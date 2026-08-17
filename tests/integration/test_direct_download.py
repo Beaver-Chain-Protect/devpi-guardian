@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html.parser
 import io
+import json
 import os
 import subprocess
 import sys
@@ -16,11 +17,14 @@ import pytest
 from devpi_guardian.verdicts.db import ConnectionFactory
 from devpi_guardian.verdicts.models import (
     ArtifactInput,
+    ArtifactState,
     Decision,
+    DecisionSource,
     ManualOverrideInput,
     ReleaseInput,
     VerdictInput,
 )
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from tests.conftest import RecordingAuditWriter
 
@@ -168,17 +172,41 @@ def _discover(
     )
 
 
-def _assert_blocked(running_devpi, direct_url: str) -> None:
+def _assert_blocked(
+    running_devpi,
+    direct_url: str,
+    *,
+    artifact_content: bytes,
+    metadata_content: bytes,
+    sha256: str,
+) -> None:
     for url in (direct_url, _metadata_url(direct_url)):
         for method in ("GET", "HEAD"):
             blocked = running_devpi.request(url, method=method)
             assert blocked.status == 404
-            assert b"ALLOW" not in blocked.body
-            assert b"DENY" not in blocked.body
+            if method == "HEAD":
+                assert blocked.body == b""
+                continue
+            for payload in (artifact_content, metadata_content):
+                assert blocked.body != payload
+                assert payload not in blocked.body
+            assert sha256.encode() not in blocked.body
+            for state in (
+                b"DISCOVERED",
+                b"SCANNING",
+                b"ALLOW",
+                b"REVIEW",
+                b"DENY",
+                b"ERROR",
+                b"MISSING",
+            ):
+                assert state not in blocked.body
 
 
 def _uv_environment(tmp_path: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    environment["no_proxy"] = "127.0.0.1,localhost,::1"
     environment["UV_NO_CACHE"] = "1"
     environment["UV_NO_INDEX"] = "1"
     environment["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
@@ -203,19 +231,57 @@ def _uv(
     )
 
 
+def _assert_revoked_lock_blocked_by_guardian(
+    result: subprocess.CompletedProcess[str],
+    *,
+    direct_url: str,
+    wheel_filename: str,
+) -> None:
+    assert result.returncode != 0
+    combined = f"{result.stdout}\n{result.stderr}"
+    direct_path = urllib.parse.urlsplit(direct_url).path
+    assert "HTTP" in combined
+    assert "404" in combined
+    assert wheel_filename in combined
+    assert direct_path in combined
+
+
+def test_revoked_lock_assertion_rejects_an_unrelated_failure() -> None:
+    unrelated = subprocess.CompletedProcess(
+        ("uv", "sync"),
+        1,
+        "",
+        "failed because the disk is full",
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_revoked_lock_blocked_by_guardian(
+            unrelated,
+            direct_url="http://127.0.0.1/root/dev/+f/abc/demo.whl",
+            wheel_filename="demo.whl",
+        )
+
+
 def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
     running_devpi,
     tmp_path: Path,
 ) -> None:
     wheel = _build_wheel(tmp_path, "1.0.0")
     content = wheel.read_bytes()
+    metadata_content = _wheel_metadata(content)
     sha256 = hashlib.sha256(content).hexdigest()
     running_devpi.api("upload", str(wheel))
     direct_url, anchor = _direct_url(running_devpi, "1.0.0")
 
     assert "/root/dev/+f/" in direct_url
     assert anchor.get("data-dist-info-metadata") is not None
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
 
     environment = _uv_environment(tmp_path)
     venv = tmp_path / "direct-venv"
@@ -248,14 +314,26 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
         filename=wheel.name,
         direct_url=direct_url,
     )
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
 
     claim = store.claim_next(
         "integration-scanning-worker",
         datetime.now(UTC) + timedelta(minutes=5),
     )
     assert claim is not None
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
     store.record_verdict(
         claim,
         VerdictInput(
@@ -269,7 +347,13 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
         ),
         [],
     )
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
 
     store.request_rescan(sha256, "integration-admin", "approve after rescan")
     _record_verdict(store, sha256, Decision.ALLOW)
@@ -285,10 +369,42 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
     metadata = running_devpi.request(metadata_url)
     assert metadata.status == 200
     assert metadata.body != content
-    assert metadata.body == _wheel_metadata(content)
+    assert metadata.body == metadata_content
     metadata_head = running_devpi.request(metadata_url, method="HEAD")
     assert metadata_head.status == 200
     assert metadata_head.body == b""
+
+    toxresult_content = b'{"testenvs":{"py312":{"retcode":0}}}'
+    toxresult_post = running_devpi.request(
+        direct_url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=toxresult_content,
+    )
+    assert toxresult_post.status == 200
+    toxresult_response = json.loads(toxresult_post.body)
+    toxresult_entrypath = toxresult_response["result"]
+    assert isinstance(toxresult_entrypath, str)
+    assert toxresult_entrypath.startswith("root/dev/+f/")
+    toxresult_url = urllib.parse.urljoin(
+        running_devpi.base_url,
+        f"/{toxresult_entrypath}",
+    )
+    toxresult_sha256 = hashlib.sha256(toxresult_content).hexdigest()
+    toxresult_decision = SQLiteVerdictReader(
+        ConnectionFactory(running_devpi.guardian_db)
+    ).get_effective_decision(toxresult_sha256)
+    assert toxresult_decision.allowed is False
+    assert toxresult_decision.source is DecisionSource.MISSING
+    assert toxresult_decision.artifact_state is ArtifactState.MISSING
+    toxresult_get = running_devpi.request(toxresult_url)
+    assert toxresult_get.status == 200
+    assert toxresult_get.body == toxresult_content
+    toxresult_head = running_devpi.request(toxresult_url, method="HEAD")
+    assert toxresult_head.status == 200
+    assert toxresult_head.body == b""
+    toxresult_length = int(toxresult_head.headers["Content-Length"])
+    assert toxresult_length == len(toxresult_content)
 
     allowed_uv = _uv(
         running_devpi,
@@ -348,11 +464,18 @@ dependencies = ["demo-guardian @ {direct_url}"]
 
     wheel_v2 = _build_wheel(tmp_path, "2.0.0")
     content_v2 = wheel_v2.read_bytes()
+    metadata_content_v2 = _wheel_metadata(content_v2)
     sha256_v2 = hashlib.sha256(content_v2).hexdigest()
     running_devpi.api("upload", str(wheel_v2))
     direct_url_v2, _ = _direct_url(running_devpi, "2.0.0")
     assert running_devpi.request(direct_url).body == content
-    _assert_blocked(running_devpi, direct_url_v2)
+    _assert_blocked(
+        running_devpi,
+        direct_url_v2,
+        artifact_content=content_v2,
+        metadata_content=metadata_content_v2,
+        sha256=sha256_v2,
+    )
 
     _discover(
         store,
@@ -378,7 +501,13 @@ dependencies = ["demo-guardian @ {direct_url}"]
         "integration-admin",
         "temporary approval withdrawn",
     )
-    _assert_blocked(running_devpi, direct_url_v2)
+    _assert_blocked(
+        running_devpi,
+        direct_url_v2,
+        artifact_content=content_v2,
+        metadata_content=metadata_content_v2,
+        sha256=sha256_v2,
+    )
     assert running_devpi.request(direct_url).body == content
 
     store.set_manual_override(
@@ -390,7 +519,13 @@ dependencies = ["demo-guardian @ {direct_url}"]
             datetime.now(UTC),
         )
     )
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
     store.set_manual_override(
         ManualOverrideInput(
             sha256,
@@ -402,7 +537,13 @@ dependencies = ["demo-guardian @ {direct_url}"]
     )
     assert running_devpi.request(direct_url).body == content
     store.request_rescan(sha256, "integration-admin", "new policy version")
-    _assert_blocked(running_devpi, direct_url)
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
     revoked_lock_environment = _uv_environment(tmp_path / "revoked-lock")
     revoked_venv = tmp_path / "revoked-lock-venv"
     revoked_lock_environment["UV_PROJECT_ENVIRONMENT"] = str(revoked_venv)
@@ -412,7 +553,11 @@ dependencies = ["demo-guardian @ {direct_url}"]
         environment=revoked_lock_environment,
         cwd=lock_project,
     )
-    assert revoked_sync.returncode != 0
+    _assert_revoked_lock_blocked_by_guardian(
+        revoked_sync,
+        direct_url=direct_url,
+        wheel_filename=wheel.name,
+    )
 
     backup = running_devpi.guardian_db.with_suffix(".saved")
     running_devpi.guardian_db.rename(backup)
@@ -444,6 +589,7 @@ def test_hashless_root_pypi_plus_e_fails_closed_before_upstream_body_fetch(
         artifact.direct_path,
     )
     assert "/root/pypi/+e/" in direct_url
+    metadata_content = _wheel_metadata(artifact.content)
     upstream_requests = running_mirror_devpi.mirror_upstream_requests
     assert upstream_requests is not None
     assert not any("/packages/" in path for path in upstream_requests)
@@ -452,6 +598,12 @@ def test_hashless_root_pypi_plus_e_fails_closed_before_upstream_body_fetch(
         for method in ("GET", "HEAD"):
             unavailable = running_mirror_devpi.request(url, method=method)
             assert unavailable.status == 503
+            if method == "HEAD":
+                assert unavailable.body == b""
+            else:
+                for payload in (artifact.content, metadata_content):
+                    assert unavailable.body != payload
+                    assert payload not in unavailable.body
             assert artifact.sha256.encode() not in unavailable.body
     assert not any("/packages/" in path for path in upstream_requests)
 
@@ -472,6 +624,8 @@ def test_hashless_root_pypi_plus_e_fails_closed_before_upstream_body_fetch(
     _record_verdict(store, artifact.sha256, Decision.ALLOW)
     still_unavailable = running_mirror_devpi.request(direct_url)
     assert still_unavailable.status == 503
+    assert still_unavailable.body != artifact.content
+    assert artifact.content not in still_unavailable.body
     assert not any("/packages/" in path for path in upstream_requests)
 
     parsed = urllib.parse.urlsplit(direct_url)

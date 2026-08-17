@@ -28,6 +28,15 @@ _SHUTDOWN_TIMEOUT = 10.0
 _START_ATTEMPTS = 3
 _MAX_DIAGNOSTIC_CHARS = 12_000
 _URL = re.compile(r"https?://[^\s\"'<>]+")
+_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _loopback_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    bypass = "127.0.0.1,localhost,::1"
+    environment["NO_PROXY"] = bypass
+    environment["no_proxy"] = bypass
+    return environment
 
 
 def _executable(name: str) -> str:
@@ -88,15 +97,20 @@ def _run(
     env: Mapping[str, str] | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        args,
-        cwd=cwd,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        safe_args = _safe_args(args)
+        message = f"command timed out after 60 seconds: {safe_args!r}"
+        raise RuntimeError(message) from None
     sanitized = subprocess.CompletedProcess(
         _safe_args(args),
         completed.returncode,
@@ -147,7 +161,7 @@ class RunningDevpi:
         cwd: Path | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
+        environment = _loopback_environment()
         environment["DEVPI_CLIENTDIR"] = str(self.client_dir)
         return _run(
             [_executable("devpi"), *args],
@@ -162,15 +176,17 @@ class RunningDevpi:
         *,
         method: str = "GET",
         headers: Mapping[str, str] | None = None,
+        body: bytes | None = None,
     ) -> HttpResult:
         url = urllib.parse.urljoin(self.base_url, path_or_url)
         request = urllib.request.Request(
             url,
+            data=body,
             method=method,
             headers=dict(headers or {}),
         )
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with _URL_OPENER.open(request, timeout=5) as response:
                 return HttpResult(
                     response.status,
                     dict(response.headers.items()),
@@ -297,7 +313,7 @@ def _start_server(
         if offline:
             args.append("--offline-mode")
         args.extend(("--guardian-db", str(guardian_db)))
-        environment = os.environ.copy()
+        environment = _loopback_environment()
         environment["PYTHONUNBUFFERED"] = "1"
         with log_path.open("wb") as log:
             process = subprocess.Popen(
@@ -315,7 +331,7 @@ def _start_server(
             if process.poll() is not None:
                 break
             try:
-                with urllib.request.urlopen(
+                with _URL_OPENER.open(
                     f"{base_url}/+status",
                     timeout=0.5,
                 ) as response:
@@ -398,6 +414,10 @@ def local_upstream(tmp_path: Path) -> _LocalUpstream:
         def do_GET(self) -> None:
             requests.append(self.path)
             super().do_GET()
+
+        def do_HEAD(self) -> None:
+            requests.append(self.path)
+            super().do_HEAD()
 
     handler = partial(TrackingFileHandler, directory=str(root))
     httpd = ThreadingHTTPServer((_HOST, 0), handler)
