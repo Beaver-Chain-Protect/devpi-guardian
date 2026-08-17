@@ -25,6 +25,15 @@
 > are not ordinary `TransitionConflict` outcomes. This correction supersedes
 > Task 7 snippets below that omit the version fields.
 
+> **2026-08-18 persisted-invariant correction:** Reader and administrator
+> paths use one shared persisted-state validator. Impossible lifecycle/current
+> verdict/current override combinations and malformed persisted timestamps or
+> metadata raise `StoreUnavailable`, so a corrupt manual `ALLOW` can never be
+> served. Schema triggers enforce immutable Artifact identity fields and
+> verdict/evidence history. Administrator commands use bounded row/count
+> verification while holding `BEGIN IMMEDIATE`; they must not materialize all
+> historical evidence payloads to prove immutability.
+
 ---
 
 ## Source design
@@ -51,6 +60,7 @@ devpi-guardian/
 │       ├── __init__.py
 │       ├── db.py
 │       ├── errors.py
+│       ├── invariants.py
 │       ├── interfaces.py
 │       ├── models.py
 │       ├── reader.py

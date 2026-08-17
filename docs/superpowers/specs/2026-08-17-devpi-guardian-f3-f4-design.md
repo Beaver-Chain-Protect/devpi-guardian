@@ -103,6 +103,7 @@ F2와 F3는 반드시 같은 `VerdictReader` 구현을 사용한다. 각자 별�
 - 시간은 UTC RFC 3339 형식으로 저장한다.
 - `SCANNING` claim에는 매번 새로 생성한 64자리 무작위 `lease_token`을 저장한다. 토큰은 로그나 외부 다운로드 URL에 노출하지 않는다.
 - 자동 판정과 evidence는 갱신·삭제하지 않고 추가한다.
+- DB trigger는 Artifact의 식별·크기·최초 발견 시각과 verdict/evidence 이력의 갱신·삭제를 거부한다. 관리자 명령은 writer lock 안에서 전체 evidence payload를 복사하지 않고 bounded row/count 검증만 수행한다.
 - Artifact마다 `is_current=1`인 자동 판정과 수동 override는 각각 최대 하나다.
 - 수동 override 대상 Artifact가 먼저 존재해야 한다.
 - `DISCOVERED` 또는 `SCANNING` 중인 Artifact에는 수동 override를 만들지 않는다. 분석이 terminal state에 도달한 후에만 관리자가 개입한다.
@@ -156,6 +157,7 @@ SCANNING
 ```text
 src/devpi_guardian/
 ├── verdicts/
+│   ├── invariants.py   # reader/store 공용 저장 상태 검증
 │   ├── models.py       # DTO, enum, 검증
 │   ├── reader.py       # VerdictReader
 │   ├── store.py        # SQLiteArtifactStore
@@ -346,6 +348,7 @@ for link, sha256 in links_with_sha256:
 - 만료 시각 이후 첫 조회부터 override가 적용되지 않는다.
 - 감사 기록 실패 시 판정 변경이 rollback된다.
 - DB 연결 실패, 잠금 timeout, 손상을 `StoreUnavailable`로 반환한다.
+- reader와 store가 동일한 저장 상태 검증기를 사용하며, 상태기계상 불가능하거나 형식이 손상된 current verdict/override는 허용 판정이나 일반 전이 충돌로 처리하지 않고 `StoreUnavailable`로 반환한다.
 - F2의 일괄 판정 조회가 단건 조회와 동일한 결과를 반환한다.
 - 판정 조회 P95가 목표 환경에서 100ms 이하이며 측정 조건과 결과가 기록된다.
 
