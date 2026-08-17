@@ -1345,6 +1345,12 @@ def test_corrupt_stored_override_expiry_maps_to_store_unavailable(
         ("verdicts", "policy_version = ?", ("",)),
         ("verdicts", "policy_version = ?", (sqlite3.Binary(b"policy"),)),
         ("verdicts", "analyzer_version = ?", ("",)),
+        ("artifacts", "updated_at = ?", ("20260817T000000+00:00",)),
+        (
+            "verdicts",
+            "created_at = ?",
+            ("2026-08-17 00:00:00+00:00",),
+        ),
     ],
 )
 def test_corrupt_artifact_or_current_verdict_context_is_unavailable(
@@ -1457,6 +1463,7 @@ def test_discovered_artifact_with_retained_verdict_is_a_normal_conflict(
         ("actor", sqlite3.Binary(b"admin")),
         ("reason", sqlite3.Binary(b"reviewed")),
         ("created_at", "not-a-timestamp"),
+        ("created_at", "2026-08-17T09:00:00+09:00"),
         ("expires_at", NOW.isoformat()),
     ],
 )

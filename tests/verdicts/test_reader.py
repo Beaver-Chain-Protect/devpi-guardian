@@ -356,8 +356,13 @@ def test_manual_allow_without_required_current_verdict_is_unavailable(
         )
 
 
+@pytest.mark.parametrize(
+    "created_at",
+    ["not-a-timestamp", "2026-08-17T09:00:00+09:00"],
+)
 def test_malformed_current_override_created_at_is_unavailable(
     tmp_path,
+    created_at: str,
 ) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
@@ -373,7 +378,8 @@ def test_malformed_current_override_created_at_is_unavailable(
             "DROP TRIGGER IF EXISTS manual_overrides_history_update_guard",
         )
         connection.execute(
-            "UPDATE manual_overrides SET created_at = 'not-a-timestamp'",
+            "UPDATE manual_overrides SET created_at = ?",
+            (created_at,),
         )
 
     with pytest.raises(StoreUnavailable):

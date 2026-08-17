@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from .models import ArtifactState, Decision, DecisionSource
 
@@ -86,8 +86,12 @@ def _stored_timestamp(value: object, field_name: str) -> datetime:
     text = _stored_text(value, field_name)
     try:
         parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise ValueError("timestamp is naive")
+        if (
+            parsed.tzinfo is None
+            or parsed.utcoffset() != timedelta(0)
+            or parsed.isoformat() != text
+        ):
+            raise ValueError("timestamp is not canonical UTC")
         return parsed.astimezone(UTC)
     except (OverflowError, ValueError) as exc:
         raise PersistedStateCorruption(
