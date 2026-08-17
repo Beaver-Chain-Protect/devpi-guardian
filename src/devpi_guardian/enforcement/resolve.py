@@ -166,7 +166,7 @@ def _classify_path(
 ) -> tuple[str, str, str, str, str] | None:
     path_info = _safe_getattr(request, "path_info")
     if not isinstance(path_info, str):
-        return None
+        _fail()
 
     path_parts = path_info.split("/")
     nonempty_parts = [part for part in path_parts if part]

@@ -75,6 +75,21 @@ class FailingHashesEntry(FakeEntry):
         pass
 
 
+class FailingPathInfoRequest:
+    def __init__(self, candidate: object) -> None:
+        self.__dict__.update(candidate.__dict__)
+
+    @property
+    def path_info(self):
+        raise UnicodeDecodeError(
+            "utf-8",
+            b"\xff",
+            0,
+            1,
+            "/private/request-target?token=secret",
+        )
+
+
 class FakeLink:
     def __init__(
         self,
@@ -310,6 +325,20 @@ def resolver_probe_tween_factory(handler, registry):
     return probe
 
 
+def passthrough_resolver_probe_tween_factory(handler, registry):
+    def probe(request):
+        try:
+            resolved = resolve_release_sha256(request)
+        except ArtifactIdentityUnavailable:
+            registry["resolver_probe"].append("identity-unavailable")
+            raise
+        registry["resolver_probe"].append(resolved)
+        registry["downstream_calls"] += 1
+        return handler(request)
+
+    return probe
+
+
 def test_pinned_devpi_registers_the_exact_protected_routes() -> None:
     assert {
         (F_ROUTE, "/{user:[^+/]+}/{index:[^+/]+}/+f/{relpath:.*}"),
@@ -462,6 +491,49 @@ def test_real_pyramid_tween_rejects_inconsistent_raw_artifact_path(
             "identity-unavailable",
         )
     ]
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("marker", ["+f", "+e"])
+@pytest.mark.parametrize("malformed", ["%FF", "%C0%AF", "%ED%A0%80"])
+def test_real_pyramid_tween_fails_closed_on_malformed_utf8_path(
+    marker: str,
+    malformed: str,
+) -> None:
+    route_name = F_ROUTE if marker == "+f" else E_ROUTE
+    config = Configurator()
+    model = FakeModel(None)
+    config.registry["xom"] = SimpleNamespace(
+        filestore=FakeFileStore(None),
+        model=model,
+    )
+    config.registry["resolver_probe"] = []
+    config.registry["downstream_calls"] = 0
+    config.add_route(
+        route_name,
+        f"/{{user}}/{{index}}/{marker}/{{relpath:.*}}",
+    )
+    tween_module = "tests.enforcement.test_resolve"
+    tween_name = "passthrough_resolver_probe_tween_factory"
+    tween_factory = f"{tween_module}.{tween_name}"
+    config.add_tween(tween_factory, over=EXCVIEW)
+    application = config.make_wsgi_app()
+    filename = f"demo-1.0-{malformed}-py3-none-any.whl"
+    raw_target = f"/root/pypi/{marker}/abc/{filename}"
+    request = application.request_factory.blank(raw_target)
+
+    with pytest.raises(UnicodeDecodeError):
+        _ = request.path_info
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        request.get_response(application)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "secret" not in repr(raised.value)
+    assert "/private" not in repr(raised.value)
+    assert config.registry["resolver_probe"] == ["identity-unavailable"]
+    assert config.registry["downstream_calls"] == 0
     assert model.calls == []
 
 
@@ -1131,6 +1203,51 @@ def test_nonprotected_path_ignores_inconsistent_raw_environment() -> None:
 
     assert resolve_release_sha256(candidate) is None
     assert model.calls == []
+
+
+def test_path_info_decode_failure_is_sanitized_and_fails_closed() -> None:
+    candidate = make_request()
+    model = candidate.registry["xom"].model
+    failing_request = FailingPathInfoRequest(candidate)
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        resolve_release_sha256(failing_request)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "secret" not in repr(raised.value)
+    assert "/private" not in repr(raised.value)
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("path_info", [None, object(), [], 42])
+def test_invalid_path_info_type_fails_closed(path_info: object) -> None:
+    candidate = make_request()
+    candidate.path_info = path_info
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+    assert candidate.registry["xom"].model.calls == []
+
+
+def test_missing_path_info_fails_closed() -> None:
+    candidate = make_request()
+    del candidate.path_info
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+    assert candidate.registry["xom"].model.calls == []
+
+
+def test_non_get_request_does_not_require_path_info() -> None:
+    candidate = make_request(method="POST")
+    del candidate.path_info
+
+    assert resolve_release_sha256(candidate) is None
+    assert candidate.registry["xom"].model.calls == []
 
 
 @pytest.mark.parametrize(
