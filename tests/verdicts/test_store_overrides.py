@@ -166,8 +166,8 @@ def test_set_manual_override_changes_effective_decision_and_audits(
         Decision.DENY,
         decision,
         override.reason,
-        None,
-        None,
+        "policy-1",
+        "analyzer-1",
         NOW,
     )
 
@@ -269,6 +269,8 @@ def test_revoke_deactivates_current_override_and_uses_automated_fallback(
         event.previous_decision,
         event.new_decision,
         event.reason,
+        event.policy_version,
+        event.analyzer_version,
         event.occurred_at,
     ) == (
         "admin@example.test",
@@ -277,6 +279,8 @@ def test_revoke_deactivates_current_override_and_uses_automated_fallback(
         override_decision,
         expected,
         "override withdrawn",
+        "policy-1",
+        "analyzer-1",
         NOW,
     )
 
@@ -356,6 +360,8 @@ def test_rescan_from_every_terminal_state_clears_transient_state_and_override(
         event.previous_decision,
         event.new_decision,
         event.reason,
+        event.policy_version,
+        event.analyzer_version,
         event.occurred_at,
     ) == (
         "admin@example.test",
@@ -364,6 +370,8 @@ def test_rescan_from_every_terminal_state_clears_transient_state_and_override(
         Decision.ALLOW,
         Decision.DENY,
         "policy changed",
+        None if state is ArtifactState.ERROR else "policy-1",
+        None if state is ArtifactState.ERROR else "analyzer-1",
         NOW,
     )
 
@@ -957,7 +965,7 @@ def test_admin_transitions_reject_duplicate_current_overrides(
     audit_writer.events.clear()
     before = database_snapshot(store)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         perform_admin_operation(store, operation)
 
     assert database_snapshot(store) == before
@@ -1087,7 +1095,7 @@ def test_admin_transitions_reject_duplicate_current_verdicts(
     audit_writer.events.clear()
     before = database_snapshot(store)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         perform_admin_operation(store, operation)
 
     assert database_snapshot(store) == before
@@ -1273,6 +1281,155 @@ def test_corrupt_stored_override_expiry_maps_to_store_unavailable(
             ) VALUES (?, 'ALLOW', 'admin', 'seed', ?, ?, 1)
             """,
             (SHA256, NOW.isoformat(), expires_at),
+        )
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+
+    with pytest.raises(StoreUnavailable) as error:
+        store.revoke_manual_override(SHA256, "admin", "withdrawn")
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize(
+    ("table", "assignment", "parameters"),
+    [
+        ("artifacts", "state = ?", ("BROKEN",)),
+        ("verdicts", "decision = ?", ("BROKEN",)),
+        ("verdicts", "policy_version = ?", ("",)),
+        ("verdicts", "policy_version = ?", (sqlite3.Binary(b"policy"),)),
+        ("verdicts", "analyzer_version = ?", ("",)),
+    ],
+)
+def test_corrupt_artifact_or_current_verdict_context_is_unavailable(
+    tmp_path,
+    audit_writer,
+    table: str,
+    assignment: str,
+    parameters: tuple[object, ...],
+) -> None:
+    store = terminal_store(tmp_path, audit_writer, Decision.REVIEW)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE {table} SET {assignment} WHERE sha256 = ?",
+            (*parameters, SHA256),
+        )
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+
+    with pytest.raises(StoreUnavailable) as error:
+        store.set_manual_override(manual_override())
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize(
+    ("state", "replacement"),
+    [
+        (Decision.ALLOW, None),
+        (Decision.REVIEW, None),
+        (Decision.DENY, None),
+        (Decision.ALLOW, Decision.REVIEW),
+        (Decision.REVIEW, Decision.DENY),
+        (Decision.DENY, Decision.ALLOW),
+    ],
+)
+def test_terminal_state_requires_one_matching_current_verdict(
+    tmp_path,
+    audit_writer,
+    state: Decision,
+    replacement: Decision | None,
+) -> None:
+    store = terminal_store(tmp_path, audit_writer, state)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        if replacement is None:
+            connection.execute(
+                "DELETE FROM verdicts WHERE sha256 = ?",
+                (SHA256,),
+            )
+        else:
+            connection.execute(
+                "UPDATE verdicts SET decision = ? WHERE sha256 = ?",
+                (replacement.value, SHA256),
+            )
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+
+    with pytest.raises(StoreUnavailable) as error:
+        store.set_manual_override(manual_override())
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+def test_error_state_may_retain_valid_current_verdict_audit_context(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = terminal_store(tmp_path, audit_writer, Decision.ALLOW)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute(
+            "UPDATE artifacts SET state = 'ERROR', last_error = 'retry'",
+        )
+    audit_writer.events.clear()
+
+    store.set_manual_override(manual_override(decision=Decision.DENY))
+
+    event = audit_writer.events[0]
+    assert event.previous_decision is Decision.DENY
+    assert event.policy_version == "policy-1"
+    assert event.analyzer_version == "analyzer-1"
+
+
+def test_discovered_artifact_with_retained_verdict_is_a_normal_conflict(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = terminal_store(tmp_path, audit_writer, Decision.REVIEW)
+    store.request_rescan(SHA256, "admin", "first rescan")
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+
+    with pytest.raises(TransitionConflict):
+        store.set_manual_override(manual_override())
+
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize(
+    ("assignment", "value"),
+    [
+        ("actor", sqlite3.Binary(b"admin")),
+        ("reason", sqlite3.Binary(b"reviewed")),
+        ("created_at", "not-a-timestamp"),
+        ("expires_at", NOW.isoformat()),
+    ],
+)
+def test_corrupt_current_override_context_is_unavailable(
+    tmp_path,
+    audit_writer,
+    assignment: str,
+    value: object,
+) -> None:
+    store = terminal_store(tmp_path, audit_writer, Decision.REVIEW)
+    store.set_manual_override(
+        manual_override(expires_at=NOW + timedelta(minutes=1)),
+    )
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"""
+            UPDATE manual_overrides SET {assignment} = ?
+            WHERE is_current = 1
+            """,
+            (value,),
         )
     audit_writer.events.clear()
     before = database_snapshot(store)

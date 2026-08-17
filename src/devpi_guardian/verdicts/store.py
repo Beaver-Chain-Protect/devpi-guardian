@@ -16,6 +16,7 @@ from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
 from .models import (
     ArtifactInput,
+    ArtifactState,
     AuditEventInput,
     ClaimedArtifact,
     Decision,
@@ -291,6 +292,16 @@ def _stored_expiry(value: object) -> datetime | None:
         return require_utc(parsed, "stored override expiry")
     except (OverflowError, ValueError) as exc:
         raise ValueError("stored override expiry is invalid") from exc
+
+
+def _stored_datetime(value: object, field_name: str) -> datetime:
+    try:
+        if type(value) is not str:
+            raise ValueError(f"stored {field_name} is invalid")
+        parsed = datetime.fromisoformat(value)
+        return require_utc(parsed, f"stored {field_name}")
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"stored {field_name} is invalid") from exc
 
 
 def _effective_decision(
@@ -985,7 +996,14 @@ class SQLiteArtifactStore:
         connection: sqlite3.Connection,
         sha256: str,
         operation_at: datetime,
-    ) -> tuple[sqlite3.Row, sqlite3.Row | None, Decision, Decision]:
+    ) -> tuple[
+        sqlite3.Row,
+        sqlite3.Row | None,
+        Decision,
+        Decision,
+        str | None,
+        str | None,
+    ]:
         artifact_row = connection.execute(
             "SELECT * FROM artifacts WHERE sha256 = ?",
             (sha256,),
@@ -995,16 +1013,12 @@ class SQLiteArtifactStore:
 
         verdict_rows = connection.execute(
             """
-            SELECT decision FROM verdicts
+            SELECT decision, policy_version, analyzer_version
+            FROM verdicts
             WHERE sha256 = ? AND is_current = 1
             """,
             (sha256,),
         ).fetchall()
-        if len(verdict_rows) > 1:
-            raise TransitionConflict("multiple current verdicts")
-        automated_decision = None
-        if verdict_rows:
-            automated_decision = verdict_rows[0]["decision"]
 
         override_rows = connection.execute(
             """
@@ -1015,26 +1029,98 @@ class SQLiteArtifactStore:
             """,
             (sha256,),
         ).fetchall()
-        if len(override_rows) > 1:
-            raise TransitionConflict("multiple current overrides")
-        current_override = override_rows[0] if override_rows else None
         try:
+            if len(verdict_rows) > 1:
+                raise ValueError("multiple current verdicts")
+            if len(override_rows) > 1:
+                raise ValueError("multiple current overrides")
+
+            state_raw = artifact_row["state"]
+            if type(state_raw) is not str:
+                raise ValueError("stored artifact state is invalid")
+            state = ArtifactState(state_raw)
+            if state is ArtifactState.MISSING:
+                raise ValueError("stored artifact state is invalid")
+
+            automated_decision = None
+            policy_version = None
+            analyzer_version = None
+            if verdict_rows:
+                verdict_row = verdict_rows[0]
+                decision_raw = verdict_row["decision"]
+                if type(decision_raw) is not str:
+                    raise ValueError("stored verdict decision is invalid")
+                automated_decision = Decision(decision_raw)
+                policy_version = _require_stored_string(
+                    verdict_row["policy_version"],
+                    "stored policy_version",
+                )
+                analyzer_version = _require_stored_string(
+                    verdict_row["analyzer_version"],
+                    "stored analyzer_version",
+                )
+
+            state_requires_verdict = state in (
+                ArtifactState.ALLOW,
+                ArtifactState.REVIEW,
+                ArtifactState.DENY,
+            )
+            if state_requires_verdict and automated_decision is None:
+                raise ValueError("terminal artifact has no current verdict")
+            if (
+                state_requires_verdict
+                and automated_decision is not None
+                and automated_decision.value != state.value
+            ):
+                raise ValueError("artifact state and verdict do not match")
+
+            current_override = override_rows[0] if override_rows else None
+            if current_override is not None:
+                manual_raw = current_override["decision"]
+                if type(manual_raw) is not str:
+                    raise ValueError("stored override decision is invalid")
+                manual = Decision(manual_raw)
+                if manual not in (Decision.ALLOW, Decision.DENY):
+                    raise ValueError("stored override decision is invalid")
+                _require_stored_string(
+                    current_override["actor"],
+                    "stored override actor",
+                )
+                _require_stored_string(
+                    current_override["reason"],
+                    "stored override reason",
+                )
+                created_at = _stored_datetime(
+                    current_override["created_at"],
+                    "override created_at",
+                )
+                expires_at = _stored_expiry(current_override["expires_at"])
+                if expires_at is not None and expires_at <= created_at:
+                    raise ValueError("stored override expiry is invalid")
+
             fallback = _effective_decision(
-                artifact_row["state"],
-                automated_decision,
+                state.value,
+                automated_decision.value if automated_decision else None,
                 None,
                 operation_at,
             )
             effective = _effective_decision(
-                artifact_row["state"],
-                automated_decision,
+                state.value,
+                automated_decision.value if automated_decision else None,
                 current_override,
                 operation_at,
             )
         except (OverflowError, TypeError, ValueError) as exc:
             path = str(self.connection_factory.path)
             raise StoreUnavailable(path) from exc
-        return artifact_row, current_override, effective, fallback
+        return (
+            artifact_row,
+            current_override,
+            effective,
+            fallback,
+            policy_version,
+            analyzer_version,
+        )
 
     @staticmethod
     def _override_history(
@@ -1157,7 +1243,14 @@ class SQLiteArtifactStore:
                 sha256,
                 operation_at,
             )
-            artifact_row, current_override, previous, _fallback = context
+            (
+                artifact_row,
+                current_override,
+                previous,
+                _fallback,
+                policy_version,
+                analyzer_version,
+            ) = context
             if artifact_row["state"] not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
             artifact_snapshot = tuple(artifact_row)
@@ -1254,6 +1347,8 @@ class SQLiteArtifactStore:
                 previous=previous,
                 new=decision,
                 reason=reason,
+                policy_version=policy_version,
+                analyzer_version=analyzer_version,
                 occurred_at=operation_at,
             )
 
@@ -1279,7 +1374,14 @@ class SQLiteArtifactStore:
                 sha256,
                 operation_at,
             )
-            artifact_row, current_override, previous, fallback = context
+            (
+                artifact_row,
+                current_override,
+                previous,
+                fallback,
+                policy_version,
+                analyzer_version,
+            ) = context
             if artifact_row["state"] not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
             if current_override is None:
@@ -1322,6 +1424,8 @@ class SQLiteArtifactStore:
                 previous=previous,
                 new=fallback,
                 reason=reason,
+                policy_version=policy_version,
+                analyzer_version=analyzer_version,
                 occurred_at=operation_at,
             )
 
@@ -1348,7 +1452,14 @@ class SQLiteArtifactStore:
                 sha256,
                 operation_at,
             )
-            artifact_row, current_override, previous, _fallback = context
+            (
+                artifact_row,
+                current_override,
+                previous,
+                _fallback,
+                policy_version,
+                analyzer_version,
+            ) = context
             state = artifact_row["state"]
             if state not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
@@ -1422,5 +1533,7 @@ class SQLiteArtifactStore:
                 previous=previous,
                 new=Decision.DENY,
                 reason=reason,
+                policy_version=policy_version,
+                analyzer_version=analyzer_version,
                 occurred_at=operation_at,
             )
