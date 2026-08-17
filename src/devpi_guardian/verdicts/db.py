@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -63,7 +63,8 @@ class ConnectionFactory:
             return connection
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
-                connection.close()
+                with suppress(OSError, sqlite3.Error):
+                    connection.close()
             raise StoreUnavailable(str(self.path)) from exc
 
 

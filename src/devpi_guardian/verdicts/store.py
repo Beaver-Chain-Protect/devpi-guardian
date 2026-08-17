@@ -511,7 +511,7 @@ class SQLiteArtifactStore:
             updated_at = operation_at.isoformat()
             row = connection.execute(
                 """
-                SELECT sha256, size_bytes
+                SELECT sha256, size_bytes, discovered_at
                 FROM artifacts
                 WHERE state = 'DISCOVERED'
                 ORDER BY discovered_at, sha256
@@ -540,15 +540,36 @@ class SQLiteArtifactStore:
                 raise TransitionConflict("artifact could not be claimed")
             persisted = connection.execute(
                 """
-                SELECT sha256, size_bytes, state, lease_owner,
+                SELECT sha256, size_bytes, discovered_at, state, lease_owner,
                        lease_expires_at, lease_token, last_error, updated_at
                 FROM artifacts WHERE sha256 = ?
                 """,
                 (row["sha256"],),
             ).fetchone()
-            if persisted is None or tuple(persisted) != (
+            expected_identity = (
                 row["sha256"],
                 row["size_bytes"],
+                row["discovered_at"],
+            )
+            if persisted is None:
+                corruption = PersistedStateCorruption(
+                    "artifact identity changed during claim",
+                )
+                path = str(self.connection_factory.path)
+                raise StoreUnavailable(path) from corruption
+            persisted_identity = (
+                persisted["sha256"],
+                persisted["size_bytes"],
+                persisted["discovered_at"],
+            )
+            if persisted_identity != expected_identity:
+                corruption = PersistedStateCorruption(
+                    "artifact identity changed during claim",
+                )
+                path = str(self.connection_factory.path)
+                raise StoreUnavailable(path) from corruption
+            if tuple(persisted) != (
+                *expected_identity,
                 "SCANNING",
                 worker_id,
                 lease_text,

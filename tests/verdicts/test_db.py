@@ -18,13 +18,24 @@ class PragmaCursor:
 
 
 class PragmaConnection:
-    def __init__(self, recursive_result=(1,), *, fail_set=False) -> None:
+    def __init__(
+        self,
+        recursive_result=(1,),
+        *,
+        fail_set=False,
+        setup_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.recursive_result = recursive_result
         self.fail_set = fail_set
+        self.setup_error = setup_error
+        self.close_error = close_error
         self.closed = False
         self.row_factory = None
 
     def execute(self, statement: str):
+        if statement == "PRAGMA foreign_keys=ON" and self.setup_error:
+            raise self.setup_error
         if statement == "PRAGMA recursive_triggers=ON" and self.fail_set:
             raise sqlite3.OperationalError("recursive triggers unavailable")
         if statement == "PRAGMA recursive_triggers":
@@ -33,6 +44,8 @@ class PragmaConnection:
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
@@ -55,6 +68,10 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     }
     expected_triggers = {
         "artifacts_identity_immutable",
+        "artifacts_identity_delete_guard",
+        "release_mappings_history_insert_guard",
+        "release_mappings_history_update_guard",
+        "release_mappings_history_delete_guard",
         "verdicts_history_insert_guard",
         "verdicts_history_update_guard",
         "verdicts_history_delete_guard",
@@ -121,6 +138,33 @@ def test_connection_maps_recursive_trigger_setup_failure_and_closes(
         ConnectionFactory(tmp_path / "guardian.db").connect()
 
     assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert connection.closed is True
+
+
+@pytest.mark.parametrize(
+    "setup_error",
+    [OSError("setup failed"), sqlite3.OperationalError("setup failed")],
+    ids=["os-error", "sqlite-error"],
+)
+def test_connection_close_failure_does_not_mask_setup_error(
+    tmp_path,
+    monkeypatch,
+    setup_error: Exception,
+) -> None:
+    connection = PragmaConnection(
+        setup_error=setup_error,
+        close_error=sqlite3.OperationalError("close failed"),
+    )
+    monkeypatch.setattr(
+        db.sqlite3,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        ConnectionFactory(tmp_path / "guardian.db").connect()
+
+    assert error.value.__cause__ is setup_error
     assert connection.closed is True
 
 
@@ -551,6 +595,127 @@ def test_schema_triggers_allow_only_current_marker_deactivation(
         ).fetchone()[0]
 
     assert (verdict_marker, override_marker) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("mutation_sql", "parameters"),
+    [
+        ("DELETE FROM artifacts", ()),
+        (
+            """
+            INSERT OR REPLACE INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 999, 'DISCOVERED', ?, ?)
+            """,
+            (
+                "a" * 64,
+                "2026-08-18T00:00:00+00:00",
+                "2026-08-18T00:00:00+00:00",
+            ),
+        ),
+    ],
+    ids=["delete", "replace"],
+)
+def test_schema_rejects_artifact_delete_and_replacement(
+    tmp_path,
+    mutation_sql: str,
+    parameters: tuple[object, ...],
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            ("a" * 64, timestamp, timestamp),
+        )
+        artifact_row = connection.execute("SELECT * FROM artifacts").fetchone()
+        before = tuple(artifact_row)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(mutation_sql, parameters)
+
+        after = tuple(connection.execute("SELECT * FROM artifacts").fetchone())
+
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("recursive_triggers", "mutation_sql", "parameters"),
+    [
+        (True, "UPDATE release_mappings SET origin_url = 'changed'", ()),
+        (True, "DELETE FROM release_mappings", ()),
+        (
+            False,
+            """
+            INSERT OR REPLACE INTO release_mappings(
+                id, stage, project, version, filename, sha256,
+                origin_url, discovered_at
+            ) VALUES (1, 'root/pypi', 'demo', '1.0', 'demo.whl', ?,
+                      'https://replacement.test/id', ?)
+            """,
+            ("a" * 64, "2026-08-18T00:00:00+00:00"),
+        ),
+        (
+            True,
+            """
+            INSERT OR REPLACE INTO release_mappings(
+                id, stage, project, version, filename, sha256,
+                origin_url, discovered_at
+            ) VALUES (2, 'root/pypi', 'demo', '1.0', 'demo.whl', ?,
+                      'https://replacement.test/unique', ?)
+            """,
+            ("a" * 64, "2026-08-18T00:00:00+00:00"),
+        ),
+    ],
+    ids=["update", "delete", "replace-id", "replace-unique"],
+)
+def test_schema_rejects_release_mapping_mutation(
+    tmp_path,
+    recursive_triggers: bool,
+    mutation_sql: str,
+    parameters: tuple[object, ...],
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            ("a" * 64, timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO release_mappings(
+                stage, project, version, filename, sha256,
+                origin_url, discovered_at
+            ) VALUES ('root/pypi', 'demo', '1.0', 'demo.whl', ?,
+                      'https://origin.test/demo', ?)
+            """,
+            ("a" * 64, timestamp),
+        )
+        setting = "ON" if recursive_triggers else "OFF"
+        connection.execute(f"PRAGMA recursive_triggers={setting}")
+        before = tuple(
+            connection.execute("SELECT * FROM release_mappings").fetchone(),
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(mutation_sql, parameters)
+
+        after = tuple(
+            connection.execute("SELECT * FROM release_mappings").fetchone(),
+        )
+
+    assert after == before
 
 
 @pytest.mark.parametrize(

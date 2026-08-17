@@ -702,6 +702,57 @@ def test_claim_rejects_unexpected_final_persisted_token(
     assert audit_writer.events == original_events
 
 
+def test_claim_rolls_back_after_trigger_replaces_artifact_identity(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = make_store(tmp_path, audit_writer)
+    store.discover_artifact(artifact(), release())
+    original_events = list(audit_writer.events)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute("DROP TRIGGER artifacts_identity_delete_guard")
+        connection.execute(
+            """
+            CREATE TRIGGER replace_artifact_identity_during_claim
+            AFTER UPDATE OF state ON artifacts
+            WHEN NEW.state = 'SCANNING'
+            BEGIN
+                INSERT OR REPLACE INTO artifacts(
+                    sha256, size_bytes, state, discovered_at, updated_at,
+                    lease_owner, lease_expires_at, lease_token, last_error
+                ) VALUES (
+                    NEW.sha256, NEW.size_bytes, NEW.state,
+                    '2026-08-18T00:00:00+00:00', NEW.updated_at,
+                    NEW.lease_owner, NEW.lease_expires_at, NEW.lease_token,
+                    NEW.last_error
+                );
+            END
+            """,
+        )
+
+    with pytest.raises(StoreUnavailable):
+        store.claim_next("worker", NOW + timedelta(minutes=5))
+
+    row = fetchall(
+        store,
+        """
+        SELECT size_bytes, state, discovered_at, lease_owner,
+               lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
+        (SHA,),
+    )[0]
+    assert tuple(row) == (
+        123,
+        ArtifactState.DISCOVERED.value,
+        NOW.isoformat(),
+        None,
+        None,
+        None,
+    )
+    assert audit_writer.events == original_events
+
+
 def test_claim_token_is_not_disclosed_when_audit_fails(
     tmp_path,
     audit_writer,

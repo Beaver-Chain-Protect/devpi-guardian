@@ -110,6 +110,31 @@ BEGIN
     SELECT RAISE(ABORT, 'immutable artifact identity');
 END;
 
+CREATE TRIGGER artifacts_identity_delete_guard
+BEFORE DELETE ON artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'immutable artifact identity');
+END;
+
+CREATE TRIGGER release_mappings_history_insert_guard
+BEFORE INSERT ON release_mappings
+WHEN EXISTS(SELECT 1 FROM release_mappings WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable release mapping history');
+END;
+
+CREATE TRIGGER release_mappings_history_update_guard
+BEFORE UPDATE ON release_mappings
+BEGIN
+    SELECT RAISE(ABORT, 'immutable release mapping history');
+END;
+
+CREATE TRIGGER release_mappings_history_delete_guard
+BEFORE DELETE ON release_mappings
+BEGIN
+    SELECT RAISE(ABORT, 'immutable release mapping history');
+END;
+
 CREATE TRIGGER verdicts_history_insert_guard
 BEFORE INSERT ON verdicts
 WHEN EXISTS(SELECT 1 FROM verdicts WHERE id = NEW.id)
