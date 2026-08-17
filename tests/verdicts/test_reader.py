@@ -34,15 +34,23 @@ def seed_artifact(
         if state is ArtifactState.SCANNING
         else (None, None, None)
     )
+    last_error = "analysis failed" if state is ArtifactState.ERROR else None
     with closing(factory.connect()) as connection, connection:
         connection.execute(
             """
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
-                lease_owner, lease_expires_at, lease_token
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                lease_owner, lease_expires_at, lease_token, last_error
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (sha256, state.value, timestamp, timestamp, *lease_values),
+            (
+                sha256,
+                state.value,
+                timestamp,
+                timestamp,
+                *lease_values,
+                last_error,
+            ),
         )
         if automated is not None:
             decision, policy_version = automated
@@ -163,10 +171,13 @@ def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:
         ArtifactState.REVIEW,
         automated=(Decision.REVIEW, "policy-1"),
         manual=Decision.ALLOW,
-        expires=NOW,
+        expires=NOW + timedelta(minutes=1),
     )
 
-    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    reader = SQLiteVerdictReader(
+        factory,
+        now=lambda: NOW + timedelta(minutes=1),
+    )
     result = reader.get_effective_decision(SHA_REVIEW)
 
     assert result.allowed is False
@@ -212,11 +223,16 @@ def test_nonallow_lifecycle_states_block(
 ) -> None:
     factory = ConnectionFactory(tmp_path / f"{state.value}.db")
     migrate(factory)
+    automated_decision = (
+        Decision(state.value)
+        if state in (ArtifactState.REVIEW, ArtifactState.DENY)
+        else Decision.ALLOW
+    )
     seed_artifact(
         factory,
         SHA_ALLOW,
         state,
-        automated=(Decision.ALLOW, "policy-1"),
+        automated=(automated_decision, "policy-1"),
     )
 
     reader = SQLiteVerdictReader(factory, now=lambda: NOW)
@@ -228,7 +244,7 @@ def test_nonallow_lifecycle_states_block(
     assert result.artifact_state is state
 
 
-def test_mismatched_automated_allow_blocks_allow_artifact(tmp_path) -> None:
+def test_mismatched_automated_verdict_is_store_unavailable(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
     seed_artifact(
@@ -239,11 +255,8 @@ def test_mismatched_automated_allow_blocks_allow_artifact(tmp_path) -> None:
     )
 
     reader = SQLiteVerdictReader(factory, now=lambda: NOW)
-    result = reader.get_effective_decision(SHA_ALLOW)
-
-    assert result.allowed is False
-    assert result.effective_decision is Decision.DENY
-    assert result.policy_version == "policy-1"
+    with pytest.raises(StoreUnavailable):
+        reader.get_effective_decision(SHA_ALLOW)
 
 
 def test_duplicate_inputs_return_one_result_per_distinct_sha(tmp_path) -> None:
@@ -322,6 +335,139 @@ def test_corrupt_expiry_maps_to_store_unavailable(tmp_path) -> None:
     with pytest.raises(StoreUnavailable):
         SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
             SHA_ALLOW,
+        )
+
+
+def test_manual_allow_without_required_current_verdict_is_unavailable(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        manual=Decision.ALLOW,
+    )
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
+            SHA_REVIEW,
+        )
+
+
+def test_malformed_current_override_created_at_is_unavailable(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+        manual=Decision.ALLOW,
+    )
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            "DROP TRIGGER IF EXISTS manual_overrides_history_update_guard",
+        )
+        connection.execute(
+            "UPDATE manual_overrides SET created_at = 'not-a-timestamp'",
+        )
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
+            SHA_REVIEW,
+        )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [ArtifactState.DISCOVERED, ArtifactState.SCANNING],
+)
+def test_current_override_on_active_lifecycle_is_unavailable(
+    tmp_path,
+    state: ArtifactState,
+) -> None:
+    factory = ConnectionFactory(tmp_path / f"{state.value}.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        state,
+        automated=(Decision.ALLOW, "policy-1"),
+        manual=Decision.ALLOW,
+    )
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
+            SHA_ALLOW,
+        )
+
+
+def test_malformed_artifact_updated_at_is_unavailable(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            "UPDATE artifacts SET updated_at = 'not-a-timestamp'",
+        )
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
+            SHA_ALLOW,
+        )
+
+
+@pytest.mark.parametrize("history", ["verdict", "override"])
+def test_duplicate_current_join_rows_are_unavailable(
+    tmp_path,
+    history: str,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+        manual=Decision.ALLOW if history == "override" else None,
+    )
+    with closing(factory.connect()) as connection, connection:
+        if history == "verdict":
+            connection.execute("DROP INDEX verdicts_one_current_idx")
+            connection.execute(
+                """
+                INSERT INTO verdicts(
+                    sha256, decision, score, policy_version,
+                    analyzer_version, baseline_sha256, is_current, created_at
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-2', 'analyzer-2',
+                          NULL, 1, ?)
+                """,
+                (SHA_REVIEW, NOW.isoformat()),
+            )
+        else:
+            connection.execute("DROP INDEX manual_overrides_one_current_idx")
+            connection.execute(
+                """
+                INSERT INTO manual_overrides(
+                    sha256, decision, actor, reason, created_at, expires_at,
+                    is_current
+                ) VALUES (?, 'DENY', 'other', 'duplicate', ?, NULL, 1)
+                """,
+                (SHA_REVIEW, NOW.isoformat()),
+            )
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
+            SHA_REVIEW,
         )
 
 

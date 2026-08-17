@@ -100,3 +100,71 @@ CREATE TABLE manual_overrides (
 CREATE UNIQUE INDEX manual_overrides_one_current_idx
     ON manual_overrides(sha256) WHERE is_current = 1;
 CREATE INDEX manual_overrides_sha256_idx ON manual_overrides(sha256, created_at);
+
+CREATE TRIGGER artifacts_identity_immutable
+BEFORE UPDATE OF sha256, size_bytes, discovered_at ON artifacts
+WHEN NEW.sha256 IS NOT OLD.sha256
+  OR NEW.size_bytes IS NOT OLD.size_bytes
+  OR NEW.discovered_at IS NOT OLD.discovered_at
+BEGIN
+    SELECT RAISE(ABORT, 'immutable artifact identity');
+END;
+
+CREATE TRIGGER verdicts_history_update_guard
+BEFORE UPDATE ON verdicts
+WHEN NOT (
+    OLD.is_current = 1
+    AND NEW.is_current = 0
+    AND NEW.id IS OLD.id
+    AND NEW.sha256 IS OLD.sha256
+    AND NEW.decision IS OLD.decision
+    AND NEW.score IS OLD.score
+    AND NEW.policy_version IS OLD.policy_version
+    AND NEW.analyzer_version IS OLD.analyzer_version
+    AND NEW.baseline_sha256 IS OLD.baseline_sha256
+    AND NEW.created_at IS OLD.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable verdict history');
+END;
+
+CREATE TRIGGER verdicts_history_delete_guard
+BEFORE DELETE ON verdicts
+BEGIN
+    SELECT RAISE(ABORT, 'immutable verdict history');
+END;
+
+CREATE TRIGGER evidence_history_update_guard
+BEFORE UPDATE ON evidence
+BEGIN
+    SELECT RAISE(ABORT, 'immutable evidence history');
+END;
+
+CREATE TRIGGER evidence_history_delete_guard
+BEFORE DELETE ON evidence
+BEGIN
+    SELECT RAISE(ABORT, 'immutable evidence history');
+END;
+
+CREATE TRIGGER manual_overrides_history_update_guard
+BEFORE UPDATE ON manual_overrides
+WHEN NOT (
+    OLD.is_current = 1
+    AND NEW.is_current = 0
+    AND NEW.id IS OLD.id
+    AND NEW.sha256 IS OLD.sha256
+    AND NEW.decision IS OLD.decision
+    AND NEW.actor IS OLD.actor
+    AND NEW.reason IS OLD.reason
+    AND NEW.created_at IS OLD.created_at
+    AND NEW.expires_at IS OLD.expires_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable override history');
+END;
+
+CREATE TRIGGER manual_overrides_history_delete_guard
+BEFORE DELETE ON manual_overrides
+BEGIN
+    SELECT RAISE(ABORT, 'immutable override history');
+END;

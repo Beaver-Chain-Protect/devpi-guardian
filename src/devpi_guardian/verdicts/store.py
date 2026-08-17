@@ -14,9 +14,13 @@ from devpi_common.metadata import normalize_name
 from .db import ConnectionFactory
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
+from .invariants import (
+    PersistedStateContext,
+    PersistedStateCorruption,
+    validate_persisted_state,
+)
 from .models import (
     ArtifactInput,
-    ArtifactState,
     AuditEventInput,
     ClaimedArtifact,
     Decision,
@@ -280,59 +284,6 @@ def _prepare_admin_command(
         _require_stored_string(actor, "actor"),
         _require_stored_string(reason, "reason"),
     )
-
-
-def _stored_expiry(value: object) -> datetime | None:
-    if value is None:
-        return None
-    try:
-        if type(value) is not str:
-            raise ValueError("stored override expiry is invalid")
-        parsed = datetime.fromisoformat(value)
-        return require_utc(parsed, "stored override expiry")
-    except (OverflowError, ValueError) as exc:
-        raise ValueError("stored override expiry is invalid") from exc
-
-
-def _stored_datetime(value: object, field_name: str) -> datetime:
-    try:
-        if type(value) is not str:
-            raise ValueError(f"stored {field_name} is invalid")
-        parsed = datetime.fromisoformat(value)
-        return require_utc(parsed, f"stored {field_name}")
-    except (OverflowError, ValueError) as exc:
-        raise ValueError(f"stored {field_name} is invalid") from exc
-
-
-def _effective_decision(
-    state: str,
-    automated_decision: object,
-    current_override: sqlite3.Row | None,
-    as_of: datetime,
-) -> Decision:
-    fallback = (
-        Decision.ALLOW
-        if state == "ALLOW" and automated_decision == Decision.ALLOW.value
-        else Decision.DENY
-    )
-    if current_override is None or state not in _TERMINAL_STATES:
-        return fallback
-    manual_raw = current_override["decision"]
-    try:
-        manual = Decision(manual_raw)
-    except (TypeError, ValueError):
-        raise ValueError("stored override decision is invalid") from None
-    if manual not in (Decision.ALLOW, Decision.DENY):
-        raise ValueError("stored override decision is invalid")
-    expires_at = _stored_expiry(current_override["expires_at"])
-    return manual if expires_at is None or expires_at > as_of else fallback
-
-
-def _deactivated_history(
-    history: list[tuple[object, ...]],
-    current_id: int | None,
-) -> list[tuple[object, ...]]:
-    return [(*row[:-1], 0) if row[0] == current_id else row for row in history]
 
 
 def _sanitize_origin_url(value: str) -> str:
@@ -996,14 +947,7 @@ class SQLiteArtifactStore:
         connection: sqlite3.Connection,
         sha256: str,
         operation_at: datetime,
-    ) -> tuple[
-        sqlite3.Row,
-        sqlite3.Row | None,
-        Decision,
-        Decision,
-        str | None,
-        str | None,
-    ]:
+    ) -> tuple[sqlite3.Row, sqlite3.Row | None, PersistedStateContext]:
         artifact_row = connection.execute(
             "SELECT * FROM artifacts WHERE sha256 = ?",
             (sha256,),
@@ -1013,9 +957,10 @@ class SQLiteArtifactStore:
 
         verdict_rows = connection.execute(
             """
-            SELECT decision, policy_version, analyzer_version
+            SELECT *
             FROM verdicts
             WHERE sha256 = ? AND is_current = 1
+            ORDER BY id LIMIT 2
             """,
             (sha256,),
         ).fetchall()
@@ -1026,172 +971,110 @@ class SQLiteArtifactStore:
                    expires_at, is_current
             FROM manual_overrides
             WHERE sha256 = ? AND is_current = 1
+            ORDER BY id LIMIT 2
             """,
             (sha256,),
         ).fetchall()
         try:
             if len(verdict_rows) > 1:
-                raise ValueError("multiple current verdicts")
+                raise PersistedStateCorruption("multiple current verdicts")
             if len(override_rows) > 1:
-                raise ValueError("multiple current overrides")
-
-            state_raw = artifact_row["state"]
-            if type(state_raw) is not str:
-                raise ValueError("stored artifact state is invalid")
-            state = ArtifactState(state_raw)
-            if state is ArtifactState.MISSING:
-                raise ValueError("stored artifact state is invalid")
-
-            automated_decision = None
-            policy_version = None
-            analyzer_version = None
-            if verdict_rows:
-                verdict_row = verdict_rows[0]
-                decision_raw = verdict_row["decision"]
-                if type(decision_raw) is not str:
-                    raise ValueError("stored verdict decision is invalid")
-                automated_decision = Decision(decision_raw)
-                policy_version = _require_stored_string(
-                    verdict_row["policy_version"],
-                    "stored policy_version",
-                )
-                analyzer_version = _require_stored_string(
-                    verdict_row["analyzer_version"],
-                    "stored analyzer_version",
-                )
-
-            state_requires_verdict = state in (
-                ArtifactState.ALLOW,
-                ArtifactState.REVIEW,
-                ArtifactState.DENY,
-            )
-            if state_requires_verdict and automated_decision is None:
-                raise ValueError("terminal artifact has no current verdict")
-            if (
-                state_requires_verdict
-                and automated_decision is not None
-                and automated_decision.value != state.value
-            ):
-                raise ValueError("artifact state and verdict do not match")
-
+                raise PersistedStateCorruption("multiple current overrides")
+            current_verdict = verdict_rows[0] if verdict_rows else None
             current_override = override_rows[0] if override_rows else None
-            if current_override is not None:
-                manual_raw = current_override["decision"]
-                if type(manual_raw) is not str:
-                    raise ValueError("stored override decision is invalid")
-                manual = Decision(manual_raw)
-                if manual not in (Decision.ALLOW, Decision.DENY):
-                    raise ValueError("stored override decision is invalid")
-                _require_stored_string(
-                    current_override["actor"],
-                    "stored override actor",
-                )
-                _require_stored_string(
-                    current_override["reason"],
-                    "stored override reason",
-                )
-                created_at = _stored_datetime(
-                    current_override["created_at"],
-                    "override created_at",
-                )
-                expires_at = _stored_expiry(current_override["expires_at"])
-                if expires_at is not None and expires_at <= created_at:
-                    raise ValueError("stored override expiry is invalid")
-
-            fallback = _effective_decision(
-                state.value,
-                automated_decision.value if automated_decision else None,
-                None,
-                operation_at,
-            )
-            effective = _effective_decision(
-                state.value,
-                automated_decision.value if automated_decision else None,
+            context = validate_persisted_state(
+                artifact_row,
+                current_verdict,
                 current_override,
                 operation_at,
             )
-        except (OverflowError, TypeError, ValueError) as exc:
+        except PersistedStateCorruption as exc:
             path = str(self.connection_factory.path)
             raise StoreUnavailable(path) from exc
-        return (
-            artifact_row,
-            current_override,
-            effective,
-            fallback,
-            policy_version,
-            analyzer_version,
-        )
+        return artifact_row, current_override, context
 
     @staticmethod
-    def _override_history(
+    def _history_counts(
         connection: sqlite3.Connection,
         sha256: str,
-    ) -> list[tuple[object, ...]]:
-        rows = connection.execute(
+    ) -> tuple[int, int, int]:
+        row = connection.execute(
             """
-            SELECT id, sha256, decision, actor, reason, created_at,
-                   expires_at, is_current
-            FROM manual_overrides WHERE sha256 = ? ORDER BY id
+            SELECT
+                (SELECT COUNT(*) FROM verdicts WHERE sha256 = ?),
+                (
+                    SELECT COUNT(*) FROM evidence AS e
+                    JOIN verdicts AS v ON v.id = e.verdict_id
+                    WHERE v.sha256 = ?
+                ),
+                (SELECT COUNT(*) FROM manual_overrides WHERE sha256 = ?)
             """,
-            (sha256,),
-        ).fetchall()
-        return [tuple(row) for row in rows]
+            (sha256, sha256, sha256),
+        ).fetchone()
+        if row is None or any(type(value) is not int for value in row):
+            raise TransitionConflict("history count failed")
+        return tuple(row)
 
-    @staticmethod
-    def _verdict_history(
+    def _verify_administrator_result(
+        self,
         connection: sqlite3.Connection,
+        *,
         sha256: str,
-    ) -> list[tuple[object, ...]]:
-        rows = connection.execute(
-            "SELECT * FROM verdicts WHERE sha256 = ? ORDER BY id",
-            (sha256,),
-        ).fetchall()
-        return [tuple(row) for row in rows]
-
-    @staticmethod
-    def _evidence_history(
-        connection: sqlite3.Connection,
-        sha256: str,
-    ) -> list[tuple[object, ...]]:
-        rows = connection.execute(
-            """
-            SELECT e.* FROM evidence AS e
-            JOIN verdicts AS v ON v.id = e.verdict_id
-            WHERE v.sha256 = ? ORDER BY e.id
-            """,
-            (sha256,),
-        ).fetchall()
-        return [tuple(row) for row in rows]
-
-    @classmethod
-    def _verify_unchanged_automated_state(
-        cls,
-        connection: sqlite3.Connection,
-        sha256: str,
-        artifact_snapshot: tuple[object, ...],
-        verdict_snapshot: list[tuple[object, ...]],
-        evidence_snapshot: list[tuple[object, ...]],
+        operation_at: datetime,
+        expected_artifact: tuple[object, ...],
+        expected_counts: tuple[int, int, int],
+        expected_verdict_id: int | None,
+        expected_override_id: int | None,
     ) -> None:
         artifact = connection.execute(
             "SELECT * FROM artifacts WHERE sha256 = ?",
             (sha256,),
         ).fetchone()
-        if artifact is None or tuple(artifact) != artifact_snapshot:
-            raise TransitionConflict("artifact changed during override")
-        if cls._verdict_history(connection, sha256) != verdict_snapshot:
-            raise TransitionConflict("verdict history changed")
-        if cls._evidence_history(connection, sha256) != evidence_snapshot:
-            raise TransitionConflict("evidence history changed")
+        if artifact is None or tuple(artifact) != expected_artifact:
+            raise TransitionConflict("administrator artifact state changed")
+        if self._history_counts(connection, sha256) != expected_counts:
+            raise TransitionConflict("administrator history count changed")
 
-    @classmethod
-    def _verify_override_history(
-        cls,
-        connection: sqlite3.Connection,
-        sha256: str,
-        expected: list[tuple[object, ...]],
-    ) -> None:
-        if cls._override_history(connection, sha256) != expected:
-            raise TransitionConflict("override history changed")
+        verdict_rows = connection.execute(
+            """
+            SELECT * FROM verdicts
+            WHERE sha256 = ? AND is_current = 1
+            ORDER BY id LIMIT 2
+            """,
+            (sha256,),
+        ).fetchall()
+        override_rows = connection.execute(
+            """
+            SELECT id, sha256, decision, actor, reason, created_at,
+                   expires_at, is_current
+            FROM manual_overrides
+            WHERE sha256 = ? AND is_current = 1
+            ORDER BY id LIMIT 2
+            """,
+            (sha256,),
+        ).fetchall()
+        verdict_ids = [row["id"] for row in verdict_rows]
+        override_ids = [row["id"] for row in override_rows]
+        expected_verdict_ids = []
+        if expected_verdict_id is not None:
+            expected_verdict_ids = [expected_verdict_id]
+        expected_override_ids = []
+        if expected_override_id is not None:
+            expected_override_ids = [expected_override_id]
+        if verdict_ids != expected_verdict_ids:
+            raise TransitionConflict("current verdict changed")
+        if override_ids != expected_override_ids:
+            raise TransitionConflict("current override changed")
+        try:
+            validate_persisted_state(
+                artifact,
+                verdict_rows[0] if verdict_rows else None,
+                override_rows[0] if override_rows else None,
+                operation_at,
+            )
+        except PersistedStateCorruption as exc:
+            path = str(self.connection_factory.path)
+            raise StoreUnavailable(path) from exc
 
     @staticmethod
     def _deactivate_override(
@@ -1238,25 +1121,21 @@ class SQLiteArtifactStore:
             )
             if expires_at is not None and expires_at <= operation_at:
                 raise ValueError("expires_at must be in the future")
-            context = self._administrator_context(
+            administrator = self._administrator_context(
                 connection,
                 sha256,
                 operation_at,
             )
-            (
-                artifact_row,
-                current_override,
-                previous,
-                _fallback,
-                policy_version,
-                analyzer_version,
-            ) = context
-            if artifact_row["state"] not in _TERMINAL_STATES:
+            artifact_row, current_override, state_context = administrator
+            if state_context.artifact_state.value not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
             artifact_snapshot = tuple(artifact_row)
-            verdict_snapshot = self._verdict_history(connection, sha256)
-            evidence_snapshot = self._evidence_history(connection, sha256)
-            override_snapshot = self._override_history(connection, sha256)
+            history_counts = self._history_counts(connection, sha256)
+            expected_counts = (
+                history_counts[0],
+                history_counts[1],
+                history_counts[2] + 1,
+            )
             if current_override is not None:
                 self._deactivate_override(connection, current_override)
 
@@ -1297,60 +1176,29 @@ class SQLiteArtifactStore:
                 1,
             ):
                 raise TransitionConflict("stored override mismatch")
-            current_rows = connection.execute(
-                """
-                SELECT id FROM manual_overrides
-                WHERE sha256 = ? AND is_current = 1
-                """,
-                (sha256,),
-            ).fetchall()
-            if [row["id"] for row in current_rows] != [override_id]:
-                message = "new override is not uniquely current"
-                raise TransitionConflict(message)
-            current_id = None
-            if current_override is not None:
-                current_id = current_override["id"]
-            expected_history = _deactivated_history(
-                override_snapshot,
-                current_id,
-            )
-            expected_history.append(
-                (
-                    override_id,
-                    sha256,
-                    decision.value,
-                    actor,
-                    reason,
-                    created_at,
-                    expires_text,
-                    1,
-                ),
-            )
-            self._verify_override_history(
-                connection,
-                sha256,
-                expected_history,
-            )
-            self._verify_unchanged_automated_state(
-                connection,
-                sha256,
-                artifact_snapshot,
-                verdict_snapshot,
-                evidence_snapshot,
-            )
+            verification = {
+                "sha256": sha256,
+                "operation_at": operation_at,
+                "expected_artifact": artifact_snapshot,
+                "expected_counts": expected_counts,
+                "expected_verdict_id": state_context.current_verdict_id,
+                "expected_override_id": override_id,
+            }
+            self._verify_administrator_result(connection, **verification)
 
             self._audit(
                 connection,
                 actor=actor,
                 action="artifact.override_set",
                 sha256=sha256,
-                previous=previous,
+                previous=state_context.effective_decision,
                 new=decision,
                 reason=reason,
-                policy_version=policy_version,
-                analyzer_version=analyzer_version,
+                policy_version=state_context.policy_version,
+                analyzer_version=state_context.analyzer_version,
                 occurred_at=operation_at,
             )
+            self._verify_administrator_result(connection, **verification)
 
     def revoke_manual_override(
         self,
@@ -1369,65 +1217,41 @@ class SQLiteArtifactStore:
                 _require_datetime(self._now(), "now"),
                 "now",
             )
-            context = self._administrator_context(
+            administrator = self._administrator_context(
                 connection,
                 sha256,
                 operation_at,
             )
-            (
-                artifact_row,
-                current_override,
-                previous,
-                fallback,
-                policy_version,
-                analyzer_version,
-            ) = context
-            if artifact_row["state"] not in _TERMINAL_STATES:
+            artifact_row, current_override, state_context = administrator
+            if state_context.artifact_state.value not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
             if current_override is None:
                 raise TransitionConflict(sha256)
             artifact_snapshot = tuple(artifact_row)
-            verdict_snapshot = self._verdict_history(connection, sha256)
-            evidence_snapshot = self._evidence_history(connection, sha256)
-            override_snapshot = self._override_history(connection, sha256)
+            history_counts = self._history_counts(connection, sha256)
             self._deactivate_override(connection, current_override)
-            current_rows = connection.execute(
-                """
-                SELECT id FROM manual_overrides
-                WHERE sha256 = ? AND is_current = 1
-                """,
-                (sha256,),
-            ).fetchall()
-            if current_rows:
-                raise TransitionConflict("override remains current")
-            expected_history = _deactivated_history(
-                override_snapshot,
-                current_override["id"],
-            )
-            self._verify_override_history(
-                connection,
-                sha256,
-                expected_history,
-            )
-            self._verify_unchanged_automated_state(
-                connection,
-                sha256,
-                artifact_snapshot,
-                verdict_snapshot,
-                evidence_snapshot,
-            )
+            verification = {
+                "sha256": sha256,
+                "operation_at": operation_at,
+                "expected_artifact": artifact_snapshot,
+                "expected_counts": history_counts,
+                "expected_verdict_id": state_context.current_verdict_id,
+                "expected_override_id": None,
+            }
+            self._verify_administrator_result(connection, **verification)
             self._audit(
                 connection,
                 actor=actor,
                 action="artifact.override_revoked",
                 sha256=sha256,
-                previous=previous,
-                new=fallback,
+                previous=state_context.effective_decision,
+                new=state_context.fallback_decision,
                 reason=reason,
-                policy_version=policy_version,
-                analyzer_version=analyzer_version,
+                policy_version=state_context.policy_version,
+                analyzer_version=state_context.analyzer_version,
                 occurred_at=operation_at,
             )
+            self._verify_administrator_result(connection, **verification)
 
     def request_rescan(
         self,
@@ -1447,25 +1271,16 @@ class SQLiteArtifactStore:
                 "now",
             )
             operation_text = operation_at.isoformat()
-            context = self._administrator_context(
+            administrator = self._administrator_context(
                 connection,
                 sha256,
                 operation_at,
             )
-            (
-                artifact_row,
-                current_override,
-                previous,
-                _fallback,
-                policy_version,
-                analyzer_version,
-            ) = context
-            state = artifact_row["state"]
+            artifact_row, current_override, state_context = administrator
+            state = state_context.artifact_state.value
             if state not in _TERMINAL_STATES:
                 raise TransitionConflict(sha256)
-            verdict_snapshot = self._verdict_history(connection, sha256)
-            evidence_snapshot = self._evidence_history(connection, sha256)
-            override_snapshot = self._override_history(connection, sha256)
+            history_counts = self._history_counts(connection, sha256)
 
             updated = connection.execute(
                 """
@@ -1481,59 +1296,36 @@ class SQLiteArtifactStore:
                 raise TransitionConflict(sha256)
             if current_override is not None:
                 self._deactivate_override(connection, current_override)
-
-            final_artifact = connection.execute(
-                """
-                SELECT state, lease_owner, lease_expires_at, lease_token,
-                       last_error, updated_at
-                FROM artifacts WHERE sha256 = ?
-                """,
-                (sha256,),
-            ).fetchone()
-            if final_artifact is None or tuple(final_artifact) != (
+            expected_artifact = (
+                artifact_row["sha256"],
+                artifact_row["size_bytes"],
                 "DISCOVERED",
-                None,
-                None,
-                None,
-                None,
+                artifact_row["discovered_at"],
                 operation_text,
-            ):
-                raise TransitionConflict("artifact rescan state mismatch")
-            current_rows = connection.execute(
-                """
-                SELECT id FROM manual_overrides
-                WHERE sha256 = ? AND is_current = 1
-                """,
-                (sha256,),
-            ).fetchall()
-            if current_rows:
-                raise TransitionConflict("override remains current")
-            current_id = None
-            if current_override is not None:
-                current_id = current_override["id"]
-            expected_history = _deactivated_history(
-                override_snapshot,
-                current_id,
+                None,
+                None,
+                None,
+                None,
             )
-            self._verify_override_history(
-                connection,
-                sha256,
-                expected_history,
-            )
-            if self._verdict_history(connection, sha256) != verdict_snapshot:
-                raise TransitionConflict("verdict history changed")
-            if self._evidence_history(connection, sha256) != evidence_snapshot:
-                raise TransitionConflict("evidence history changed")
-
+            verification = {
+                "sha256": sha256,
+                "operation_at": operation_at,
+                "expected_artifact": expected_artifact,
+                "expected_counts": history_counts,
+                "expected_verdict_id": state_context.current_verdict_id,
+                "expected_override_id": None,
+            }
+            self._verify_administrator_result(connection, **verification)
             self._audit(
                 connection,
                 actor=actor,
                 action="artifact.rescan_requested",
                 sha256=sha256,
-                previous=previous,
+                previous=state_context.effective_decision,
                 new=Decision.DENY,
                 reason=reason,
-                policy_version=policy_version,
-                analyzer_version=analyzer_version,
+                policy_version=state_context.policy_version,
+                analyzer_version=state_context.analyzer_version,
                 occurred_at=operation_at,
             )
+            self._verify_administrator_result(connection, **verification)

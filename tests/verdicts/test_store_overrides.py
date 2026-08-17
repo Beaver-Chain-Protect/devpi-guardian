@@ -75,6 +75,29 @@ class NeverConnectFactory:
         raise AssertionError("invalid input opened SQLite")
 
 
+class EvidencePayloadReadGuardFactory:
+    def __init__(self, base: ConnectionFactory) -> None:
+        self.base = base
+        self.path = base.path
+        self.payload_reads: list[tuple[str | None, str | None]] = []
+        self._callbacks = []
+
+    def connect(self):
+        connection = self.base.connect()
+
+        def authorizer(action, table, column, _database, _trigger):
+            is_read = action == sqlite3.SQLITE_READ
+            reads_payload = table == "evidence" and column == "details_json"
+            if is_read and reads_payload:
+                self.payload_reads.append((table, column))
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self._callbacks.append(authorizer)
+        connection.set_authorizer(authorizer)
+        return connection
+
+
 def database_snapshot(store: SQLiteArtifactStore) -> tuple[list[tuple], ...]:
     return tuple(
         [tuple(row) for row in fetchall(store, query)]
@@ -810,33 +833,40 @@ def test_sqlite_failure_rolls_back_and_maps_to_store_unavailable(
 
 
 @pytest.mark.parametrize(
-    "trigger_sql",
+    ("trigger_sql", "error_type"),
     [
-        """
-        CREATE TRIGGER ignore_override_insert
-        BEFORE INSERT ON manual_overrides
-        BEGIN SELECT RAISE(IGNORE); END
-        """,
-        """
-        CREATE TRIGGER rewrite_override_insert
-        AFTER INSERT ON manual_overrides
-        BEGIN
-            UPDATE manual_overrides
-            SET reason = 'trigger changed history' WHERE id = NEW.id;
-        END
-        """,
+        (
+            """
+            CREATE TRIGGER ignore_override_insert
+            BEFORE INSERT ON manual_overrides
+            BEGIN SELECT RAISE(IGNORE); END
+            """,
+            TransitionConflict,
+        ),
+        (
+            """
+            CREATE TRIGGER rewrite_override_insert
+            AFTER INSERT ON manual_overrides
+            BEGIN
+                UPDATE manual_overrides
+                SET reason = 'trigger changed history' WHERE id = NEW.id;
+            END
+            """,
+            StoreUnavailable,
+        ),
     ],
 )
 def test_set_detects_ignored_or_rewritten_insert_and_rolls_back(
     tmp_path,
     audit_writer,
     trigger_sql: str,
+    error_type: type[Exception],
 ) -> None:
     store = terminal_store(tmp_path, audit_writer)
     before = database_snapshot(store)
     install_trigger(store, trigger_sql)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(error_type):
         store.set_manual_override(manual_override())
 
     assert database_snapshot(store) == before
@@ -893,7 +923,7 @@ def test_override_removal_detects_after_trigger_reactivation(
         """,
     )
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         perform_admin_operation(store, operation)
 
     assert database_snapshot(store) == before
@@ -901,42 +931,53 @@ def test_override_removal_detects_after_trigger_reactivation(
 
 
 @pytest.mark.parametrize(
-    "trigger_sql",
+    ("trigger_sql", "error_type"),
     [
-        """
-        CREATE TRIGGER ignore_rescan
-        BEFORE UPDATE OF state ON artifacts
-        WHEN NEW.state = 'DISCOVERED'
-        BEGIN SELECT RAISE(IGNORE); END
-        """,
-        """
-        CREATE TRIGGER rewrite_rescan
-        AFTER UPDATE OF state ON artifacts
-        WHEN NEW.state = 'DISCOVERED'
-        BEGIN
-            UPDATE artifacts SET state = 'DENY' WHERE sha256 = NEW.sha256;
-        END
-        """,
-        """
-        CREATE TRIGGER rewrite_verdict_during_rescan
-        AFTER UPDATE OF state ON artifacts
-        WHEN NEW.state = 'DISCOVERED'
-        BEGIN
-            UPDATE verdicts SET decision = 'DENY' WHERE sha256 = NEW.sha256;
-        END
-        """,
+        (
+            """
+            CREATE TRIGGER ignore_rescan
+            BEFORE UPDATE OF state ON artifacts
+            WHEN NEW.state = 'DISCOVERED'
+            BEGIN SELECT RAISE(IGNORE); END
+            """,
+            TransitionConflict,
+        ),
+        (
+            """
+            CREATE TRIGGER rewrite_rescan
+            AFTER UPDATE OF state ON artifacts
+            WHEN NEW.state = 'DISCOVERED'
+            BEGIN
+                UPDATE artifacts SET state = 'DENY' WHERE sha256 = NEW.sha256;
+            END
+            """,
+            TransitionConflict,
+        ),
+        (
+            """
+            CREATE TRIGGER rewrite_verdict_during_rescan
+            AFTER UPDATE OF state ON artifacts
+            WHEN NEW.state = 'DISCOVERED'
+            BEGIN
+                UPDATE verdicts SET decision = 'DENY'
+                WHERE sha256 = NEW.sha256;
+            END
+            """,
+            StoreUnavailable,
+        ),
     ],
 )
 def test_rescan_checks_final_artifact_and_verdict_state(
     tmp_path,
     audit_writer,
     trigger_sql: str,
+    error_type: type[Exception],
 ) -> None:
     store = prepare_admin_operation(tmp_path, audit_writer, "rescan")
     before = database_snapshot(store)
     install_trigger(store, trigger_sql)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(error_type):
         store.request_rescan(SHA256, "admin", "policy changed")
 
     assert database_snapshot(store) == before
@@ -1048,7 +1089,7 @@ def test_concurrent_override_removal_or_rescan_has_one_winner(
     assert len(audit_writer.events) == 1
 
 
-def test_revoke_rejects_current_override_on_nonterminal_artifact(
+def test_current_override_on_nonterminal_artifact_is_corruption(
     tmp_path,
     audit_writer,
 ) -> None:
@@ -1067,7 +1108,7 @@ def test_revoke_rejects_current_override_on_nonterminal_artifact(
     audit_writer.events.clear()
     before = database_snapshot(store)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         store.revoke_manual_override(SHA256, "admin", "withdrawn")
 
     assert database_snapshot(store) == before
@@ -1131,7 +1172,7 @@ def test_audit_callback_runs_inside_the_immediate_transaction(
 
 
 @pytest.mark.parametrize(
-    ("operation", "trigger_sql"),
+    ("operation", "trigger_sql", "error_type"),
     [
         (
             "set",
@@ -1143,6 +1184,7 @@ def test_audit_callback_runs_inside_the_immediate_transaction(
                 SET state = 'DISCOVERED' WHERE sha256 = NEW.sha256;
             END
             """,
+            TransitionConflict,
         ),
         (
             "revoke",
@@ -1155,6 +1197,7 @@ def test_audit_callback_runs_inside_the_immediate_transaction(
                 SET decision = 'DENY' WHERE sha256 = NEW.sha256;
             END
             """,
+            StoreUnavailable,
         ),
     ],
 )
@@ -1163,12 +1206,13 @@ def test_set_and_revoke_detect_after_trigger_changes_outside_override_row(
     audit_writer,
     operation: str,
     trigger_sql: str,
+    error_type: type[Exception],
 ) -> None:
     store = prepare_admin_operation(tmp_path, audit_writer, operation)
     before = database_snapshot(store)
     install_trigger(store, trigger_sql)
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(error_type):
         perform_admin_operation(store, operation)
 
     assert database_snapshot(store) == before
@@ -1216,7 +1260,7 @@ def test_admin_transitions_preserve_all_older_override_history(
             """,
         )
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         perform_admin_operation(store, operation)
 
     assert database_snapshot(store) == before
@@ -1255,7 +1299,7 @@ def test_admin_transition_preserves_immutable_evidence_history(
         """,
     )
 
-    with pytest.raises(TransitionConflict):
+    with pytest.raises(StoreUnavailable):
         store.set_manual_override(manual_override())
 
     assert database_snapshot(store) == before
@@ -1313,6 +1357,8 @@ def test_corrupt_artifact_or_current_verdict_context_is_unavailable(
     store = terminal_store(tmp_path, audit_writer, Decision.REVIEW)
     with closing(store.connection_factory.connect()) as connection, connection:
         connection.execute("PRAGMA ignore_check_constraints = ON")
+        if table == "verdicts":
+            connection.execute("DROP TRIGGER verdicts_history_update_guard")
         connection.execute(
             f"UPDATE {table} SET {assignment} WHERE sha256 = ?",
             (*parameters, SHA256),
@@ -1347,6 +1393,8 @@ def test_terminal_state_requires_one_matching_current_verdict(
 ) -> None:
     store = terminal_store(tmp_path, audit_writer, state)
     with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute("DROP TRIGGER verdicts_history_update_guard")
+        connection.execute("DROP TRIGGER verdicts_history_delete_guard")
         if replacement is None:
             connection.execute(
                 "DELETE FROM verdicts WHERE sha256 = ?",
@@ -1425,6 +1473,9 @@ def test_corrupt_current_override_context_is_unavailable(
     with closing(store.connection_factory.connect()) as connection, connection:
         connection.execute("PRAGMA ignore_check_constraints = ON")
         connection.execute(
+            "DROP TRIGGER manual_overrides_history_update_guard",
+        )
+        connection.execute(
             f"""
             UPDATE manual_overrides SET {assignment} = ?
             WHERE is_current = 1
@@ -1440,3 +1491,90 @@ def test_corrupt_current_override_context_is_unavailable(
     assert isinstance(error.value.__cause__, ValueError)
     assert database_snapshot(store) == before
     assert audit_writer.events == []
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("size_bytes", "size_bytes + 1"),
+        ("discovered_at", "'2026-08-18T00:00:00+00:00'"),
+    ],
+)
+def test_rescan_rolls_back_after_trigger_artifact_identity_mutation(
+    tmp_path,
+    audit_writer,
+    column: str,
+    value: str,
+) -> None:
+    store = prepare_admin_operation(tmp_path, audit_writer, "rescan")
+    before = database_snapshot(store)
+    install_trigger(
+        store,
+        f"""
+        CREATE TRIGGER mutate_artifact_identity_during_rescan
+        AFTER UPDATE OF state ON artifacts
+        WHEN NEW.state = 'DISCOVERED'
+        BEGIN
+            UPDATE artifacts SET {column} = {value} WHERE sha256 = NEW.sha256;
+        END
+        """,
+    )
+
+    with pytest.raises(StoreUnavailable):
+        store.request_rescan(SHA256, "admin", "policy changed")
+
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["set", "revoke", "rescan"])
+def test_admin_transitions_reject_malformed_artifact_timestamp(
+    tmp_path,
+    audit_writer,
+    operation: str,
+) -> None:
+    store = prepare_admin_operation(tmp_path, audit_writer, operation)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute(
+            "UPDATE artifacts SET updated_at = 'not-a-timestamp'",
+        )
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+
+    with pytest.raises(StoreUnavailable):
+        perform_admin_operation(store, operation)
+
+    assert database_snapshot(store) == before
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["set", "revoke", "rescan"])
+def test_admin_verification_does_not_read_evidence_payloads(
+    tmp_path,
+    audit_writer,
+    operation: str,
+) -> None:
+    base_store = prepare_admin_operation(tmp_path, audit_writer, operation)
+    opened = base_store.connection_factory.connect()
+    with closing(opened) as connection, connection:
+        verdict_id = connection.execute(
+            "SELECT id FROM verdicts WHERE sha256 = ? AND is_current = 1",
+            (SHA256,),
+        ).fetchone()[0]
+        details_json = '{"payload":"' + ("x" * 500_000) + '"}'
+        connection.execute(
+            """
+            INSERT INTO evidence(
+                verdict_id, rule_id, action, file_path, line, message,
+                details_json
+            ) VALUES (?, 'RULE-LARGE', 'REVIEW', NULL, NULL, 'large', ?)
+            """,
+            (verdict_id, details_json),
+        )
+    guard = EvidencePayloadReadGuardFactory(base_store.connection_factory)
+    store = SQLiteArtifactStore(guard, audit_writer, now=lambda: NOW)
+    audit_writer.events.clear()
+
+    perform_admin_operation(store, operation)
+
+    assert guard.payload_reads == []

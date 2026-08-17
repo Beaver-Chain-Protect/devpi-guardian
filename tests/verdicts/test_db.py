@@ -16,6 +16,8 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     with closing(factory.connect()) as connection:
         table_query = "SELECT name FROM sqlite_master WHERE type = 'table'"
         tables = {row[0] for row in connection.execute(table_query)}
+        trigger_query = "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        triggers = {row[0] for row in connection.execute(trigger_query)}
         version_query = "SELECT MAX(version) FROM schema_migrations"
         version = connection.execute(version_query).fetchone()[0]
     expected_tables = {
@@ -25,7 +27,17 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "evidence",
         "manual_overrides",
     }
+    expected_triggers = {
+        "artifacts_identity_immutable",
+        "verdicts_history_update_guard",
+        "verdicts_history_delete_guard",
+        "evidence_history_update_guard",
+        "evidence_history_delete_guard",
+        "manual_overrides_history_update_guard",
+        "manual_overrides_history_delete_guard",
+    }
     assert expected_tables <= tables
+    assert triggers == expected_triggers
     assert version == 1
 
 
@@ -279,12 +291,14 @@ def test_migrate_maps_text_version_to_error(tmp_path) -> None:
         "ALTER TABLE artifacts DROP COLUMN last_error",
         "DROP INDEX evidence_verdict_id_idx",
         "DROP INDEX artifacts_lease_token_unique_idx",
+        "DROP TRIGGER artifacts_identity_immutable",
     ],
     ids=[
         "missing-table",
         "missing-column",
         "missing-index",
         "missing-lease-token-index",
+        "missing-identity-trigger",
     ],
 )
 def test_migrate_rejects_incomplete(tmp_path, corruption_sql: str) -> None:
@@ -374,6 +388,96 @@ def test_migrate_rejects_sqlite_lookalike_trigger(tmp_path) -> None:
 
     with pytest.raises(MigrationError):
         migrate(factory)
+
+
+def _seed_history_rows(connection: sqlite3.Connection) -> None:
+    sha256 = "a" * 64
+    timestamp = "2026-08-17T00:00:00+00:00"
+    connection.execute(
+        """
+        INSERT INTO artifacts(
+            sha256, size_bytes, state, discovered_at, updated_at
+        ) VALUES (?, 1, 'REVIEW', ?, ?)
+        """,
+        (sha256, timestamp, timestamp),
+    )
+    verdict = connection.execute(
+        """
+        INSERT INTO verdicts(
+            sha256, decision, score, policy_version, analyzer_version,
+            baseline_sha256, is_current, created_at
+        ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', NULL, 1, ?)
+        """,
+        (sha256, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT INTO evidence(
+            verdict_id, rule_id, action, file_path, line, message,
+            details_json
+        ) VALUES (?, 'RULE-1', 'REVIEW', NULL, NULL, 'review', '{}')
+        """,
+        (verdict.lastrowid,),
+    )
+    connection.execute(
+        """
+        INSERT INTO manual_overrides(
+            sha256, decision, actor, reason, created_at, expires_at,
+            is_current
+        ) VALUES (?, 'ALLOW', 'admin', 'reviewed', ?, NULL, 1)
+        """,
+        (sha256, timestamp),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation_sql",
+    [
+        "UPDATE artifacts SET size_bytes = 2",
+        "UPDATE artifacts SET discovered_at = '2026-08-18T00:00:00+00:00'",
+        f"UPDATE artifacts SET sha256 = {'b' * 64!r}",
+        "UPDATE verdicts SET decision = 'DENY'",
+        "UPDATE verdicts SET decision = 'DENY', is_current = 0",
+        "DELETE FROM verdicts",
+        "UPDATE evidence SET message = 'changed'",
+        "DELETE FROM evidence",
+        "UPDATE manual_overrides SET reason = 'changed'",
+        "UPDATE manual_overrides SET reason = 'changed', is_current = 0",
+        "DELETE FROM manual_overrides",
+    ],
+)
+def test_schema_triggers_reject_identity_and_history_mutation(
+    tmp_path,
+    mutation_sql: str,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    with closing(factory.connect()) as connection, connection:
+        _seed_history_rows(connection)
+
+    with closing(factory.connect()) as connection:  # noqa: SIM117
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(mutation_sql)
+
+
+def test_schema_triggers_allow_only_current_marker_deactivation(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    with closing(factory.connect()) as connection, connection:
+        _seed_history_rows(connection)
+        connection.execute("UPDATE verdicts SET is_current = 0")
+        connection.execute("UPDATE manual_overrides SET is_current = 0")
+
+        verdict_marker = connection.execute(
+            "SELECT is_current FROM verdicts",
+        ).fetchone()[0]
+        override_marker = connection.execute(
+            "SELECT is_current FROM manual_overrides",
+        ).fetchone()[0]
+
+    assert (verdict_marker, override_marker) == (0, 0)
 
 
 @pytest.mark.parametrize(
