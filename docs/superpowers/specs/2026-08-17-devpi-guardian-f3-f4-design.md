@@ -44,6 +44,8 @@ P0는 devpi 플러그인이 등록하는 Pyramid tween과 별도 SQLite 판정 �
 
 - 직접 파일 뷰 실행 전에 tween이 판정을 조회한다.
 - Pyramid tween은 main router보다 먼저 실행되므로 resolver는 `matched_route`, `matchdict`, `context`에 의존하지 않는다. `path_info`와 raw request target을 엄격히 분류하고, keyfs transaction 안에서 `registry["xom"].model.getstage(user, index)`로 stage를 조회한다.
+- raw request target은 decoded `path_info`의 canonical UTF-8 percent encoding과 일치해야 한다. ASCII reserved/unreserved 문자의 대체 encoding이나 이중 decoding 가능성은 거부하되, devpi가 허용하는 Unicode user/index/filename은 지원한다.
+- `+f` entry가 아직 없는 mirror 요청은 pinned devpi view와 같은 프로젝트 metadata refresh만 수행한 뒤 entry를 한 번 재조회할 수 있다. Artifact 본문은 판정 전에 읽거나 전달하지 않으며, 재조회 후에도 canonical SHA-256 entry가 없으면 차단한다.
 - SQLite는 별도 영구 볼륨의 `guardian.db`를 사용한다.
 - 코어 PR 병합을 기다리지 않는다.
 - 향후 devpi 코어가 파일 다운로드 필터 훅을 제공하면 F3 어댑터만 교체한다.

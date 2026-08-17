@@ -51,6 +51,14 @@
 > The guardian tween remains registered under
 > `devpi_server.views.tween_keyfs_transaction`.
 
+> **2026-08-18 mirror/Unicode resolver correction:** Raw URI checks accept
+> only the canonical UTF-8 percent encoding of decoded `SCRIPT_NAME` and
+> `path_info`; alternate ASCII encodings remain ambiguous and fail closed.
+> For a missing `+f` entry, the resolver may mirror devpi 6.20.3's
+> metadata-only project refresh and retry the entry lookup once. It never
+> reads or serves Artifact bytes before verdict enforcement, and `+e` retains
+> its key-exists-first behavior.
+
 ---
 
 ## Source design
