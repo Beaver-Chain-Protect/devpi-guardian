@@ -1024,7 +1024,7 @@ class SQLiteArtifactStore:
         expected_artifact: tuple[object, ...],
         expected_counts: tuple[int, int, int],
         expected_verdict_id: int | None,
-        expected_override_id: int | None,
+        expected_override: tuple[object, ...] | None,
     ) -> None:
         artifact = connection.execute(
             "SELECT * FROM artifacts WHERE sha256 = ?",
@@ -1054,17 +1054,20 @@ class SQLiteArtifactStore:
             (sha256,),
         ).fetchall()
         verdict_ids = [row["id"] for row in verdict_rows]
-        override_ids = [row["id"] for row in override_rows]
         expected_verdict_ids = []
         if expected_verdict_id is not None:
             expected_verdict_ids = [expected_verdict_id]
-        expected_override_ids = []
-        if expected_override_id is not None:
-            expected_override_ids = [expected_override_id]
         if verdict_ids != expected_verdict_ids:
             raise TransitionConflict("current verdict changed")
-        if override_ids != expected_override_ids:
-            raise TransitionConflict("current override changed")
+        expected_override_rows = []
+        if expected_override is not None:
+            expected_override_rows = [expected_override]
+        if [tuple(row) for row in override_rows] != expected_override_rows:
+            corruption = PersistedStateCorruption(
+                "current override changed",
+            )
+            path = str(self.connection_factory.path)
+            raise StoreUnavailable(path) from corruption
         try:
             validate_persisted_state(
                 artifact,
@@ -1158,15 +1161,8 @@ class SQLiteArtifactStore:
             if inserted.rowcount != 1 or type(inserted.lastrowid) is not int:
                 raise TransitionConflict("override insert was ignored")
             override_id = inserted.lastrowid
-            stored = connection.execute(
-                """
-                SELECT sha256, decision, actor, reason, created_at,
-                       expires_at, is_current
-                FROM manual_overrides WHERE id = ?
-                """,
-                (override_id,),
-            ).fetchone()
-            if stored is None or tuple(stored) != (
+            expected_override = (
+                override_id,
                 sha256,
                 decision.value,
                 actor,
@@ -1174,7 +1170,16 @@ class SQLiteArtifactStore:
                 created_at,
                 expires_text,
                 1,
-            ):
+            )
+            stored = connection.execute(
+                """
+                SELECT id, sha256, decision, actor, reason, created_at,
+                       expires_at, is_current
+                FROM manual_overrides WHERE id = ?
+                """,
+                (override_id,),
+            ).fetchone()
+            if stored is None or tuple(stored) != expected_override:
                 raise TransitionConflict("stored override mismatch")
             verification = {
                 "sha256": sha256,
@@ -1182,7 +1187,7 @@ class SQLiteArtifactStore:
                 "expected_artifact": artifact_snapshot,
                 "expected_counts": expected_counts,
                 "expected_verdict_id": state_context.current_verdict_id,
-                "expected_override_id": override_id,
+                "expected_override": expected_override,
             }
             self._verify_administrator_result(connection, **verification)
 
@@ -1236,7 +1241,7 @@ class SQLiteArtifactStore:
                 "expected_artifact": artifact_snapshot,
                 "expected_counts": history_counts,
                 "expected_verdict_id": state_context.current_verdict_id,
-                "expected_override_id": None,
+                "expected_override": None,
             }
             self._verify_administrator_result(connection, **verification)
             self._audit(
@@ -1313,7 +1318,7 @@ class SQLiteArtifactStore:
                 "expected_artifact": expected_artifact,
                 "expected_counts": history_counts,
                 "expected_verdict_id": state_context.current_verdict_id,
-                "expected_override_id": None,
+                "expected_override": None,
             }
             self._verify_administrator_result(connection, **verification)
             self._audit(

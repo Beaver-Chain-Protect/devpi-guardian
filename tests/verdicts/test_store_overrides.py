@@ -1171,6 +1171,51 @@ def test_audit_callback_runs_inside_the_immediate_transaction(
     assert observations == [True]
 
 
+@pytest.mark.parametrize("replacement_id", ["same", "different"])
+def test_set_rolls_back_audit_callback_override_replacement(
+    tmp_path,
+    audit_writer,
+    replacement_id: str,
+) -> None:
+    store = terminal_store(tmp_path, audit_writer)
+    audit_writer.events.clear()
+    before = database_snapshot(store)
+    original_append = audit_writer.append_in_transaction
+
+    def append_in_transaction(connection, event) -> None:
+        original_append(connection, event)
+        current_id = connection.execute(
+            "SELECT id FROM manual_overrides WHERE is_current = 1",
+        ).fetchone()[0]
+        connection.execute(
+            "DROP TRIGGER manual_overrides_history_insert_guard",
+        )
+        connection.execute(
+            "DROP TRIGGER manual_overrides_history_delete_guard",
+        )
+        override_id = current_id
+        if replacement_id == "different":
+            override_id += 1000
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO manual_overrides(
+                id, sha256, decision, actor, reason, created_at, expires_at,
+                is_current
+            ) VALUES (?, ?, 'DENY', 'other', 'replacement', ?, NULL, 1)
+            """,
+            (override_id, SHA256, NOW.isoformat()),
+        )
+
+    audit_writer.append_in_transaction = append_in_transaction
+
+    with pytest.raises(StoreUnavailable):
+        store.set_manual_override(manual_override())
+
+    assert database_snapshot(store) == before
+    assert len(audit_writer.events) == 1
+    migrate(store.connection_factory)
+
+
 @pytest.mark.parametrize(
     ("operation", "trigger_sql", "error_type"),
     [

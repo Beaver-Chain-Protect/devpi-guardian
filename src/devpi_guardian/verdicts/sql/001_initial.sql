@@ -110,6 +110,13 @@ BEGIN
     SELECT RAISE(ABORT, 'immutable artifact identity');
 END;
 
+CREATE TRIGGER verdicts_history_insert_guard
+BEFORE INSERT ON verdicts
+WHEN EXISTS(SELECT 1 FROM verdicts WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable verdict history');
+END;
+
 CREATE TRIGGER verdicts_history_update_guard
 BEFORE UPDATE ON verdicts
 WHEN NOT (
@@ -134,6 +141,13 @@ BEGIN
     SELECT RAISE(ABORT, 'immutable verdict history');
 END;
 
+CREATE TRIGGER evidence_history_insert_guard
+BEFORE INSERT ON evidence
+WHEN EXISTS(SELECT 1 FROM evidence WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable evidence history');
+END;
+
 CREATE TRIGGER evidence_history_update_guard
 BEFORE UPDATE ON evidence
 BEGIN
@@ -144,6 +158,13 @@ CREATE TRIGGER evidence_history_delete_guard
 BEFORE DELETE ON evidence
 BEGIN
     SELECT RAISE(ABORT, 'immutable evidence history');
+END;
+
+CREATE TRIGGER manual_overrides_history_insert_guard
+BEFORE INSERT ON manual_overrides
+WHEN EXISTS(SELECT 1 FROM manual_overrides WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable override history');
 END;
 
 CREATE TRIGGER manual_overrides_history_update_guard

@@ -45,6 +45,19 @@ class ConnectionFactory:
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA recursive_triggers=ON")
+            recursive_triggers = connection.execute(
+                "PRAGMA recursive_triggers",
+            ).fetchone()
+            if (
+                recursive_triggers is None
+                or len(recursive_triggers) != 1
+                or type(recursive_triggers[0]) is not int
+                or recursive_triggers[0] != 1
+            ):
+                raise sqlite3.OperationalError(
+                    "recursive triggers unavailable",
+                )
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
             return connection

@@ -18,6 +18,53 @@ SHA_MISSING = "c" * 64
 NOW = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
 
 
+class FetchallSpyCursor:
+    def __init__(self, cursor, fetched_row_counts: list[int]) -> None:
+        self._cursor = cursor
+        self._fetched_row_counts = fetched_row_counts
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        self._fetched_row_counts.append(len(rows))
+        return rows
+
+
+class FetchallSpyConnection:
+    def __init__(self, connection, fetched_row_counts: list[int]) -> None:
+        self._connection = connection
+        self._fetched_row_counts = fetched_row_counts
+
+    @property
+    def in_transaction(self):
+        return self._connection.in_transaction
+
+    def execute(self, statement, parameters=()):
+        cursor = self._connection.execute(statement, parameters)
+        return FetchallSpyCursor(cursor, self._fetched_row_counts)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+class FetchallSpyFactory:
+    def __init__(self, factory: ConnectionFactory) -> None:
+        self._factory = factory
+        self.path = factory.path
+        self.fetched_row_counts: list[int] = []
+
+    def connect(self):
+        return FetchallSpyConnection(
+            self._factory.connect(),
+            self.fetched_row_counts,
+        )
+
+
 def seed_artifact(
     factory: ConnectionFactory,
     sha256: str,
@@ -475,6 +522,62 @@ def test_duplicate_current_join_rows_are_unavailable(
         SQLiteVerdictReader(factory, now=lambda: NOW).get_effective_decision(
             SHA_REVIEW,
         )
+
+
+def test_duplicate_current_reads_are_bounded_before_validation(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+        manual=Decision.ALLOW,
+    )
+    with closing(factory.connect()) as connection, connection:
+        connection.execute("DROP INDEX verdicts_one_current_idx")
+        connection.execute("DROP INDEX manual_overrides_one_current_idx")
+        timestamp = NOW.isoformat()
+        verdict_parameters = []
+        override_parameters = []
+        for index in range(1, 300):
+            verdict_parameters.append(
+                (SHA_REVIEW, f"policy-{index}", timestamp),
+            )
+            override_parameters.append(
+                (SHA_REVIEW, f"actor-{index}", timestamp),
+            )
+        connection.executemany(
+            """
+            INSERT INTO verdicts(
+                sha256, decision, score, policy_version,
+                analyzer_version, baseline_sha256, is_current, created_at
+            ) VALUES (?, 'REVIEW', 1.0, ?, 'analyzer-duplicate',
+                      NULL, 1, ?)
+            """,
+            verdict_parameters,
+        )
+        connection.executemany(
+            """
+            INSERT INTO manual_overrides(
+                sha256, decision, actor, reason, created_at, expires_at,
+                is_current
+            ) VALUES (?, 'ALLOW', ?, 'duplicate', ?, NULL, 1)
+            """,
+            override_parameters,
+        )
+    spy_factory = FetchallSpyFactory(factory)
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(
+            spy_factory,
+            now=lambda: NOW,
+        ).get_effective_decision(SHA_REVIEW)
+
+    assert spy_factory.fetched_row_counts
+    assert max(spy_factory.fetched_row_counts) <= 2
 
 
 def test_single_delegates_to_batch(monkeypatch, tmp_path) -> None:

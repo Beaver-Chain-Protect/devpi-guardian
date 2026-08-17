@@ -6,7 +6,33 @@ import pytest
 
 from devpi_guardian.verdicts import db
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
-from devpi_guardian.verdicts.errors import MigrationError
+from devpi_guardian.verdicts.errors import MigrationError, StoreUnavailable
+
+
+class PragmaCursor:
+    def __init__(self, row=None) -> None:
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+class PragmaConnection:
+    def __init__(self, recursive_result=(1,), *, fail_set=False) -> None:
+        self.recursive_result = recursive_result
+        self.fail_set = fail_set
+        self.closed = False
+        self.row_factory = None
+
+    def execute(self, statement: str):
+        if statement == "PRAGMA recursive_triggers=ON" and self.fail_set:
+            raise sqlite3.OperationalError("recursive triggers unavailable")
+        if statement == "PRAGMA recursive_triggers":
+            return PragmaCursor(self.recursive_result)
+        return PragmaCursor()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
@@ -29,10 +55,13 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     }
     expected_triggers = {
         "artifacts_identity_immutable",
+        "verdicts_history_insert_guard",
         "verdicts_history_update_guard",
         "verdicts_history_delete_guard",
+        "evidence_history_insert_guard",
         "evidence_history_update_guard",
         "evidence_history_delete_guard",
+        "manual_overrides_history_insert_guard",
         "manual_overrides_history_update_guard",
         "manual_overrides_history_delete_guard",
     }
@@ -49,6 +78,50 @@ def test_connection_enables_required_pragmas(tmp_path) -> None:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 4321
+        recursive = connection.execute("PRAGMA recursive_triggers").fetchone()
+        assert recursive[0] == 1
+
+
+@pytest.mark.parametrize(
+    "recursive_result",
+    [None, (0,), (True,)],
+    ids=["missing", "disabled", "non-integer"],
+)
+def test_connection_rejects_wrong_recursive_trigger_result(
+    tmp_path,
+    monkeypatch,
+    recursive_result,
+) -> None:
+    connection = PragmaConnection(recursive_result)
+    monkeypatch.setattr(
+        db.sqlite3,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        ConnectionFactory(tmp_path / "guardian.db").connect()
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert connection.closed is True
+
+
+def test_connection_maps_recursive_trigger_setup_failure_and_closes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    connection = PragmaConnection(fail_set=True)
+    monkeypatch.setattr(
+        db.sqlite3,
+        "connect",
+        lambda *args, **kwargs: connection,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        ConnectionFactory(tmp_path / "guardian.db").connect()
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert connection.closed is True
 
 
 def test_schema_rejects_invalid_sha256(tmp_path) -> None:
@@ -478,6 +551,99 @@ def test_schema_triggers_allow_only_current_marker_deactivation(
         ).fetchone()[0]
 
     assert (verdict_marker, override_marker) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("table", "recursive_triggers", "replacement_sql"),
+    [
+        (
+            "verdicts",
+            False,
+            """
+            INSERT OR REPLACE INTO verdicts(
+                id, sha256, decision, score, policy_version,
+                analyzer_version, baseline_sha256, is_current, created_at
+            ) VALUES (1, ?, 'DENY', 0.0, 'replacement', 'replacement',
+                      NULL, 1, ?)
+            """,
+        ),
+        (
+            "evidence",
+            False,
+            """
+            INSERT OR REPLACE INTO evidence(
+                id, verdict_id, rule_id, action, file_path, line, message,
+                details_json
+            ) VALUES (1, 1, 'REPLACED', 'DENY', NULL, NULL,
+                      'replacement', '{}')
+            """,
+        ),
+        (
+            "manual_overrides",
+            False,
+            """
+            INSERT OR REPLACE INTO manual_overrides(
+                id, sha256, decision, actor, reason, created_at, expires_at,
+                is_current
+            ) VALUES (1, ?, 'DENY', 'other', 'replacement', ?, NULL, 1)
+            """,
+        ),
+        (
+            "verdicts",
+            True,
+            """
+            INSERT OR REPLACE INTO verdicts(
+                id, sha256, decision, score, policy_version,
+                analyzer_version, baseline_sha256, is_current, created_at
+            ) VALUES (2, ?, 'REVIEW', 1.0, 'replacement', 'replacement',
+                      NULL, 1, ?)
+            """,
+        ),
+        (
+            "manual_overrides",
+            True,
+            """
+            INSERT OR REPLACE INTO manual_overrides(
+                id, sha256, decision, actor, reason, created_at, expires_at,
+                is_current
+            ) VALUES (2, ?, 'DENY', 'other', 'replacement', ?, NULL, 1)
+            """,
+        ),
+    ],
+    ids=[
+        "verdict-id",
+        "evidence-id",
+        "override-id",
+        "verdict-current",
+        "override-current",
+    ],
+)
+def test_schema_triggers_reject_history_replacement(
+    tmp_path,
+    table: str,
+    recursive_triggers: bool,
+    replacement_sql: str,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        _seed_history_rows(connection)
+        recursive_setting = "ON" if recursive_triggers else "OFF"
+        connection.execute(f"PRAGMA recursive_triggers={recursive_setting}")
+        rows = connection.execute(f"SELECT * FROM {table}")
+        before = tuple(tuple(row) for row in rows)
+        parameters = ()
+        if table != "evidence":
+            parameters = ("a" * 64, timestamp)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(replacement_sql, parameters)
+
+        rows = connection.execute(f"SELECT * FROM {table}")
+        after = tuple(tuple(row) for row in rows)
+
+    assert after == before
 
 
 @pytest.mark.parametrize(
