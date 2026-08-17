@@ -217,12 +217,16 @@ class ManualOverrideInput:
         _require_decision(self.decision, "decision")
         if self.decision not in (Decision.ALLOW, Decision.DENY):
             raise ValueError("manual decision must be ALLOW or DENY")
-        if not self.actor.strip():
+        if not isinstance(self.actor, str) or not self.actor.strip():
             raise ValueError("actor must not be blank")
-        if not self.reason.strip():
+        if not isinstance(self.reason, str) or not self.reason.strip():
             raise ValueError("reason must not be blank")
+        if not isinstance(self.created_at, datetime):
+            raise ValueError("created_at must be a datetime")
         created = require_utc(self.created_at, "created_at")
         if self.expires_at is not None:
+            if not isinstance(self.expires_at, datetime):
+                raise ValueError("expires_at must be a datetime")
             expires = require_utc(self.expires_at, "expires_at")
             if expires <= created:
                 raise ValueError("expires_at must be later than created_at")

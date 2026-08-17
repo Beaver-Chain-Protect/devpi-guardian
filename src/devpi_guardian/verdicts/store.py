@@ -20,6 +20,7 @@ from .models import (
     ClaimedArtifact,
     Decision,
     EvidenceInput,
+    ManualOverrideInput,
     ReleaseInput,
     VerdictInput,
     require_utc,
@@ -30,6 +31,7 @@ _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_STORED_TEXT_LENGTH = 4096
 _MAX_DETAILS_JSON_LENGTH = 1024 * 1024
 _MAX_ANALYSIS_ERROR_LENGTH = 4096
+_TERMINAL_STATES = {"ALLOW", "REVIEW", "DENY", "ERROR"}
 
 
 def _require_datetime(value: object, field_name: str) -> datetime:
@@ -220,6 +222,106 @@ def _prepare_evidence(
             )
         )
     return tuple(prepared)
+
+
+def _prepare_manual_override(
+    override: object,
+) -> tuple[str, Decision, str, str, str, datetime | None, str | None]:
+    if type(override) is not ManualOverrideInput:
+        raise ValueError("override must be a ManualOverrideInput")
+    try:
+        sha256 = validate_sha256(override.sha256)
+        decision = override.decision
+        actor = _require_stored_string(override.actor, "actor")
+        reason = _require_stored_string(override.reason, "reason")
+        created_at = _iso(override.created_at, "created_at")
+        expires_value = override.expires_at
+    except AttributeError:
+        message = "ManualOverrideInput missing required fields"
+        raise ValueError(message) from None
+    if type(decision) is not Decision or decision not in (
+        Decision.ALLOW,
+        Decision.DENY,
+    ):
+        raise ValueError("manual decision must be ALLOW or DENY")
+    expires_at = None
+    expires_text = None
+    if expires_value is not None:
+        expires_at = require_utc(
+            _require_datetime(expires_value, "expires_at"),
+            "expires_at",
+        )
+        expires_text = expires_at.isoformat()
+        created = require_utc(
+            _require_datetime(override.created_at, "created_at"),
+            "created_at",
+        )
+        if expires_at <= created:
+            raise ValueError("expires_at must be later than created_at")
+    return (
+        sha256,
+        decision,
+        actor,
+        reason,
+        created_at,
+        expires_at,
+        expires_text,
+    )
+
+
+def _prepare_admin_command(
+    sha256: object,
+    actor: object,
+    reason: object,
+) -> tuple[str, str, str]:
+    return (
+        validate_sha256(sha256),
+        _require_stored_string(actor, "actor"),
+        _require_stored_string(reason, "reason"),
+    )
+
+
+def _stored_expiry(value: object) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if type(value) is not str:
+            raise ValueError("stored override expiry is invalid")
+        parsed = datetime.fromisoformat(value)
+        return require_utc(parsed, "stored override expiry")
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("stored override expiry is invalid") from exc
+
+
+def _effective_decision(
+    state: str,
+    automated_decision: object,
+    current_override: sqlite3.Row | None,
+    as_of: datetime,
+) -> Decision:
+    fallback = (
+        Decision.ALLOW
+        if state == "ALLOW" and automated_decision == Decision.ALLOW.value
+        else Decision.DENY
+    )
+    if current_override is None or state not in _TERMINAL_STATES:
+        return fallback
+    manual_raw = current_override["decision"]
+    try:
+        manual = Decision(manual_raw)
+    except (TypeError, ValueError):
+        raise ValueError("stored override decision is invalid") from None
+    if manual not in (Decision.ALLOW, Decision.DENY):
+        raise ValueError("stored override decision is invalid")
+    expires_at = _stored_expiry(current_override["expires_at"])
+    return manual if expires_at is None or expires_at > as_of else fallback
+
+
+def _deactivated_history(
+    history: list[tuple[object, ...]],
+    current_id: int | None,
+) -> list[tuple[object, ...]]:
+    return [(*row[:-1], 0) if row[0] == current_id else row for row in history]
 
 
 def _sanitize_origin_url(value: str) -> str:
@@ -875,5 +977,450 @@ class SQLiteArtifactStore:
                 action="artifact.analysis_error",
                 sha256=claim_sha256,
                 reason="analysis failed",
+                occurred_at=operation_at,
+            )
+
+    def _administrator_context(
+        self,
+        connection: sqlite3.Connection,
+        sha256: str,
+        operation_at: datetime,
+    ) -> tuple[sqlite3.Row, sqlite3.Row | None, Decision, Decision]:
+        artifact_row = connection.execute(
+            "SELECT * FROM artifacts WHERE sha256 = ?",
+            (sha256,),
+        ).fetchone()
+        if artifact_row is None:
+            raise ArtifactNotFound(sha256)
+
+        verdict_rows = connection.execute(
+            """
+            SELECT decision FROM verdicts
+            WHERE sha256 = ? AND is_current = 1
+            """,
+            (sha256,),
+        ).fetchall()
+        if len(verdict_rows) > 1:
+            raise TransitionConflict("multiple current verdicts")
+        automated_decision = None
+        if verdict_rows:
+            automated_decision = verdict_rows[0]["decision"]
+
+        override_rows = connection.execute(
+            """
+            SELECT id, sha256, decision, actor, reason, created_at,
+                   expires_at, is_current
+            FROM manual_overrides
+            WHERE sha256 = ? AND is_current = 1
+            """,
+            (sha256,),
+        ).fetchall()
+        if len(override_rows) > 1:
+            raise TransitionConflict("multiple current overrides")
+        current_override = override_rows[0] if override_rows else None
+        try:
+            fallback = _effective_decision(
+                artifact_row["state"],
+                automated_decision,
+                None,
+                operation_at,
+            )
+            effective = _effective_decision(
+                artifact_row["state"],
+                automated_decision,
+                current_override,
+                operation_at,
+            )
+        except (OverflowError, TypeError, ValueError) as exc:
+            path = str(self.connection_factory.path)
+            raise StoreUnavailable(path) from exc
+        return artifact_row, current_override, effective, fallback
+
+    @staticmethod
+    def _override_history(
+        connection: sqlite3.Connection,
+        sha256: str,
+    ) -> list[tuple[object, ...]]:
+        rows = connection.execute(
+            """
+            SELECT id, sha256, decision, actor, reason, created_at,
+                   expires_at, is_current
+            FROM manual_overrides WHERE sha256 = ? ORDER BY id
+            """,
+            (sha256,),
+        ).fetchall()
+        return [tuple(row) for row in rows]
+
+    @staticmethod
+    def _verdict_history(
+        connection: sqlite3.Connection,
+        sha256: str,
+    ) -> list[tuple[object, ...]]:
+        rows = connection.execute(
+            "SELECT * FROM verdicts WHERE sha256 = ? ORDER BY id",
+            (sha256,),
+        ).fetchall()
+        return [tuple(row) for row in rows]
+
+    @staticmethod
+    def _evidence_history(
+        connection: sqlite3.Connection,
+        sha256: str,
+    ) -> list[tuple[object, ...]]:
+        rows = connection.execute(
+            """
+            SELECT e.* FROM evidence AS e
+            JOIN verdicts AS v ON v.id = e.verdict_id
+            WHERE v.sha256 = ? ORDER BY e.id
+            """,
+            (sha256,),
+        ).fetchall()
+        return [tuple(row) for row in rows]
+
+    @classmethod
+    def _verify_unchanged_automated_state(
+        cls,
+        connection: sqlite3.Connection,
+        sha256: str,
+        artifact_snapshot: tuple[object, ...],
+        verdict_snapshot: list[tuple[object, ...]],
+        evidence_snapshot: list[tuple[object, ...]],
+    ) -> None:
+        artifact = connection.execute(
+            "SELECT * FROM artifacts WHERE sha256 = ?",
+            (sha256,),
+        ).fetchone()
+        if artifact is None or tuple(artifact) != artifact_snapshot:
+            raise TransitionConflict("artifact changed during override")
+        if cls._verdict_history(connection, sha256) != verdict_snapshot:
+            raise TransitionConflict("verdict history changed")
+        if cls._evidence_history(connection, sha256) != evidence_snapshot:
+            raise TransitionConflict("evidence history changed")
+
+    @classmethod
+    def _verify_override_history(
+        cls,
+        connection: sqlite3.Connection,
+        sha256: str,
+        expected: list[tuple[object, ...]],
+    ) -> None:
+        if cls._override_history(connection, sha256) != expected:
+            raise TransitionConflict("override history changed")
+
+    @staticmethod
+    def _deactivate_override(
+        connection: sqlite3.Connection,
+        current_override: sqlite3.Row,
+    ) -> None:
+        override_id = current_override["id"]
+        cleared = connection.execute(
+            """
+            UPDATE manual_overrides SET is_current = 0
+            WHERE id = ? AND is_current = 1
+            """,
+            (override_id,),
+        )
+        if cleared.rowcount != 1:
+            raise TransitionConflict("current override update failed")
+        persisted = connection.execute(
+            """
+            SELECT id, sha256, decision, actor, reason, created_at,
+                   expires_at, is_current
+            FROM manual_overrides WHERE id = ?
+            """,
+            (override_id,),
+        ).fetchone()
+        expected = (*tuple(current_override)[:-1], 0)
+        if persisted is None or tuple(persisted) != expected:
+            raise TransitionConflict("override history changed")
+
+    def set_manual_override(self, override: ManualOverrideInput) -> None:
+        (
+            sha256,
+            decision,
+            actor,
+            reason,
+            created_at,
+            expires_at,
+            expires_text,
+        ) = _prepare_manual_override(override)
+
+        with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            if expires_at is not None and expires_at <= operation_at:
+                raise ValueError("expires_at must be in the future")
+            context = self._administrator_context(
+                connection,
+                sha256,
+                operation_at,
+            )
+            artifact_row, current_override, previous, _fallback = context
+            if artifact_row["state"] not in _TERMINAL_STATES:
+                raise TransitionConflict(sha256)
+            artifact_snapshot = tuple(artifact_row)
+            verdict_snapshot = self._verdict_history(connection, sha256)
+            evidence_snapshot = self._evidence_history(connection, sha256)
+            override_snapshot = self._override_history(connection, sha256)
+            if current_override is not None:
+                self._deactivate_override(connection, current_override)
+
+            inserted = connection.execute(
+                """
+                INSERT INTO manual_overrides(
+                    sha256, decision, actor, reason, created_at, expires_at,
+                    is_current
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    sha256,
+                    decision.value,
+                    actor,
+                    reason,
+                    created_at,
+                    expires_text,
+                ),
+            )
+            if inserted.rowcount != 1 or type(inserted.lastrowid) is not int:
+                raise TransitionConflict("override insert was ignored")
+            override_id = inserted.lastrowid
+            stored = connection.execute(
+                """
+                SELECT sha256, decision, actor, reason, created_at,
+                       expires_at, is_current
+                FROM manual_overrides WHERE id = ?
+                """,
+                (override_id,),
+            ).fetchone()
+            if stored is None or tuple(stored) != (
+                sha256,
+                decision.value,
+                actor,
+                reason,
+                created_at,
+                expires_text,
+                1,
+            ):
+                raise TransitionConflict("stored override mismatch")
+            current_rows = connection.execute(
+                """
+                SELECT id FROM manual_overrides
+                WHERE sha256 = ? AND is_current = 1
+                """,
+                (sha256,),
+            ).fetchall()
+            if [row["id"] for row in current_rows] != [override_id]:
+                message = "new override is not uniquely current"
+                raise TransitionConflict(message)
+            current_id = None
+            if current_override is not None:
+                current_id = current_override["id"]
+            expected_history = _deactivated_history(
+                override_snapshot,
+                current_id,
+            )
+            expected_history.append(
+                (
+                    override_id,
+                    sha256,
+                    decision.value,
+                    actor,
+                    reason,
+                    created_at,
+                    expires_text,
+                    1,
+                ),
+            )
+            self._verify_override_history(
+                connection,
+                sha256,
+                expected_history,
+            )
+            self._verify_unchanged_automated_state(
+                connection,
+                sha256,
+                artifact_snapshot,
+                verdict_snapshot,
+                evidence_snapshot,
+            )
+
+            self._audit(
+                connection,
+                actor=actor,
+                action="artifact.override_set",
+                sha256=sha256,
+                previous=previous,
+                new=decision,
+                reason=reason,
+                occurred_at=operation_at,
+            )
+
+    def revoke_manual_override(
+        self,
+        sha256: str,
+        actor: str,
+        reason: str,
+    ) -> None:
+        sha256, actor, reason = _prepare_admin_command(
+            sha256,
+            actor,
+            reason,
+        )
+
+        with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            context = self._administrator_context(
+                connection,
+                sha256,
+                operation_at,
+            )
+            artifact_row, current_override, previous, fallback = context
+            if artifact_row["state"] not in _TERMINAL_STATES:
+                raise TransitionConflict(sha256)
+            if current_override is None:
+                raise TransitionConflict(sha256)
+            artifact_snapshot = tuple(artifact_row)
+            verdict_snapshot = self._verdict_history(connection, sha256)
+            evidence_snapshot = self._evidence_history(connection, sha256)
+            override_snapshot = self._override_history(connection, sha256)
+            self._deactivate_override(connection, current_override)
+            current_rows = connection.execute(
+                """
+                SELECT id FROM manual_overrides
+                WHERE sha256 = ? AND is_current = 1
+                """,
+                (sha256,),
+            ).fetchall()
+            if current_rows:
+                raise TransitionConflict("override remains current")
+            expected_history = _deactivated_history(
+                override_snapshot,
+                current_override["id"],
+            )
+            self._verify_override_history(
+                connection,
+                sha256,
+                expected_history,
+            )
+            self._verify_unchanged_automated_state(
+                connection,
+                sha256,
+                artifact_snapshot,
+                verdict_snapshot,
+                evidence_snapshot,
+            )
+            self._audit(
+                connection,
+                actor=actor,
+                action="artifact.override_revoked",
+                sha256=sha256,
+                previous=previous,
+                new=fallback,
+                reason=reason,
+                occurred_at=operation_at,
+            )
+
+    def request_rescan(
+        self,
+        sha256: str,
+        actor: str,
+        reason: str,
+    ) -> None:
+        sha256, actor, reason = _prepare_admin_command(
+            sha256,
+            actor,
+            reason,
+        )
+
+        with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            operation_text = operation_at.isoformat()
+            context = self._administrator_context(
+                connection,
+                sha256,
+                operation_at,
+            )
+            artifact_row, current_override, previous, _fallback = context
+            state = artifact_row["state"]
+            if state not in _TERMINAL_STATES:
+                raise TransitionConflict(sha256)
+            verdict_snapshot = self._verdict_history(connection, sha256)
+            evidence_snapshot = self._evidence_history(connection, sha256)
+            override_snapshot = self._override_history(connection, sha256)
+
+            updated = connection.execute(
+                """
+                UPDATE artifacts
+                SET state = 'DISCOVERED', lease_owner = NULL,
+                    lease_expires_at = NULL, lease_token = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE sha256 = ? AND state = ?
+                """,
+                (operation_text, sha256, state),
+            )
+            if updated.rowcount != 1:
+                raise TransitionConflict(sha256)
+            if current_override is not None:
+                self._deactivate_override(connection, current_override)
+
+            final_artifact = connection.execute(
+                """
+                SELECT state, lease_owner, lease_expires_at, lease_token,
+                       last_error, updated_at
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (sha256,),
+            ).fetchone()
+            if final_artifact is None or tuple(final_artifact) != (
+                "DISCOVERED",
+                None,
+                None,
+                None,
+                None,
+                operation_text,
+            ):
+                raise TransitionConflict("artifact rescan state mismatch")
+            current_rows = connection.execute(
+                """
+                SELECT id FROM manual_overrides
+                WHERE sha256 = ? AND is_current = 1
+                """,
+                (sha256,),
+            ).fetchall()
+            if current_rows:
+                raise TransitionConflict("override remains current")
+            current_id = None
+            if current_override is not None:
+                current_id = current_override["id"]
+            expected_history = _deactivated_history(
+                override_snapshot,
+                current_id,
+            )
+            self._verify_override_history(
+                connection,
+                sha256,
+                expected_history,
+            )
+            if self._verdict_history(connection, sha256) != verdict_snapshot:
+                raise TransitionConflict("verdict history changed")
+            if self._evidence_history(connection, sha256) != evidence_snapshot:
+                raise TransitionConflict("evidence history changed")
+
+            self._audit(
+                connection,
+                actor=actor,
+                action="artifact.rescan_requested",
+                sha256=sha256,
+                previous=previous,
+                new=Decision.DENY,
+                reason=reason,
                 occurred_at=operation_at,
             )
