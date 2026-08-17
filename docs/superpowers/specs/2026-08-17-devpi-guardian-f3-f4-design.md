@@ -6,6 +6,19 @@
 - 범위: F3 직접 URL 차단, F4 Artifact 판정 저장소
 - 구현 저장소: `devpi-guardian`
 
+> **2026-08-18 final resolver/metrics/fixture correction:** Protected
+> `GET`/`HEAD` requests require at least one of `REQUEST_URI`, `RAW_URI`, or
+> `RAW_PATH_INFO`; every present key must match the decoded identity. Literal
+> route markers and canonical UTF-8 encoding are accepted. The only pip
+> compatibility exception is the uppercase encoded fixed third route marker
+> `/%2Bf/` or `/%2Be/`. Lowercase or double encoding, encoded slash, and
+> encoded `+` in user, index, or tail are rejected. The in-process block
+> recorder admits 4,096 normal series plus one fixed
+> `cardinality_overflow` series, keeps incrementing existing keys, validates
+> dimensions, and exposes only a bounded snapshot; external export is not
+> part of F3/F4. The real subprocess harness and the official
+> `pytest-devpi-server` fixture smoke test are both required evidence.
+
 ## 1. 목적
 
 이 문서는 `devpi-guardian`의 직접 Artifact URL 우회를 차단하고, SHA-256 단위 판정을 영속적으로 저장하는 방법을 정의한다. 다른 작업자는 이 문서의 공개 인터페이스를 통해 F1·F2, F5, F7~F12를 연결한다.
@@ -44,7 +57,13 @@ P0는 devpi 플러그인이 등록하는 Pyramid tween과 별도 SQLite 판정 �
 
 - 직접 파일 뷰 실행 전에 tween이 판정을 조회한다.
 - Pyramid tween은 main router보다 먼저 실행되므로 resolver는 `matched_route`, `matchdict`, `context`에 의존하지 않는다. `path_info`와 raw request target을 엄격히 분류하고, keyfs transaction 안에서 `registry["xom"].model.getstage(user, index)`로 stage를 조회한다.
-- raw request target은 decoded `path_info`의 canonical UTF-8 percent encoding과 일치해야 한다. ASCII reserved/unreserved 문자의 대체 encoding이나 이중 decoding 가능성은 거부하되, devpi가 허용하는 Unicode user/index/filename은 지원한다.
+- protected `GET`/`HEAD` raw request target은 `REQUEST_URI`, `RAW_URI`,
+  `RAW_PATH_INFO` 중 하나 이상이 있어야 하며, 존재하는 모든 key는 decoded
+  `path_info` identity와 일치해야 한다. Literal marker와 canonical UTF-8
+  percent encoding만 허용하고, pip 호환을 위해 고정된 세 번째 route
+  marker의 uppercase `/%2Bf/`·`/%2Be/`만 예외로 허용한다. lowercase 또는
+  double encoding, encoded slash, user/index/tail 안의 encoded `+`는
+  거부한다.
 - `+f` entry가 아직 없는 mirror 요청은 pinned devpi view와 같은 프로젝트 metadata refresh만 수행한 뒤 entry를 한 번 재조회할 수 있다. Artifact 본문은 판정 전에 읽거나 전달하지 않으며, 재조회 후에도 canonical SHA-256 entry가 없으면 차단한다.
 - SQLite는 별도 영구 볼륨의 `guardian.db`를 사용한다.
 - 코어 PR 병합을 기다리지 않는다.
@@ -232,10 +251,23 @@ class ArtifactStore(Protocol):
 - `busy_timeout`을 설정한다.
 - 프로세스와 스레드마다 별도 연결을 사용한다.
 - reader는 current verdict와 current override를 별도 bounded query로 읽어 손상 DB의 중복 행을 판정 전에 제한한다.
-- migration은 애플리케이션 요청을 받기 전에 한 프로세스만 실행한다.
+- P0 first initialization에서는 정확히 하나의 startup/migration owner만
+  empty DB에 대해 migration을 실행한다. owner가 readiness를 보고하기
+  전에는 Guardian devpi instance를 여러 개 동시에 시작하지 않는다. 이후
+  초기화된 DB로 시작하는 instance는 schema를 idempotently 검증한다.
+- F5는 devpi plugin의 `ConnectionFactory` 객체를 공유하지 않는다.
+  deployment가 관리하는 동일한 absolute DB path를 `--guardian-db`와 F5의
+  독립적인 `ConnectionFactory` 생성에 각각 전달하고, owner readiness 이후
+  F5를 시작한다.
 - 승인과 취소의 즉시성을 위해 P0에서는 판정 cache를 두지 않는다.
 - 운영 backup은 DB 파일 하나를 복사하지 말고 SQLite backup API 또는 checkpoint 후 일관된 snapshot을 사용한다.
 - migration 실패 시 devpi-guardian을 준비 완료 상태로 올리지 않는다.
+
+F3 tween은 plugin이 Pyramid registry에 설치한 thread-safe in-process block
+recorder를 best effort로 호출한다. Recorder는 validated dimensions로
+최대 4,096개의 normal series와 고정된 `cardinality_overflow` 1개만
+유지하며, 이미 존재하는 series는 cap 이후에도 증가시킨다. Snapshot은
+bounded copy이고 외부 metrics exporter는 이 범위에 포함되지 않는다.
 
 F12는 다음 형태의 adapter를 제공한다.
 
@@ -353,6 +385,9 @@ for link, sha256 in links_with_sha256:
 - 수동 `ALLOW`와 `DENY`, 취소, 만료가 정해진 우선순위로 계산된다.
 - 만료 시각 이후 첫 조회부터 override가 적용되지 않는다.
 - 감사 기록 실패 시 판정 변경이 rollback된다.
+- F12의 persistent audit adapter integration은 별도 deliverable이다. F4
+  현재 검증은 audit writer failure가 같은 transaction의 상태 변경을
+  rollback하는지 증명한다.
 - DB 연결 실패, 잠금 timeout, 손상을 `StoreUnavailable`로 반환한다.
 - reader와 store가 동일한 저장 상태 검증기를 사용하며, 상태기계상 불가능하거나 형식이 손상된 current verdict/override는 허용 판정이나 일반 전이 충돌로 처리하지 않고 `StoreUnavailable`로 반환한다.
 - F2의 일괄 판정 조회가 단건 조회와 동일한 결과를 반환한다.
@@ -385,6 +420,8 @@ for link, sha256 in links_with_sha256:
 - DB 잠금·중단·재연결 장애 테스트
 - 승인·취소·만료 동시성 테스트
 - 판정 조회 성능 측정
+- real subprocess harness와 `pytest-devpi-server` official fixture smoke
+  proof를 모두 포함한다.
 
 ## 11. 확정된 구현 기준
 

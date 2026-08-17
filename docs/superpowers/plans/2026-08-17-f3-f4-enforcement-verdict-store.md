@@ -59,6 +59,19 @@
 > reads or serves Artifact bytes before verdict enforcement, and `+e` retains
 > its key-exists-first behavior.
 
+> **2026-08-18 final resolver/metrics/fixture correction:** Protected
+> `GET`/`HEAD` requests require at least one of `REQUEST_URI`, `RAW_URI`, or
+> `RAW_PATH_INFO`; every present key must match the decoded identity. Literal
+> route markers and canonical UTF-8 encoding are accepted. The only pip
+> compatibility exception is the uppercase encoded fixed third route marker
+> `/%2Bf/` or `/%2Be/`. Lowercase or double encoding, encoded slash, and
+> encoded `+` in user, index, or tail are rejected. The in-process block
+> recorder admits 4,096 normal series plus one fixed
+> `cardinality_overflow` series, keeps incrementing existing keys, validates
+> dimensions, and exposes only a bounded snapshot; external export is not
+> part of F3/F4. Preserve both the real subprocess harness and the official
+> `pytest-devpi-server` fixture smoke proof.
+
 ---
 
 ## Source design
@@ -79,6 +92,7 @@ devpi-guardian/
 │   ├── plugin.py
 │   ├── enforcement/
 │   │   ├── __init__.py
+│   │   ├── metrics.py
 │   │   ├── resolve.py
 │   │   └── tween.py
 │   └── verdicts/
@@ -98,11 +112,13 @@ devpi-guardian/
 │   ├── __init__.py
 │   ├── test_package.py
 │   ├── enforcement/
+│   │   ├── test_metrics.py
 │   │   ├── test_resolve.py
 │   │   └── test_tween.py
 │   ├── integration/
 │   │   ├── conftest.py
-│   │   └── test_direct_download.py
+│   │   ├── test_direct_download.py
+│   │   └── test_pytest_devpi_server.py
 │   └── verdicts/
 │       ├── __init__.py
 │       ├── test_db.py
@@ -2147,7 +2163,9 @@ git commit -m "feat: resolve devpi release digests"
 ### Task 9: Enforce ALLOW-only direct downloads in a Pyramid tween
 
 **Files:**
+- Create: src/devpi_guardian/enforcement/metrics.py
 - Create: src/devpi_guardian/enforcement/tween.py
+- Create: tests/enforcement/test_metrics.py
 - Create: tests/enforcement/test_tween.py
 
 - [ ] **Step 1: Write failing HTTP behavior tests**
@@ -2489,6 +2507,7 @@ git commit -m "feat: register guardian enforcement plugin"
 - Modify: pyproject.toml
 - Create: tests/integration/conftest.py
 - Create: tests/integration/test_direct_download.py
+- Create: tests/integration/test_pytest_devpi_server.py
 
 - [ ] **Step 1: Add integration-only build and client dependencies**
 
@@ -2711,6 +2730,13 @@ version = "1.0.0"
 Run: uv run pytest tests/integration/test_direct_download.py -v -m integration
 
 Expected: PASS; the same direct +f URL returns 404 before the ALLOW verdict and exact wheel bytes after ALLOW.
+
+The real subprocess harness in `tests/integration/conftest.py` remains the
+process-level proof for restart, concurrent requests, pip, and uv behavior.
+Additionally, `tests/integration/test_pytest_devpi_server.py` must run against
+the official `pytest-devpi-server` fixture to smoke the installed plugin's
+direct-route behavior; the official-fixture proof does not replace the real
+subprocess harness.
 
 - [ ] **Step 5: Add HEAD and uv direct-URL assertions**
 

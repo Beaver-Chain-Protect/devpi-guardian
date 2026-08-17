@@ -46,14 +46,31 @@ decisions = reader.get_effective_decisions(sha256s)
 failures raise `StoreUnavailable` instead. F2 and the direct-download tween
 must use this reader rather than duplicate SQL or precedence logic.
 
-F5 receives the same factory plus its F12 writer and constructs the public
-store; it does not query Guardian tables directly:
+F5 does not receive the in-process factory object created by the devpi plugin.
+Deployment configuration owns one absolute database path. After the migration
+owner reports readiness, F5 independently constructs a `ConnectionFactory`
+from that exact path and does not query Guardian tables directly:
+
+```console
+export GUARDIAN_DB=/var/lib/devpi-guardian/guardian.db
+devpi-server --guardian-db "$GUARDIAN_DB"
+```
+
+The plugin does not read `GUARDIAN_DB` automatically; the same deployment
+configuration explicitly supplies `--guardian-db`, and the F5 process reads
+the variable when constructing its own factory:
 
 ```python
-from devpi_guardian.verdicts.store import SQLiteArtifactStore
+import os
+from pathlib import Path
 
+from devpi_guardian.verdicts.store import SQLiteArtifactStore
+from devpi_guardian.verdicts.db import ConnectionFactory
+
+# Run this only after the devpi process using --guardian-db is ready.
+f5_factory = ConnectionFactory(Path(os.environ["GUARDIAN_DB"]).resolve())
 # audit_writer is an injected F12 implementation of AuditWriter.
-store = SQLiteArtifactStore(factory, audit_writer)
+store = SQLiteArtifactStore(f5_factory, audit_writer)
 claim = store.claim_next(worker_id, lease_until)
 if claim is not None:
     store.record_verdict(claim, verdict, evidence)
@@ -117,7 +134,8 @@ through discovery and scanning until a new verdict is recorded.
 F12 implements `AuditWriter.append_in_transaction(connection, event)` using
 the exact `sqlite3.Connection` supplied by F4. The writer records its event in
 that transaction; if audit recording fails, the state transition is rolled
-back.
+back. Persistent audit-adapter integration is a separate F12 delivery; current
+F4 proof covers the same-transaction rollback behavior with a recording stub.
 
 ## Running devpi-server
 
@@ -149,6 +167,13 @@ Response bodies and logs do not expose the SHA-256 decision reason, URL
 credentials, or query secrets. The tween does not trust URL fragments,
 filenames, or client headers as Artifact identity.
 
+The raw-target guard for protected `GET`/`HEAD` requests requires at least one
+of `REQUEST_URI`, `RAW_URI`, or `RAW_PATH_INFO`; every present key must match
+the decoded identity. Literal route markers and canonical UTF-8 encoding are
+accepted, with only the uppercase encoded fixed marker `/%2Bf/` or `/%2Be/`
+allowed as the pip compatibility exception. Lowercase or double encoding,
+encoded slash, and encoded `+` in the user, index, or tail are rejected.
+
 ## Error mapping for API callers
 
 Map domain errors consistently at the management/API boundary:
@@ -165,9 +190,12 @@ serving with an unvalidated database.
 
 ## Operations and security
 
-- Use one process to run `migrate` before readiness. Each process and thread
-  obtains its own `ConnectionFactory.connect()` SQLite connection; connections
-  are not shared across threads or processes.
+- During P0 first initialization, exactly one startup/migration owner must run
+  `migrate` before readiness. Do not concurrently start multiple Guardian devpi
+  instances against an empty database. After the owner is ready, later starts
+  validate the initialized schema idempotently.
+- Each process and thread obtains its own `ConnectionFactory.connect()` SQLite
+  connection; connections are not shared across threads or processes.
 - Keep the database, `-wal`, and `-shm` files on the same persistent volume.
   For backup, use SQLite's backup API or checkpoint and take a consistent
   snapshot; do not copy only the main database file while WAL writes are
@@ -190,9 +218,13 @@ mapping; no external metrics exporter is included.
 Each `BlockMetricDimensions` key contains exactly `route`, `sha256`,
 `effective_decision`, and `block_category`. Route is `+f`, `+e`, or `unknown`;
 identity failures use `unknown` for SHA-256 and decision; categories currently
-include `identity_unavailable`, `store_unavailable`, and `not_allowed`.
-Allowed requests do not increment the counter, and URL credentials, filenames,
-and query secrets are not dimensions.
+include `identity_unavailable`, `store_unavailable`, and `not_allowed`. The
+default recorder admits exactly 4,096 distinct normal series, then increments
+one fixed `cardinality_overflow` series; existing keys keep incrementing after
+the cap. Thus `snapshot()` is bounded to at most 4,097 series. Input fields
+are validated as bounded route, canonical SHA-256-or-`unknown`, decision, and
+category values; URL credentials, filenames, and query secrets are never
+dimensions. Allowed requests do not increment the counter.
 
 ## Performance evidence
 
@@ -210,8 +242,9 @@ uv run pytest -m performance -s -v
 ## F3/F4 completion criteria
 
 - SQLite migration is repeatable on an empty or already initialized database,
-  and artifacts, mappings, verdict history, evidence, overrides, and audit data
-  survive process restart.
+  and artifacts, mappings, verdict history, evidence, and overrides survive
+  process restart. Persistent F12 audit-adapter integration is separate; F4
+  proves same-transaction rollback when audit recording fails.
 - All writes and audit events share one transaction; automated verdicts and
   evidence remain immutable, and only one current verdict and override apply to
   an Artifact.
@@ -224,11 +257,14 @@ uv run pytest -m performance -s -v
   and observed P95 range are recorded above, with every result below 100 ms.
 - Only an effective `ALLOW` release file reaches the devpi handler for `+f`,
   `+e`, `GET`, `HEAD`, and `.metadata`; direct URLs cannot bypass the reader.
-- Integration coverage verifies verdict and override persistence across a
-  devpi restart, 64 concurrent blocked requests (8 workers over 8 rounds),
-  exact-version pip behavior when an Artifact is allowed or revoked, uv direct
-  URL lock/sync behavior, and `%2Bf`/`%2Be` route-marker compatibility in the
-  resolver tests.
-- The plugin-installed in-process block counter records only blocked requests
-  with the four bounded dimensions above; exporting those snapshots is an
-  external deployment responsibility.
+- The real subprocess harness in `tests/integration/conftest.py` and the
+  official `pytest-devpi-server` fixture smoke test in
+  `tests/integration/test_pytest_devpi_server.py` verify direct-route blocking,
+  allow behavior, restart persistence, and `+e` failure handling. The broader
+  integration proof verifies 64 concurrent blocked requests (8 workers over 8
+  rounds), exact-version pip behavior when an Artifact is allowed or revoked,
+  uv direct URL lock/sync behavior, and `%2Bf`/`%2Be` route-marker compatibility
+  in resolver tests.
+- The plugin-installed in-process block counter records validated bounded
+  series with a fixed overflow series; exporting snapshots is an external
+  deployment responsibility.
