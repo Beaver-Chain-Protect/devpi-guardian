@@ -13,6 +13,7 @@ import pytest
 from devpi_guardian.verdicts import store as store_module
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import StoreUnavailable, TransitionConflict
+from devpi_guardian.verdicts.invariants import PersistedStateCorruption
 from devpi_guardian.verdicts.models import (
     ArtifactInput,
     ArtifactState,
@@ -70,6 +71,22 @@ def release(
 def fetchall(store, query: str, parameters: tuple[Any, ...] = ()):
     with closing(store.connection_factory.connect()) as connection:
         return connection.execute(query, parameters).fetchall()
+
+
+def domain_snapshot(store) -> tuple[tuple[tuple[object, ...], ...], ...]:
+    queries = (
+        "SELECT * FROM artifacts ORDER BY sha256",
+        "SELECT * FROM release_mappings ORDER BY id",
+        "SELECT * FROM verdicts ORDER BY id",
+        "SELECT * FROM evidence ORDER BY id",
+        "SELECT * FROM manual_overrides ORDER BY id",
+    )
+    with closing(store.connection_factory.connect()) as connection:
+        snapshots = []
+        for query in queries:
+            rows = connection.execute(query)
+            snapshots.append(tuple(tuple(row) for row in rows))
+        return tuple(snapshots)
 
 
 def seed_scanning(
@@ -751,6 +768,93 @@ def test_claim_rolls_back_after_trigger_replaces_artifact_identity(
         None,
     )
     assert audit_writer.events == original_events
+
+
+@pytest.mark.parametrize("guard_bypass", ["pragma-off", "drop-guard"])
+def test_claim_verifies_complete_state_after_audit_callback(
+    tmp_path,
+    audit_writer,
+    monkeypatch,
+    guard_bypass: str,
+) -> None:
+    generated_token = "d" * 64
+    replacement_token = "e" * 64
+    store = make_store(tmp_path, audit_writer)
+    store.discover_artifact(artifact(), release())
+    original_events = list(audit_writer.events)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            CREATE TABLE audit_probe(
+                id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL
+            )
+            """,
+        )
+    before = domain_snapshot(store)
+    original_append = audit_writer.append_in_transaction
+
+    def append_in_transaction(connection, event) -> None:
+        original_append(connection, event)
+        connection.execute(
+            "INSERT INTO audit_probe(action) VALUES (?)",
+            (event.action,),
+        )
+        if guard_bypass == "pragma-off":
+            connection.execute("PRAGMA recursive_triggers=OFF")
+        else:
+            connection.execute("DROP TRIGGER artifacts_identity_delete_guard")
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at,
+                lease_owner, lease_expires_at, lease_token, last_error
+            ) VALUES (?, 999, 'SCANNING', ?, ?, 'tampered-worker', ?, ?, NULL)
+            """,
+            (
+                SHA,
+                "2026-08-18T00:00:00+00:00",
+                "2026-08-18T00:01:00+00:00",
+                "2026-08-18T00:05:00+00:00",
+                replacement_token,
+            ),
+        )
+
+    audit_writer.append_in_transaction = append_in_transaction
+    monkeypatch.setattr(
+        store_module.secrets,
+        "token_hex",
+        lambda _size: generated_token,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        store.claim_next("worker", NOW + timedelta(minutes=5))
+
+    assert isinstance(error.value.__cause__, PersistedStateCorruption)
+    rendered_error = f"{error.value} {error.value.__cause__}"
+    assert generated_token not in rendered_error
+    assert replacement_token not in rendered_error
+    assert domain_snapshot(store) == before
+    with closing(store.connection_factory.connect()) as connection:
+        audit_count = connection.execute(
+            "SELECT COUNT(*) FROM audit_probe",
+        ).fetchone()[0]
+        guard_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name = 'artifacts_identity_delete_guard'
+            """,
+        ).fetchone()[0]
+        recursive = connection.execute(
+            "PRAGMA recursive_triggers",
+        ).fetchone()[0]
+    assert audit_count == 0
+    assert guard_count == 1
+    assert recursive == 1
+    # The in-memory recording adapter is intentionally not transactional.
+    assert audit_writer.events[:-1] == original_events
+    assert audit_writer.events[-1].action == "artifact.claimed"
 
 
 def test_claim_token_is_not_disclosed_when_audit_fails(

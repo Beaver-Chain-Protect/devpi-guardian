@@ -491,6 +491,37 @@ class SQLiteArtifactStore:
                     occurred_at=operation_at,
                 )
 
+    def _verify_claimed_state(
+        self,
+        connection: sqlite3.Connection,
+        expected: tuple[object, ...],
+        *,
+        after_audit: bool,
+    ) -> None:
+        persisted = connection.execute(
+            """
+            SELECT sha256, size_bytes, discovered_at, state, lease_owner,
+                   lease_expires_at, lease_token, last_error, updated_at
+            FROM artifacts WHERE sha256 = ?
+            """,
+            (expected[0],),
+        ).fetchone()
+        persisted_tuple = None if persisted is None else tuple(persisted)
+        if persisted_tuple == expected:
+            return
+
+        persisted_identity = None
+        if persisted_tuple is not None:
+            persisted_identity = persisted_tuple[:3]
+        identity_changed = persisted_identity != expected[:3]
+        if after_audit or identity_changed:
+            corruption = PersistedStateCorruption(
+                "claimed artifact state changed unexpectedly",
+            )
+            path = str(self.connection_factory.path)
+            raise StoreUnavailable(path) from corruption
+        raise TransitionConflict("artifact claim state mismatch")
+
     def claim_next(
         self,
         worker_id: str,
@@ -538,46 +569,22 @@ class SQLiteArtifactStore:
             )
             if cursor.rowcount != 1:
                 raise TransitionConflict("artifact could not be claimed")
-            persisted = connection.execute(
-                """
-                SELECT sha256, size_bytes, discovered_at, state, lease_owner,
-                       lease_expires_at, lease_token, last_error, updated_at
-                FROM artifacts WHERE sha256 = ?
-                """,
-                (row["sha256"],),
-            ).fetchone()
-            expected_identity = (
+            expected_artifact = (
                 row["sha256"],
                 row["size_bytes"],
                 row["discovered_at"],
-            )
-            if persisted is None:
-                corruption = PersistedStateCorruption(
-                    "artifact identity changed during claim",
-                )
-                path = str(self.connection_factory.path)
-                raise StoreUnavailable(path) from corruption
-            persisted_identity = (
-                persisted["sha256"],
-                persisted["size_bytes"],
-                persisted["discovered_at"],
-            )
-            if persisted_identity != expected_identity:
-                corruption = PersistedStateCorruption(
-                    "artifact identity changed during claim",
-                )
-                path = str(self.connection_factory.path)
-                raise StoreUnavailable(path) from corruption
-            if tuple(persisted) != (
-                *expected_identity,
                 "SCANNING",
                 worker_id,
                 lease_text,
                 lease_token,
                 None,
                 updated_at,
-            ):
-                raise TransitionConflict("artifact claim state mismatch")
+            )
+            self._verify_claimed_state(
+                connection,
+                expected_artifact,
+                after_audit=False,
+            )
             self._audit(
                 connection,
                 actor=worker_id,
@@ -585,6 +592,11 @@ class SQLiteArtifactStore:
                 sha256=row["sha256"],
                 reason="analysis lease acquired",
                 occurred_at=operation_at,
+            )
+            self._verify_claimed_state(
+                connection,
+                expected_artifact,
+                after_audit=True,
             )
             return ClaimedArtifact(
                 sha256=row["sha256"],
