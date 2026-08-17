@@ -128,6 +128,109 @@ def test_schema_rejects_nonnumeric_text_size(tmp_path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("state", "owner", "expires_at", "token"),
+    [
+        ("SCANNING", "worker", "2026-08-17T00:05:00+00:00", None),
+        ("SCANNING", None, "2026-08-17T00:05:00+00:00", "b" * 64),
+        ("SCANNING", "worker", None, "b" * 64),
+        ("DISCOVERED", None, None, "b" * 64),
+        ("ALLOW", "worker", "2026-08-17T00:05:00+00:00", "b" * 64),
+    ],
+)
+def test_schema_requires_complete_lease_tuple_only_while_scanning(
+    tmp_path,
+    state,
+    owner,
+    expires_at,
+    token,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:  # noqa: SIM117
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    sha256, size_bytes, state, discovered_at, updated_at,
+                    lease_owner, lease_expires_at, lease_token
+                ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "a" * 64,
+                    state,
+                    "2026-08-17T00:00:00+00:00",
+                    "2026-08-17T00:00:00+00:00",
+                    owner,
+                    expires_at,
+                    token,
+                ),
+            )
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        sqlite3.Binary(b"b" * 64),
+        "B" * 64,
+        "é" + "b" * 63,
+        "b" * 63,
+        "b" * 65,
+    ],
+    ids=["blob", "uppercase", "non-ascii", "short", "long"],
+)
+def test_schema_rejects_noncanonical_lease_token(tmp_path, token) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:  # noqa: SIM117
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    sha256, size_bytes, state, discovered_at, updated_at,
+                    lease_owner, lease_expires_at, lease_token
+                ) VALUES (?, 1, 'SCANNING', ?, ?, 'worker', ?, ?)
+                """,
+                (
+                    "a" * 64,
+                    "2026-08-17T00:00:00+00:00",
+                    "2026-08-17T00:00:00+00:00",
+                    "2026-08-17T00:05:00+00:00",
+                    token,
+                ),
+            )
+
+
+def test_schema_requires_unique_nonnull_lease_tokens(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    token = "f" * 64
+    timestamp = "2026-08-17T00:00:00+00:00"
+
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at,
+                lease_owner, lease_expires_at, lease_token
+            ) VALUES (?, 1, 'SCANNING', ?, ?, 'worker-a', ?, ?)
+            """,
+            ("a" * 64, timestamp, timestamp, timestamp, token),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    sha256, size_bytes, state, discovered_at, updated_at,
+                    lease_owner, lease_expires_at, lease_token
+                ) VALUES (?, 1, 'SCANNING', ?, ?, 'worker-b', ?, ?)
+                """,
+                ("b" * 64, timestamp, timestamp, timestamp, token),
+            )
+
+
 def _seed_schema_version(path: Path, version: object) -> None:
     version_type = "INTEGER" if type(version) is int else "TEXT"
     with closing(sqlite3.connect(path)) as connection, connection:
@@ -175,8 +278,14 @@ def test_migrate_maps_text_version_to_error(tmp_path) -> None:
         "DROP TABLE evidence",
         "ALTER TABLE artifacts DROP COLUMN last_error",
         "DROP INDEX evidence_verdict_id_idx",
+        "DROP INDEX artifacts_lease_token_unique_idx",
     ],
-    ids=["missing-table", "missing-column", "missing-index"],
+    ids=[
+        "missing-table",
+        "missing-column",
+        "missing-index",
+        "missing-lease-token-index",
+    ],
 )
 def test_migrate_rejects_incomplete(tmp_path, corruption_sql: str) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")

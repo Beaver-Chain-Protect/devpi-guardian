@@ -8,6 +8,7 @@ from devpi_guardian.verdicts.errors import InvalidSha256
 from devpi_guardian.verdicts.models import (
     ArtifactInput,
     ArtifactState,
+    ClaimedArtifact,
     Decision,
     DecisionSource,
     EvidenceInput,
@@ -258,6 +259,18 @@ def test_verdict_score_normalizes_int_to_float() -> None:
 
     assert verdict.score == 1.0
     assert isinstance(verdict.score, float)
+
+
+def test_claimed_artifact_carries_opaque_lease_token() -> None:
+    claim = ClaimedArtifact(
+        sha256=SHA256,
+        size_bytes=1,
+        worker_id="worker",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        lease_token="b" * 64,
+    )
+
+    assert claim.lease_token == "b" * 64
 
 
 def test_manual_override_decision_must_be_a_decision() -> None:

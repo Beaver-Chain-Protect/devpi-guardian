@@ -50,11 +50,16 @@ class ArtifactStore(Protocol):
 
     def record_verdict(
         self,
+        claim: ClaimedArtifact,
         verdict: VerdictInput,
         evidence: Sequence[EvidenceInput],
     ) -> None: ...
 
-    def mark_analysis_error(self, sha256: str, error: str) -> None: ...
+    def mark_analysis_error(
+        self,
+        claim: ClaimedArtifact,
+        error: str,
+    ) -> None: ...
     def request_rescan(self, sha256: str, actor: str, reason: str) -> None: ...
     def set_manual_override(self, override: ManualOverrideInput) -> None: ...
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from devpi_guardian.verdicts import store as store_module
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import StoreUnavailable, TransitionConflict
 from devpi_guardian.verdicts.models import (
@@ -83,10 +85,17 @@ def seed_scanning(
             """
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
-                lease_owner, lease_expires_at
-            ) VALUES (?, 123, 'SCANNING', ?, ?, ?, ?)
+                lease_owner, lease_expires_at, lease_token
+            ) VALUES (?, 123, 'SCANNING', ?, ?, ?, ?, ?)
             """,
-            (sha256, timestamp, timestamp, owner, expires_at.isoformat()),
+            (
+                sha256,
+                timestamp,
+                timestamp,
+                owner,
+                expires_at.isoformat(),
+                sha256,
+            ),
         )
 
 
@@ -122,6 +131,31 @@ def test_concurrent_workers_have_exactly_one_claim_winner(
     assert winners[0].worker_id in {"worker-1", "worker-2"}
 
 
+def test_claim_tokens_are_unique_canonical_and_not_audited(
+    tmp_path,
+    audit_writer,
+) -> None:
+    clock = [NOW]
+    store = make_store(tmp_path, audit_writer, now=lambda: clock[0])
+    store.discover_artifact(artifact(), release())
+
+    claim_a = store.claim_next("worker-a", NOW + timedelta(minutes=1))
+    assert claim_a is not None
+    clock[0] = NOW + timedelta(minutes=2)
+    assert store.recover_expired_claims(clock[0]) == 1
+    claim_b = store.claim_next("worker-b", NOW + timedelta(minutes=5))
+    assert claim_b is not None
+
+    assert claim_a.lease_token != claim_b.lease_token
+    assert re.fullmatch(r"[0-9a-f]{64}", claim_a.lease_token)
+    assert re.fullmatch(r"[0-9a-f]{64}", claim_b.lease_token)
+    assert claim_a.lease_token not in repr(claim_a)
+    assert claim_b.lease_token not in repr(claim_b)
+    audit_snapshot = repr(audit_writer.events)
+    assert claim_a.lease_token not in audit_snapshot
+    assert claim_b.lease_token not in audit_snapshot
+
+
 def test_expired_claim_recovers_and_can_be_claimed_by_another_worker(
     tmp_path, audit_writer
 ) -> None:
@@ -139,6 +173,19 @@ def test_expired_claim_recovers_and_can_be_claimed_by_another_worker(
     assert recovered == 1
     assert claimed is not None
     assert claimed.worker_id == "worker-new"
+    recovered_row = fetchall(
+        store,
+        """
+        SELECT lease_owner, lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
+        (SHA,),
+    )[0]
+    assert tuple(recovered_row) == (
+        claimed.worker_id,
+        claimed.lease_expires_at.isoformat(),
+        claimed.lease_token,
+    )
     audit_payloads = [
         (
             event.actor,
@@ -423,6 +470,61 @@ def test_claim_rejects_invalid_worker_id(
     assert audit_writer.events == []
 
 
+@pytest.mark.parametrize(
+    "lease_until",
+    [NOW - timedelta(microseconds=1), NOW],
+    ids=["past", "equal"],
+)
+def test_claim_rejects_nonfuture_lease_without_side_effects(
+    tmp_path,
+    audit_writer,
+    lease_until,
+) -> None:
+    store = make_store(tmp_path, audit_writer, now=lambda: NOW)
+    store.discover_artifact(artifact(), release())
+    original_events = list(audit_writer.events)
+
+    with pytest.raises(ValueError, match="future"):
+        store.claim_next("worker", lease_until)
+
+    row = fetchall(
+        store,
+        """
+        SELECT state, lease_owner, lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
+        (SHA,),
+    )[0]
+    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None, None)
+    assert audit_writer.events == original_events
+
+
+def test_claim_evaluates_now_after_acquiring_writer_lock(
+    tmp_path,
+    audit_writer,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db", busy_timeout_ms=1)
+    migrate(factory)
+    setup_store = SQLiteArtifactStore(factory, audit_writer, now=lambda: NOW)
+    setup_store.discover_artifact(artifact(), release())
+
+    def now_under_writer_lock() -> datetime:
+        with closing(factory.connect()) as probe:  # noqa: SIM117
+            with pytest.raises(sqlite3.OperationalError):
+                probe.execute("BEGIN IMMEDIATE")
+        return NOW
+
+    store = SQLiteArtifactStore(
+        factory,
+        audit_writer,
+        now=now_under_writer_lock,
+    )
+
+    claimed = store.claim_next("worker", NOW + timedelta(minutes=5))
+
+    assert claimed is not None
+
+
 @pytest.mark.parametrize("operation", ["claim", "recover"])
 @pytest.mark.parametrize("timestamp", [None, "2026-08-17", 123])
 def test_lease_operations_reject_non_datetime_before_side_effects(
@@ -461,12 +563,12 @@ def test_lease_operations_reject_naive_timestamp_before_mutation(
     row = fetchall(
         store,
         """
-        SELECT state, lease_owner, lease_expires_at
+        SELECT state, lease_owner, lease_expires_at, lease_token
         FROM artifacts WHERE sha256 = ?
         """,
         (SHA,),
     )[0]
-    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None)
+    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None, None)
     assert audit_writer.events == original_events
 
 
@@ -492,12 +594,12 @@ def test_audit_failure_rolls_back_claim(tmp_path, audit_writer) -> None:
     row = fetchall(
         store,
         """
-        SELECT state, lease_owner, lease_expires_at
+        SELECT state, lease_owner, lease_expires_at, lease_token
         FROM artifacts WHERE sha256 = ?
         """,
         (SHA,),
     )[0]
-    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None)
+    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None, None)
 
 
 def test_audit_failure_rolls_back_all_recovered_rows(
@@ -547,7 +649,10 @@ def test_claim_dto_matches_persisted_lease(tmp_path, audit_writer) -> None:
     assert claimed is not None
     persisted = fetchall(
         store,
-        "SELECT lease_owner, lease_expires_at FROM artifacts WHERE sha256 = ?",
+        """
+        SELECT lease_owner, lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
         (SHA,),
     )[0]
     assert claimed.sha256 == SHA
@@ -556,6 +661,71 @@ def test_claim_dto_matches_persisted_lease(tmp_path, audit_writer) -> None:
     assert claimed.lease_expires_at.tzinfo is UTC
     persisted_expiry = persisted["lease_expires_at"]
     assert claimed.lease_expires_at.isoformat() == persisted_expiry
+    assert claimed.lease_token == persisted["lease_token"]
+
+
+def test_claim_rejects_unexpected_final_persisted_token(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = make_store(tmp_path, audit_writer)
+    store.discover_artifact(artifact(), release())
+    original_events = list(audit_writer.events)
+    with closing(store.connection_factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            CREATE TRIGGER rewrite_claim_token
+            AFTER UPDATE OF state ON artifacts
+            WHEN NEW.state = 'SCANNING'
+            BEGIN
+                UPDATE artifacts
+                SET lease_token =
+                    'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' ||
+                    'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+                WHERE sha256 = NEW.sha256;
+            END
+            """
+        )
+
+    with pytest.raises(TransitionConflict):
+        store.claim_next("worker", NOW + timedelta(minutes=5))
+
+    row = fetchall(
+        store,
+        """
+        SELECT state, lease_owner, lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
+        (SHA,),
+    )[0]
+    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None, None)
+    assert audit_writer.events == original_events
+
+
+def test_claim_token_is_not_disclosed_when_audit_fails(
+    tmp_path,
+    audit_writer,
+    monkeypatch,
+) -> None:
+    token = "d" * 64
+    store = make_store(tmp_path, audit_writer)
+    store.discover_artifact(artifact(), release())
+    audit_writer.fail = True
+    monkeypatch.setattr(store_module.secrets, "token_hex", lambda _size: token)
+
+    with pytest.raises(RuntimeError, match="audit unavailable") as error:
+        store.claim_next("worker", NOW + timedelta(minutes=5))
+
+    assert token not in str(error.value)
+    row = fetchall(
+        store,
+        """
+        SELECT state, lease_owner, lease_expires_at, lease_token
+        FROM artifacts WHERE sha256 = ?
+        """,
+        (SHA,),
+    )[0]
+    assert tuple(row) == (ArtifactState.DISCOVERED.value, None, None, None)
 
 
 class FailingConnection:

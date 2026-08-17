@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from devpi_guardian.verdicts.errors import (
 )
 from devpi_guardian.verdicts.models import (
     ArtifactState,
+    ClaimedArtifact,
     Decision,
     EvidenceInput,
     VerdictInput,
@@ -101,13 +103,44 @@ def unchecked_evidence(**changes: Any) -> EvidenceInput:
     return value
 
 
-def prepare_scanning(tmp_path, audit_writer) -> SQLiteArtifactStore:
+def claim_input(**changes: Any) -> ClaimedArtifact:
+    values = {
+        "sha256": SHA256,
+        "size_bytes": 123,
+        "worker_id": "worker",
+        "lease_expires_at": NOW + timedelta(minutes=5),
+        "lease_token": "d" * 64,
+    }
+    values.update(changes)
+    return ClaimedArtifact(**values)
+
+
+def unchecked_claim(**changes: Any) -> ClaimedArtifact:
+    valid = claim_input()
+    values = {
+        "sha256": valid.sha256,
+        "size_bytes": valid.size_bytes,
+        "worker_id": valid.worker_id,
+        "lease_expires_at": valid.lease_expires_at,
+        "lease_token": valid.lease_token,
+    }
+    values.update(changes)
+    value = object.__new__(ClaimedArtifact)
+    for field_name, field_value in values.items():
+        object.__setattr__(value, field_name, field_value)
+    return value
+
+
+def prepare_scanning(
+    tmp_path,
+    audit_writer,
+) -> tuple[SQLiteArtifactStore, ClaimedArtifact]:
     store = make_store(tmp_path, audit_writer, now=lambda: NOW)
     store.discover_artifact(artifact(), release())
     claimed = store.claim_next("worker", NOW + timedelta(minutes=5))
     assert claimed is not None
     audit_writer.events.clear()
-    return store
+    return store, claimed
 
 
 def install_trigger(store: SQLiteArtifactStore, sql: str) -> None:
@@ -115,11 +148,14 @@ def install_trigger(store: SQLiteArtifactStore, sql: str) -> None:
         connection.execute(sql)
 
 
-def assert_scanning_without_verdict(store: SQLiteArtifactStore) -> None:
+def assert_scanning_without_verdict(
+    store: SQLiteArtifactStore,
+    claim: ClaimedArtifact,
+) -> None:
     row = fetchall(
         store,
         """
-        SELECT state, lease_owner, lease_expires_at, last_error
+        SELECT state, lease_owner, lease_expires_at, lease_token, last_error
         FROM artifacts WHERE sha256 = ?
         """,
         (SHA256,),
@@ -128,6 +164,7 @@ def assert_scanning_without_verdict(store: SQLiteArtifactStore) -> None:
         ArtifactState.SCANNING.value,
         "worker",
         (NOW + timedelta(minutes=5)).isoformat(),
+        claim.lease_token,
         None,
     )
     assert fetchall(store, "SELECT COUNT(*) FROM verdicts")[0][0] == 0
@@ -146,7 +183,7 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     created_at = datetime(
         2026,
         8,
@@ -157,6 +194,7 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     )
 
     store.record_verdict(
+        claim,
         verdict(created_at=created_at),
         [evidence(details={"z": [2, 1], "a": {"enabled": True}})],
     )
@@ -164,13 +202,15 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     artifact_row = fetchall(
         store,
         """
-        SELECT state, lease_owner, lease_expires_at, last_error, updated_at
+        SELECT state, lease_owner, lease_expires_at, lease_token, last_error,
+               updated_at
         FROM artifacts WHERE sha256 = ?
         """,
         (SHA256,),
     )[0]
     assert tuple(artifact_row) == (
         ArtifactState.REVIEW.value,
+        None,
         None,
         None,
         None,
@@ -225,9 +265,9 @@ def test_record_verdict_audits_effective_transition_and_versions(
     decision,
     effective,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
 
-    store.record_verdict(verdict(decision=decision), ())
+    store.record_verdict(claim, verdict(decision=decision), ())
 
     assert len(audit_writer.events) == 1
     event = audit_writer.events[0]
@@ -263,9 +303,14 @@ def test_record_verdict_requires_existing_scanning_artifact(
     audit_writer.events.clear()
 
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(), ())
+        store.record_verdict(claim_input(), verdict(), ())
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(sha256=MISSING_SHA256), ())
+        missing_claim = claim_input(sha256=MISSING_SHA256)
+        store.record_verdict(
+            missing_claim,
+            verdict(sha256=MISSING_SHA256),
+            (),
+        )
 
     assert fetchall(store, "SELECT COUNT(*) FROM verdicts")[0][0] == 0
     row = fetchall(
@@ -281,12 +326,16 @@ def test_duplicate_verdict_submission_rolls_back_cleanly(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
-    store.record_verdict(verdict(decision=Decision.ALLOW), ())
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    store.record_verdict(claim, verdict(decision=Decision.ALLOW), ())
     original_events = list(audit_writer.events)
 
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(decision=Decision.DENY), [evidence()])
+        store.record_verdict(
+            claim,
+            verdict(decision=Decision.DENY),
+            [evidence()],
+        )
 
     row = fetchall(
         store,
@@ -303,11 +352,11 @@ def test_racing_verdict_submissions_have_one_winner(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
 
     def submit(decision: Decision) -> Decision | None:
         try:
-            store.record_verdict(verdict(decision=decision), ())
+            store.record_verdict(claim, verdict(decision=decision), ())
         except TransitionConflict:
             return None
         return decision
@@ -320,11 +369,172 @@ def test_racing_verdict_submissions_have_one_winner(
     assert len(audit_writer.events) == 1
 
 
+def test_recovered_claim_cannot_complete_a_later_claim(
+    tmp_path,
+    audit_writer,
+) -> None:
+    clock = [NOW]
+    store = make_store(tmp_path, audit_writer, now=lambda: clock[0])
+    store.discover_artifact(artifact(), release())
+    claim_a = store.claim_next("worker-a", NOW + timedelta(minutes=1))
+    assert claim_a is not None
+    clock[0] = NOW + timedelta(minutes=2)
+    assert store.recover_expired_claims(clock[0]) == 1
+    claim_b = store.claim_next("worker-b", NOW + timedelta(minutes=5))
+    assert claim_b is not None
+    audit_writer.events.clear()
+
+    with pytest.raises(TransitionConflict):
+        store.record_verdict(claim_a, verdict(), ())
+
+    row = fetchall(
+        store,
+        """
+        SELECT state, lease_owner, lease_expires_at, lease_token
+        FROM artifacts
+        """,
+    )[0]
+    assert tuple(row) == (
+        ArtifactState.SCANNING.value,
+        claim_b.worker_id,
+        claim_b.lease_expires_at.isoformat(),
+        claim_b.lease_token,
+    )
+    assert fetchall(store, "SELECT COUNT(*) FROM verdicts")[0][0] == 0
+    assert audit_writer.events == []
+
+    store.record_verdict(claim_b, verdict(), ())
+
+    completed = fetchall(
+        store,
+        """
+        SELECT state, lease_owner, lease_expires_at, lease_token
+        FROM artifacts
+        """,
+    )[0]
+    assert tuple(completed) == (ArtifactState.REVIEW.value, None, None, None)
+    assert fetchall(store, "SELECT COUNT(*) FROM verdicts")[0][0] == 1
+    assert len(audit_writer.events) == 1
+
+
+def test_recovered_claim_cannot_mark_a_later_claim_as_error(
+    tmp_path,
+    audit_writer,
+) -> None:
+    clock = [NOW]
+    store = make_store(tmp_path, audit_writer, now=lambda: clock[0])
+    store.discover_artifact(artifact(), release())
+    claim_a = store.claim_next("worker-a", NOW + timedelta(minutes=1))
+    assert claim_a is not None
+    clock[0] = NOW + timedelta(minutes=2)
+    assert store.recover_expired_claims(clock[0]) == 1
+    claim_b = store.claim_next("worker-b", NOW + timedelta(minutes=5))
+    assert claim_b is not None
+    audit_writer.events.clear()
+
+    with pytest.raises(TransitionConflict):
+        store.mark_analysis_error(claim_a, "late analysis failure")
+
+    row = fetchall(
+        store,
+        """
+        SELECT state, size_bytes, lease_owner, lease_expires_at, lease_token,
+               last_error
+        FROM artifacts
+        """,
+    )[0]
+    assert tuple(row) == (
+        ArtifactState.SCANNING.value,
+        claim_b.size_bytes,
+        claim_b.worker_id,
+        claim_b.lease_expires_at.isoformat(),
+        claim_b.lease_token,
+        None,
+    )
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["verdict", "error"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sha256", MISSING_SHA256),
+        ("size_bytes", 124),
+        ("worker_id", "forged-worker"),
+        ("lease_expires_at", NOW + timedelta(minutes=4)),
+        ("lease_token", "c" * 64),
+    ],
+)
+def test_completion_rejects_forged_claim_fields_without_side_effects(
+    tmp_path,
+    audit_writer,
+    operation,
+    field,
+    value,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    forged = replace(claim, **{field: value})
+
+    with pytest.raises(TransitionConflict) as error:
+        if operation == "verdict":
+            store.record_verdict(
+                forged,
+                verdict(sha256=forged.sha256),
+                (),
+            )
+        else:
+            store.mark_analysis_error(forged, "failed")
+
+    assert forged.lease_token not in str(error.value)
+    assert_scanning_without_verdict(store, claim)
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["verdict", "error"])
+def test_completion_rejects_expired_current_claim_without_side_effects(
+    tmp_path,
+    audit_writer,
+    operation,
+) -> None:
+    clock = [NOW]
+    store = make_store(tmp_path, audit_writer, now=lambda: clock[0])
+    store.discover_artifact(artifact(), release())
+    claim = store.claim_next("worker", NOW + timedelta(minutes=1))
+    assert claim is not None
+    audit_writer.events.clear()
+    clock[0] = claim.lease_expires_at
+
+    with pytest.raises(TransitionConflict):
+        if operation == "verdict":
+            store.record_verdict(claim, verdict(), ())
+        else:
+            store.mark_analysis_error(claim, "failed")
+
+    row = fetchall(
+        store,
+        """
+        SELECT state, size_bytes, lease_owner, lease_expires_at, lease_token,
+               last_error
+        FROM artifacts
+        """,
+    )[0]
+    assert tuple(row) == (
+        ArtifactState.SCANNING.value,
+        claim.size_bytes,
+        claim.worker_id,
+        claim.lease_expires_at.isoformat(),
+        claim.lease_token,
+        None,
+    )
+    assert fetchall(store, "SELECT COUNT(*) FROM verdicts")[0][0] == 0
+    assert audit_writer.events == []
+
+
 def test_record_verdict_preserves_history_and_replaces_only_current_marker(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     with closing(store.connection_factory.connect()) as connection, connection:
         old_cursor = connection.execute(
             """
@@ -345,7 +555,11 @@ def test_record_verdict_preserves_history_and_replaces_only_current_marker(
             (old_cursor.lastrowid,),
         )
 
-    store.record_verdict(verdict(decision=Decision.REVIEW), [evidence()])
+    store.record_verdict(
+        claim,
+        verdict(decision=Decision.REVIEW),
+        [evidence()],
+    )
 
     verdict_rows = fetchall(
         store,
@@ -372,7 +586,7 @@ def test_record_verdict_accepts_existing_baseline_foreign_key(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     store.discover_artifact(
         artifact(sha256=BASELINE_SHA256),
         release(
@@ -383,7 +597,11 @@ def test_record_verdict_accepts_existing_baseline_foreign_key(
     )
     audit_writer.events.clear()
 
-    store.record_verdict(verdict(baseline_sha256=BASELINE_SHA256), ())
+    store.record_verdict(
+        claim,
+        verdict(baseline_sha256=BASELINE_SHA256),
+        (),
+    )
 
     row = fetchall(store, "SELECT baseline_sha256 FROM verdicts")[0]
     assert row[0] == BASELINE_SHA256
@@ -393,12 +611,96 @@ def test_record_verdict_rejects_missing_baseline_without_changes(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
 
     with pytest.raises(ArtifactNotFound):
-        store.record_verdict(verdict(baseline_sha256=BASELINE_SHA256), ())
+        store.record_verdict(
+            claim,
+            verdict(baseline_sha256=BASELINE_SHA256),
+            (),
+        )
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["verdict", "error"])
+def test_completion_requires_exact_claim_dto_before_connecting(
+    tmp_path,
+    audit_writer,
+    operation,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+
+    with pytest.raises(ValueError, match="ClaimedArtifact"):
+        if operation == "verdict":
+            store.record_verdict(object(), verdict(), ())
+        else:
+            store.mark_analysis_error(object(), "failed")
+
+    assert audit_writer.events == []
+
+
+@pytest.mark.parametrize("operation", ["verdict", "error"])
+@pytest.mark.parametrize(
+    ("changes", "error_type"),
+    [
+        ({"sha256": "A" * 64}, InvalidSha256),
+        ({"size_bytes": True}, ValueError),
+        ({"size_bytes": -1}, ValueError),
+        ({"size_bytes": 2**63}, ValueError),
+        ({"worker_id": None}, ValueError),
+        ({"worker_id": " "}, ValueError),
+        ({"worker_id": "worker\x00unsafe"}, ValueError),
+        ({"worker_id": "w" * 4097}, ValueError),
+        ({"lease_expires_at": NOW.replace(tzinfo=None)}, ValueError),
+        ({"lease_expires_at": "2026-08-17"}, ValueError),
+        ({"lease_token": None}, ValueError),
+        ({"lease_token": "D" * 64}, ValueError),
+        ({"lease_token": "d" * 63}, ValueError),
+        ({"lease_token": "g" * 64}, ValueError),
+    ],
+)
+def test_completion_validates_mutated_claim_before_connecting(
+    tmp_path,
+    audit_writer,
+    operation,
+    changes,
+    error_type,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+
+    with pytest.raises(error_type):
+        if operation == "verdict":
+            store.record_verdict(unchecked_claim(**changes), verdict(), ())
+        else:
+            store.mark_analysis_error(unchecked_claim(**changes), "failed")
+
+    assert audit_writer.events == []
+
+
+def test_record_verdict_rejects_claim_verdict_sha_mismatch_before_connecting(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+
+    with pytest.raises(TransitionConflict):
+        store.record_verdict(
+            claim_input(sha256=MISSING_SHA256),
+            verdict(),
+            (),
+        )
+
     assert audit_writer.events == []
 
 
@@ -434,7 +736,11 @@ def test_record_verdict_validates_mutated_dto_before_connecting(
     )
 
     with pytest.raises(error_type):
-        store.record_verdict(unchecked_verdict(**changes), ())
+        store.record_verdict(
+            claim_input(),
+            unchecked_verdict(**changes),
+            (),
+        )
 
     assert audit_writer.events == []
 
@@ -449,7 +755,7 @@ def test_record_verdict_requires_exact_verdict_dto_before_connecting(
     )
 
     with pytest.raises(ValueError, match="VerdictInput"):
-        store.record_verdict(object(), ())
+        store.record_verdict(claim_input(), object(), ())
 
 
 @pytest.mark.parametrize("bad_evidence", [None, "text", b"bytes", 123])
@@ -464,7 +770,7 @@ def test_record_verdict_rejects_non_sequence_evidence_before_connecting(
     )
 
     with pytest.raises(ValueError, match="sequence"):
-        store.record_verdict(verdict(), bad_evidence)
+        store.record_verdict(claim_input(), verdict(), bad_evidence)
 
 
 def test_record_verdict_rejects_iterator_evidence_before_connecting(
@@ -478,7 +784,7 @@ def test_record_verdict_rejects_iterator_evidence_before_connecting(
     iterator: Iterator[EvidenceInput] = iter([evidence()])
 
     with pytest.raises(ValueError, match="sequence"):
-        store.record_verdict(verdict(), iterator)
+        store.record_verdict(claim_input(), verdict(), iterator)
 
 
 def test_record_verdict_requires_actual_evidence_dto_before_connecting(
@@ -491,7 +797,7 @@ def test_record_verdict_requires_actual_evidence_dto_before_connecting(
     )
 
     with pytest.raises(ValueError, match="EvidenceInput"):
-        store.record_verdict(verdict(), [{}])
+        store.record_verdict(claim_input(), verdict(), [{}])
 
 
 @pytest.mark.parametrize(
@@ -530,7 +836,11 @@ def test_record_verdict_validates_mutated_evidence_before_connecting(
     )
 
     with pytest.raises(ValueError):
-        store.record_verdict(verdict(), [unchecked_evidence(**changes)])
+        store.record_verdict(
+            claim_input(),
+            verdict(),
+            [unchecked_evidence(**changes)],
+        )
 
 
 @pytest.mark.parametrize(
@@ -557,13 +867,13 @@ def test_record_verdict_rejects_ignored_state_changing_writes(
     audit_writer,
     trigger_sql,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(store, trigger_sql)
 
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(), [evidence()])
+        store.record_verdict(claim, verdict(), [evidence()])
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []
 
 
@@ -571,7 +881,7 @@ def test_record_verdict_rejects_ignored_current_verdict_update(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     with closing(store.connection_factory.connect()) as connection, connection:
         connection.execute(
             """
@@ -592,7 +902,7 @@ def test_record_verdict_rejects_ignored_current_verdict_update(
         )
 
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(), ())
+        store.record_verdict(claim, verdict(), ())
 
     rows = fetchall(store, "SELECT decision, is_current FROM verdicts")
     assert [tuple(row) for row in rows] == [(Decision.DENY.value, 1)]
@@ -609,7 +919,7 @@ def test_record_verdict_checks_final_artifact_state(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(
         store,
         """
@@ -623,9 +933,13 @@ def test_record_verdict_checks_final_artifact_state(
     )
 
     with pytest.raises(TransitionConflict):
-        store.record_verdict(verdict(decision=Decision.ALLOW), [evidence()])
+        store.record_verdict(
+            claim,
+            verdict(decision=Decision.ALLOW),
+            [evidence()],
+        )
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []
 
 
@@ -633,13 +947,13 @@ def test_audit_failure_rolls_back_verdict_evidence_and_state(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     audit_writer.fail = True
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        store.record_verdict(verdict(), [evidence()])
+        store.record_verdict(claim, verdict(), [evidence()])
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
 
 
 def test_commit_failure_rolls_back_verdict_evidence_and_state(
@@ -654,7 +968,8 @@ def test_commit_failure_rolls_back_verdict_evidence_and_state(
         now=lambda: NOW,
     )
     base_store.discover_artifact(artifact(), release())
-    base_store.claim_next("worker", NOW + timedelta(minutes=5))
+    claim = base_store.claim_next("worker", NOW + timedelta(minutes=5))
+    assert claim is not None
     audit_writer.events.clear()
     wrapping_factory = WrappingFactory(base_factory, fail_commit=True)
     store = SQLiteArtifactStore(
@@ -664,7 +979,7 @@ def test_commit_failure_rolls_back_verdict_evidence_and_state(
     )
 
     with pytest.raises(StoreUnavailable) as error:
-        store.record_verdict(verdict(), [evidence()])
+        store.record_verdict(claim, verdict(), [evidence()])
 
     assert isinstance(error.value.__cause__, sqlite3.OperationalError)
     assert str(error.value.__cause__) == "commit failed"
@@ -687,7 +1002,7 @@ def test_unexpected_sqlite_error_recording_verdict_maps_to_store_unavailable(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(
         store,
         """
@@ -697,10 +1012,10 @@ def test_unexpected_sqlite_error_recording_verdict_maps_to_store_unavailable(
     )
 
     with pytest.raises(StoreUnavailable) as error:
-        store.record_verdict(verdict(), ())
+        store.record_verdict(claim, verdict(), ())
 
     assert isinstance(error.value.__cause__, sqlite3.IntegrityError)
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []
 
 
@@ -708,15 +1023,16 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     raw_error = "line one\nline two\x00\t" + "x" * 5000 + "TAIL-SECRET"
 
-    store.mark_analysis_error(SHA256, raw_error)
+    store.mark_analysis_error(claim, raw_error)
 
     row = fetchall(
         store,
         """
-        SELECT state, lease_owner, lease_expires_at, last_error, updated_at
+        SELECT state, lease_owner, lease_expires_at, lease_token, last_error,
+               updated_at
         FROM artifacts WHERE sha256 = ?
         """,
         (SHA256,),
@@ -724,6 +1040,7 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert row["state"] == ArtifactState.ERROR.value
     assert row["lease_owner"] is None
     assert row["lease_expires_at"] is None
+    assert row["lease_token"] is None
     assert row["updated_at"] == NOW.isoformat()
     assert len(row["last_error"]) == 4096
     assert "\n" not in row["last_error"]
@@ -764,9 +1081,12 @@ def test_analysis_error_requires_existing_scanning_artifact(
     audit_writer.events.clear()
 
     with pytest.raises(TransitionConflict):
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim_input(), "failed")
     with pytest.raises(TransitionConflict):
-        store.mark_analysis_error(MISSING_SHA256, "failed")
+        store.mark_analysis_error(
+            claim_input(sha256=MISSING_SHA256),
+            "failed",
+        )
 
     row = fetchall(
         store,
@@ -778,18 +1098,18 @@ def test_analysis_error_requires_existing_scanning_artifact(
 
 
 @pytest.mark.parametrize(
-    ("sha256", "error_value", "error_type"),
+    ("claim", "error_value", "error_type"),
     [
-        ("A" * 64, "failed", InvalidSha256),
-        (SHA256, None, ValueError),
-        (SHA256, 123, ValueError),
-        (SHA256, b"failed", ValueError),
+        (unchecked_claim(sha256="A" * 64), "failed", InvalidSha256),
+        (claim_input(), None, ValueError),
+        (claim_input(), 123, ValueError),
+        (claim_input(), b"failed", ValueError),
     ],
 )
 def test_analysis_error_validates_inputs_before_connecting(
     tmp_path,
     audit_writer,
-    sha256,
+    claim,
     error_value,
     error_type,
 ) -> None:
@@ -799,7 +1119,7 @@ def test_analysis_error_validates_inputs_before_connecting(
     )
 
     with pytest.raises(error_type):
-        store.mark_analysis_error(sha256, error_value)
+        store.mark_analysis_error(claim, error_value)
 
     assert audit_writer.events == []
 
@@ -808,9 +1128,9 @@ def test_analysis_error_replaces_unsafe_unicode_deterministically(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
 
-    store.mark_analysis_error(SHA256, "bad\ud800value\x7f")
+    store.mark_analysis_error(claim, "bad\ud800value\x7f")
 
     row = fetchall(
         store,
@@ -824,7 +1144,7 @@ def test_ignored_analysis_error_update_fails_closed(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(
         store,
         """
@@ -836,9 +1156,9 @@ def test_ignored_analysis_error_update_fails_closed(
     )
 
     with pytest.raises(TransitionConflict):
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim, "failed")
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []
 
 
@@ -846,7 +1166,7 @@ def test_analysis_error_checks_final_artifact_state(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(
         store,
         """
@@ -856,16 +1176,16 @@ def test_analysis_error_checks_final_artifact_state(
         BEGIN
             UPDATE artifacts
             SET state = 'DISCOVERED', lease_owner = NULL,
-                lease_expires_at = NULL
+                lease_expires_at = NULL, lease_token = NULL
             WHERE sha256 = NEW.sha256;
         END
         """,
     )
 
     with pytest.raises(TransitionConflict):
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim, "failed")
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []
 
 
@@ -873,13 +1193,13 @@ def test_audit_failure_rolls_back_analysis_error(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     audit_writer.fail = True
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim, "failed")
 
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
 
 
 def test_commit_failure_rolls_back_analysis_error(
@@ -894,7 +1214,8 @@ def test_commit_failure_rolls_back_analysis_error(
         now=lambda: NOW,
     )
     base_store.discover_artifact(artifact(), release())
-    base_store.claim_next("worker", NOW + timedelta(minutes=5))
+    claim = base_store.claim_next("worker", NOW + timedelta(minutes=5))
+    assert claim is not None
     audit_writer.events.clear()
     wrapping_factory = WrappingFactory(base_factory, fail_commit=True)
     store = SQLiteArtifactStore(
@@ -904,7 +1225,7 @@ def test_commit_failure_rolls_back_analysis_error(
     )
 
     with pytest.raises(StoreUnavailable) as error:
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim, "failed")
 
     assert isinstance(error.value.__cause__, sqlite3.OperationalError)
     assert str(error.value.__cause__) == "commit failed"
@@ -912,7 +1233,8 @@ def test_commit_failure_rolls_back_analysis_error(
     with closing(base_factory.connect()) as connection:
         row = connection.execute(
             """
-            SELECT state, lease_owner, lease_expires_at, last_error
+            SELECT state, lease_owner, lease_expires_at, lease_token,
+                   last_error
             FROM artifacts WHERE sha256 = ?
             """,
             (SHA256,),
@@ -921,6 +1243,7 @@ def test_commit_failure_rolls_back_analysis_error(
         ArtifactState.SCANNING.value,
         "worker",
         (NOW + timedelta(minutes=5)).isoformat(),
+        claim.lease_token,
         None,
     )
 
@@ -929,7 +1252,7 @@ def test_unexpected_sqlite_error_marking_analysis_error_maps_to_unavailable(
     tmp_path,
     audit_writer,
 ) -> None:
-    store = prepare_scanning(tmp_path, audit_writer)
+    store, claim = prepare_scanning(tmp_path, audit_writer)
     install_trigger(
         store,
         """
@@ -941,8 +1264,8 @@ def test_unexpected_sqlite_error_marking_analysis_error_maps_to_unavailable(
     )
 
     with pytest.raises(StoreUnavailable) as error:
-        store.mark_analysis_error(SHA256, "failed")
+        store.mark_analysis_error(claim, "failed")
 
     assert isinstance(error.value.__cause__, sqlite3.IntegrityError)
-    assert_scanning_without_verdict(store)
+    assert_scanning_without_verdict(store, claim)
     assert audit_writer.events == []

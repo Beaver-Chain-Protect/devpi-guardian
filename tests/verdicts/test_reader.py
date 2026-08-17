@@ -30,17 +30,17 @@ def seed_artifact(
 ) -> None:
     timestamp = NOW.isoformat()
     lease_values = (
-        ("worker", (NOW + timedelta(minutes=10)).isoformat())
+        ("worker", (NOW + timedelta(minutes=10)).isoformat(), "f" * 64)
         if state is ArtifactState.SCANNING
-        else (None, None)
+        else (None, None, None)
     )
     with closing(factory.connect()) as connection, connection:
         connection.execute(
             """
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
-                lease_owner, lease_expires_at
-            ) VALUES (?, 1, ?, ?, ?, ?, ?)
+                lease_owner, lease_expires_at, lease_token
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?)
             """,
             (sha256, state.value, timestamp, timestamp, *lease_values),
         )

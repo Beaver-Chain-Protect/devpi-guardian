@@ -18,13 +18,34 @@ CREATE TABLE artifacts (
     updated_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    lease_token TEXT
+        CHECK(
+            lease_token IS NULL
+            OR (
+                typeof(lease_token) = 'text'
+                AND length(lease_token) = 64
+                AND lease_token NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
     last_error TEXT,
     CHECK(
-        (state = 'SCANNING' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+        (
+            state = 'SCANNING'
+            AND lease_owner IS NOT NULL
+            AND lease_expires_at IS NOT NULL
+            AND lease_token IS NOT NULL
+        )
         OR
-        (state != 'SCANNING' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+        (
+            state != 'SCANNING'
+            AND lease_owner IS NULL
+            AND lease_expires_at IS NULL
+            AND lease_token IS NULL
+        )
     )
 );
+CREATE UNIQUE INDEX artifacts_lease_token_unique_idx
+    ON artifacts(lease_token) WHERE lease_token IS NOT NULL;
 
 CREATE TABLE release_mappings (
     id INTEGER PRIMARY KEY,

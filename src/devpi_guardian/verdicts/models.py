@@ -234,6 +234,7 @@ class ClaimedArtifact:
     size_bytes: int
     worker_id: str
     lease_expires_at: datetime
+    lease_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import secrets
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -127,6 +128,46 @@ def _sanitize_analysis_error(value: object) -> str:
         )
         else character
         for character in value[:_MAX_ANALYSIS_ERROR_LENGTH]
+    )
+
+
+def _require_lease_token(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("lease_token must be a canonical token")
+    return value
+
+
+def _prepare_claim(
+    claim: object,
+) -> tuple[str, int, str, datetime, str, str]:
+    if type(claim) is not ClaimedArtifact:
+        raise ValueError("claim must be a ClaimedArtifact")
+    try:
+        sha256 = validate_sha256(claim.sha256)
+        size_bytes = claim.size_bytes
+        worker_id = _require_stored_string(claim.worker_id, "worker_id")
+        lease_expires_at = require_utc(
+            _require_datetime(claim.lease_expires_at, "lease_expires_at"),
+            "lease_expires_at",
+        )
+        lease_token = _require_lease_token(claim.lease_token)
+    except AttributeError:
+        raise ValueError("ClaimedArtifact missing required fields") from None
+    size_is_integer = type(size_bytes) is int
+    size_in_range = size_is_integer and 0 <= size_bytes <= _MAX_SQLITE_INTEGER
+    if not size_in_range:
+        raise ValueError("size_bytes must be a SQLite integer")
+    return (
+        sha256,
+        size_bytes,
+        worker_id,
+        lease_expires_at,
+        lease_expires_at.isoformat(),
+        lease_token,
     )
 
 
@@ -391,18 +432,19 @@ class SQLiteArtifactStore:
         worker_id: str,
         lease_until: datetime,
     ) -> ClaimedArtifact | None:
-        if type(worker_id) is not str or not worker_id.strip():
-            raise ValueError("worker_id must not be blank")
+        worker_id = _require_stored_string(worker_id, "worker_id")
         lease_timestamp = _require_datetime(lease_until, "lease_until")
         lease_expires_at = require_utc(lease_timestamp, "lease_until")
         lease_text = lease_expires_at.isoformat()
-        operation_at = require_utc(
-            _require_datetime(self._now(), "now"),
-            "now",
-        )
-        updated_at = operation_at.isoformat()
 
         with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            if lease_expires_at <= operation_at:
+                raise ValueError("lease_until must be in the future")
+            updated_at = operation_at.isoformat()
             row = connection.execute(
                 """
                 SELECT sha256, size_bytes
@@ -414,17 +456,43 @@ class SQLiteArtifactStore:
             ).fetchone()
             if row is None:
                 return None
+            lease_token = _require_lease_token(secrets.token_hex(32))
             cursor = connection.execute(
                 """
                 UPDATE artifacts
                 SET state = 'SCANNING', lease_owner = ?, lease_expires_at = ?,
-                    updated_at = ?, last_error = NULL
+                    lease_token = ?, updated_at = ?, last_error = NULL
                 WHERE sha256 = ? AND state = 'DISCOVERED'
                 """,
-                (worker_id, lease_text, updated_at, row["sha256"]),
+                (
+                    worker_id,
+                    lease_text,
+                    lease_token,
+                    updated_at,
+                    row["sha256"],
+                ),
             )
             if cursor.rowcount != 1:
                 raise TransitionConflict("artifact could not be claimed")
+            persisted = connection.execute(
+                """
+                SELECT sha256, size_bytes, state, lease_owner,
+                       lease_expires_at, lease_token, last_error, updated_at
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (row["sha256"],),
+            ).fetchone()
+            if persisted is None or tuple(persisted) != (
+                row["sha256"],
+                row["size_bytes"],
+                "SCANNING",
+                worker_id,
+                lease_text,
+                lease_token,
+                None,
+                updated_at,
+            ):
+                raise TransitionConflict("artifact claim state mismatch")
             self._audit(
                 connection,
                 actor=worker_id,
@@ -438,6 +506,7 @@ class SQLiteArtifactStore:
                 size_bytes=row["size_bytes"],
                 worker_id=worker_id,
                 lease_expires_at=lease_expires_at,
+                lease_token=lease_token,
             )
 
     def recover_expired_claims(self, now: datetime) -> int:
@@ -449,7 +518,7 @@ class SQLiteArtifactStore:
         with self._write() as connection:
             rows = connection.execute(
                 """
-                SELECT sha256, lease_owner, lease_expires_at
+                SELECT sha256, lease_owner, lease_expires_at, lease_token
                 FROM artifacts
                 WHERE state = 'SCANNING' AND lease_expires_at <= ?
                 ORDER BY lease_expires_at, sha256
@@ -461,15 +530,18 @@ class SQLiteArtifactStore:
                     """
                     UPDATE artifacts
                     SET state = 'DISCOVERED', lease_owner = NULL,
-                        lease_expires_at = NULL, updated_at = ?
+                        lease_expires_at = NULL, lease_token = NULL,
+                        updated_at = ?
                     WHERE sha256 = ? AND state = 'SCANNING'
                       AND lease_owner = ? AND lease_expires_at = ?
+                      AND lease_token = ?
                     """,
                     (
                         recovered_text,
                         row["sha256"],
                         row["lease_owner"],
                         row["lease_expires_at"],
+                        row["lease_token"],
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -488,9 +560,18 @@ class SQLiteArtifactStore:
 
     def record_verdict(
         self,
+        claim: ClaimedArtifact,
         verdict: VerdictInput,
         evidence: Sequence[EvidenceInput],
     ) -> None:
+        (
+            claim_sha256,
+            claim_size_bytes,
+            claim_worker_id,
+            claim_expires_at,
+            claim_expires_text,
+            claim_token,
+        ) = _prepare_claim(claim)
         if type(verdict) is not VerdictInput:
             raise ValueError("verdict must be a VerdictInput")
         try:
@@ -514,21 +595,36 @@ class SQLiteArtifactStore:
             raise ValueError("decision must be a Decision")
         if baseline_sha256 is not None:
             baseline_sha256 = validate_sha256(baseline_sha256)
+        if sha256 != claim_sha256:
+            raise TransitionConflict(sha256)
 
         prepared_evidence = _prepare_evidence(evidence)
-        operation_at = require_utc(
-            _require_datetime(self._now(), "now"),
-            "now",
-        )
-        updated_at = operation_at.isoformat()
 
         with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            if claim_expires_at <= operation_at:
+                raise TransitionConflict(claim_sha256)
+            updated_at = operation_at.isoformat()
             artifact_row = connection.execute(
-                "SELECT state FROM artifacts WHERE sha256 = ?",
-                (sha256,),
+                """
+                SELECT sha256, size_bytes, state, lease_owner,
+                       lease_expires_at, lease_token
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (claim_sha256,),
             ).fetchone()
-            if artifact_row is None or artifact_row["state"] != "SCANNING":
-                raise TransitionConflict(sha256)
+            if artifact_row is None or tuple(artifact_row) != (
+                claim_sha256,
+                claim_size_bytes,
+                "SCANNING",
+                claim_worker_id,
+                claim_expires_text,
+                claim_token,
+            ):
+                raise TransitionConflict(claim_sha256)
 
             if baseline_sha256 is not None:
                 baseline = connection.execute(
@@ -594,24 +690,37 @@ class SQLiteArtifactStore:
                 """
                 UPDATE artifacts
                 SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
-                    last_error = NULL, updated_at = ?
-                WHERE sha256 = ? AND state = 'SCANNING'
+                    lease_token = NULL, last_error = NULL, updated_at = ?
+                WHERE sha256 = ? AND size_bytes = ?
+                  AND state = 'SCANNING' AND lease_owner = ?
+                  AND lease_expires_at = ? AND lease_token = ?
+                  AND lease_expires_at > ?
                 """,
-                (decision.value, updated_at, sha256),
+                (
+                    decision.value,
+                    updated_at,
+                    claim_sha256,
+                    claim_size_bytes,
+                    claim_worker_id,
+                    claim_expires_text,
+                    claim_token,
+                    updated_at,
+                ),
             )
             if terminal.rowcount != 1:
-                raise TransitionConflict(sha256)
+                raise TransitionConflict(claim_sha256)
 
             final_artifact = connection.execute(
                 """
-                SELECT state, lease_owner, lease_expires_at, last_error,
-                       updated_at
+                SELECT state, lease_owner, lease_expires_at, lease_token,
+                       last_error, updated_at
                 FROM artifacts WHERE sha256 = ?
                 """,
-                (sha256,),
+                (claim_sha256,),
             ).fetchone()
             if final_artifact is None or tuple(final_artifact) != (
                 decision.value,
+                None,
                 None,
                 None,
                 None,
@@ -676,39 +785,83 @@ class SQLiteArtifactStore:
                 occurred_at=operation_at,
             )
 
-    def mark_analysis_error(self, sha256: str, error: str) -> None:
-        canonical_sha256 = validate_sha256(sha256)
+    def mark_analysis_error(
+        self,
+        claim: ClaimedArtifact,
+        error: str,
+    ) -> None:
+        (
+            claim_sha256,
+            claim_size_bytes,
+            claim_worker_id,
+            claim_expires_at,
+            claim_expires_text,
+            claim_token,
+        ) = _prepare_claim(claim)
         message = _sanitize_analysis_error(error)
-        operation_at = require_utc(
-            _require_datetime(self._now(), "now"),
-            "now",
-        )
-        updated_at = operation_at.isoformat()
 
         with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            if claim_expires_at <= operation_at:
+                raise TransitionConflict(claim_sha256)
+            updated_at = operation_at.isoformat()
+            artifact_row = connection.execute(
+                """
+                SELECT sha256, size_bytes, state, lease_owner,
+                       lease_expires_at, lease_token
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (claim_sha256,),
+            ).fetchone()
+            if artifact_row is None or tuple(artifact_row) != (
+                claim_sha256,
+                claim_size_bytes,
+                "SCANNING",
+                claim_worker_id,
+                claim_expires_text,
+                claim_token,
+            ):
+                raise TransitionConflict(claim_sha256)
+
             updated = connection.execute(
                 """
                 UPDATE artifacts
                 SET state = 'ERROR', lease_owner = NULL,
-                    lease_expires_at = NULL,
+                    lease_expires_at = NULL, lease_token = NULL,
                     last_error = ?, updated_at = ?
-                WHERE sha256 = ? AND state = 'SCANNING'
+                WHERE sha256 = ? AND size_bytes = ?
+                  AND state = 'SCANNING' AND lease_owner = ?
+                  AND lease_expires_at = ? AND lease_token = ?
+                  AND lease_expires_at > ?
                 """,
-                (message, updated_at, canonical_sha256),
+                (
+                    message,
+                    updated_at,
+                    claim_sha256,
+                    claim_size_bytes,
+                    claim_worker_id,
+                    claim_expires_text,
+                    claim_token,
+                    updated_at,
+                ),
             )
             if updated.rowcount != 1:
-                raise TransitionConflict(canonical_sha256)
+                raise TransitionConflict(claim_sha256)
 
             final_artifact = connection.execute(
                 """
-                SELECT state, lease_owner, lease_expires_at, last_error,
-                       updated_at
+                SELECT state, lease_owner, lease_expires_at, lease_token,
+                       last_error, updated_at
                 FROM artifacts WHERE sha256 = ?
                 """,
-                (canonical_sha256,),
+                (claim_sha256,),
             ).fetchone()
             if final_artifact is None or tuple(final_artifact) != (
                 "ERROR",
+                None,
                 None,
                 None,
                 message,
@@ -720,7 +873,7 @@ class SQLiteArtifactStore:
                 connection,
                 actor="guardian-worker",
                 action="artifact.analysis_error",
-                sha256=canonical_sha256,
+                sha256=claim_sha256,
                 reason="analysis failed",
                 occurred_at=operation_at,
             )
