@@ -38,6 +38,28 @@ class Reader:
         return self.result
 
 
+class HostileSha256(str):
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+class ExplodingDecision(EnforcementDecision):
+    def __getattribute__(self, name):
+        if name in {
+            "sha256",
+            "allowed",
+            "effective_decision",
+            "source",
+            "artifact_state",
+            "policy_version",
+        }:
+            raise RuntimeError("malformed decision")
+        return super().__getattribute__(name)
+
+
 def decision(
     *,
     allowed=False,
@@ -213,6 +235,100 @@ def test_only_valid_allow_source_state_pairs_reach_handler(
     )
 
     response = make_tween(reader, calls)(protected_request)
+
+    assert response.status_code == (200 if allowed_downstream else 404)
+    assert calls == ([protected_request] if allowed_downstream else [])
+
+
+@pytest.mark.parametrize("resolved", [HostileSha256("b" * 64), "not-a-sha256"])
+def test_invalid_resolver_result_returns_503_without_reader_or_handler(
+    monkeypatch,
+    resolved,
+):
+    monkeypatch.setattr(
+        "devpi_guardian.enforcement.tween.resolve_release_sha256",
+        lambda request: resolved,
+    )
+    calls = []
+    reader = Reader(
+        result=decision(
+            allowed=True,
+            effective_decision=Decision.ALLOW,
+            artifact_state=ArtifactState.ALLOW,
+        )
+    )
+
+    response = make_tween(reader, calls)(make_request(Log()))
+
+    assert response.status_code == 503
+    assert calls == []
+    assert reader.calls == []
+
+
+def test_exploding_decision_subclass_returns_sanitized_404_without_handler(
+    protected_request,
+):
+    calls = []
+    malformed = ExplodingDecision(
+        sha256=SHA256,
+        allowed=True,
+        effective_decision=Decision.ALLOW,
+        source=DecisionSource.AUTOMATED,
+        artifact_state=ArtifactState.ALLOW,
+        policy_version="policy-1",
+    )
+
+    response = make_tween(Reader(result=malformed), calls)(protected_request)
+
+    assert response.status_code == 404
+    assert calls == []
+
+
+class PolicySubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("source", "artifact_state", "policy_version", "allowed_downstream"),
+    [
+        (DecisionSource.AUTOMATED, ArtifactState.ALLOW, None, False),
+        (DecisionSource.AUTOMATED, ArtifactState.ALLOW, "", False),
+        (
+            DecisionSource.AUTOMATED,
+            ArtifactState.ALLOW,
+            PolicySubclass("v1"),
+            False,
+        ),
+        (DecisionSource.MANUAL_OVERRIDE, ArtifactState.REVIEW, None, False),
+        (DecisionSource.MANUAL_OVERRIDE, ArtifactState.DENY, "", False),
+        (DecisionSource.MANUAL_OVERRIDE, ArtifactState.ERROR, None, True),
+        (DecisionSource.MANUAL_OVERRIDE, ArtifactState.ERROR, "v1", True),
+        (
+            DecisionSource.MANUAL_OVERRIDE,
+            ArtifactState.ERROR,
+            PolicySubclass("v1"),
+            False,
+        ),
+    ],
+)
+def test_allow_requires_valid_policy_version_for_source_and_state(
+    protected_request,
+    source,
+    artifact_state,
+    policy_version,
+    allowed_downstream,
+):
+    calls = []
+    result = EnforcementDecision(
+        sha256=SHA256,
+        allowed=True,
+        effective_decision=Decision.ALLOW,
+        source=source,
+        artifact_state=artifact_state,
+        policy_version=policy_version,
+    )
+
+    response = make_tween(Reader(result=result), calls)(protected_request)
 
     assert response.status_code == (200 if allowed_downstream else 404)
     assert calls == ([protected_request] if allowed_downstream else [])

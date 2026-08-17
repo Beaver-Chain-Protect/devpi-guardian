@@ -396,6 +396,8 @@ def _get_entry_sha256(entry: object) -> str:
     sha256 = _safe_getitem(hashes, "sha256")
     if sha256 is _FAILED:
         _fail()
+    if type(sha256) is not str:
+        _fail()
     try:
         return validate_sha256(sha256)
     except InvalidSha256:

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pyramid.httpexceptions import HTTPNotFound, HTTPServiceUnavailable
 
-from devpi_guardian.verdicts.errors import StoreUnavailable
+from devpi_guardian.verdicts.errors import InvalidSha256, StoreUnavailable
 from devpi_guardian.verdicts.models import (
     ArtifactState,
     Decision,
     DecisionSource,
     EnforcementDecision,
+    validate_sha256,
 )
 
 from .resolve import ArtifactIdentityUnavailable, resolve_release_sha256
@@ -29,7 +30,7 @@ def _route_classification(request: object) -> str:
         path_info = request.path_info
     except Exception:
         return _UNKNOWN
-    if not isinstance(path_info, str):
+    if type(path_info) is not str:
         return _UNKNOWN
     parts = path_info.split("/")
     if len(parts) > 3 and parts[3] in {"+f", "+e"}:
@@ -88,20 +89,46 @@ def _safe_log(
 
 def _is_exact_allow(decision: object, sha256: str) -> bool:
     """Accept only a structurally valid, reader-produced effective ALLOW."""
-    if not isinstance(decision, EnforcementDecision):
+    if type(decision) is not EnforcementDecision:
         return False
-    if type(decision.sha256) is not str or decision.sha256 != sha256:
-        return False
-    if decision.allowed is not True:
-        return False
-    if decision.effective_decision is not Decision.ALLOW:
-        return False
-    if decision.source is DecisionSource.AUTOMATED:
-        return decision.artifact_state is ArtifactState.ALLOW
-    if decision.source is DecisionSource.MANUAL_OVERRIDE:
+    try:
+        decision_sha256 = decision.sha256
+        allowed = decision.allowed
+        effective_decision = decision.effective_decision
+        source = decision.source
         artifact_state = decision.artifact_state
-        return any(artifact_state is state for state in _MANUAL_ALLOW_STATES)
+        policy_version = decision.policy_version
+    except Exception:
+        return False
+
+    if type(decision_sha256) is not str or decision_sha256 != sha256:
+        return False
+    if allowed is not True or effective_decision is not Decision.ALLOW:
+        return False
+    if source is DecisionSource.AUTOMATED:
+        allowed_state = artifact_state is ArtifactState.ALLOW
+        return allowed_state and _valid_policy_version(policy_version)
+    if source is not DecisionSource.MANUAL_OVERRIDE:
+        return False
+    if artifact_state is ArtifactState.ERROR:
+        return policy_version is None or _valid_policy_version(policy_version)
+    if any(artifact_state is state for state in _MANUAL_ALLOW_STATES[:-1]):
+        return _valid_policy_version(policy_version)
     return False
+
+
+def _valid_policy_version(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
+
+
+def _valid_resolved_sha256(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        validate_sha256(value)
+    except InvalidSha256:
+        return False
+    return True
 
 
 def guardian_enforcement_tween_factory(handler, registry):
@@ -130,6 +157,14 @@ def guardian_enforcement_tween_factory(handler, registry):
 
         if sha256 is None:
             return handler(request)
+        if not _valid_resolved_sha256(sha256):
+            _safe_log(
+                request,
+                sha256=_UNKNOWN,
+                decision=None,
+                block_category="identity_unavailable",
+            )
+            return HTTPServiceUnavailable()
 
         try:
             decision = reader.get_effective_decision(sha256)

@@ -75,6 +75,14 @@ class FailingHashesEntry(FakeEntry):
         pass
 
 
+class HostileSha256(str):
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
 class FailingPathInfoRequest:
     def __init__(self, candidate: object) -> None:
         self.__dict__.update(candidate.__dict__)
@@ -944,6 +952,16 @@ def test_non_release_relations_pass_through(relation: str) -> None:
 def test_release_without_canonical_sha256_fails_closed(sha256: object) -> None:
     candidate = make_request()
     candidate.registry["xom"].filestore.entry.hashes = {"sha256": sha256}
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+
+def test_release_with_hostile_sha256_subclass_fails_closed() -> None:
+    candidate = make_request()
+    candidate.registry["xom"].filestore.entry.hashes = {
+        "sha256": HostileSha256(SHA256),
+    }
 
     with pytest.raises(ArtifactIdentityUnavailable):
         resolve_release_sha256(candidate)
