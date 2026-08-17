@@ -280,7 +280,7 @@ def make_request(
     if path_info is None:
         path_info = f"/{full_relpath}"
     if environ is None:
-        environ = {}
+        environ = {"REQUEST_URI": path_info}
     return SimpleNamespace(
         method=method,
         matched_route=SimpleNamespace(name=route_name),
@@ -404,6 +404,7 @@ def test_real_pyramid_tween_resolves_before_router_populates_attributes(
     application = config.make_wsgi_app()
 
     request = application.request_factory.blank(f"/{relpath}", method=method)
+    request.environ["REQUEST_URI"] = f"/{relpath}"
     response = request.get_response(application)
 
     assert response.status_code == 200
@@ -482,6 +483,56 @@ def test_real_pyramid_tween_rejects_inconsistent_raw_artifact_path(
 
     request = application.request_factory.blank(DEFAULT_PATH_INFO)
     request.environ[raw_key] = raw_value
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        request.get_response(application)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert config.registry["resolver_probe"] == [
+        (
+            {
+                "matched_route": False,
+                "matchdict": False,
+                "context": False,
+            },
+            "identity-unavailable",
+        )
+    ]
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("marker", "route_name"),
+    [("+f", F_ROUTE), ("+e", E_ROUTE)],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_real_pyramid_tween_requires_a_raw_protected_request_path(
+    marker: str,
+    route_name: str,
+    method: str,
+) -> None:
+    relpath = f"root/pypi/{marker}/abc/demo-1.0-py3-none-any.whl"
+    model = FakeModel(FakeStage(FakeLink(relpath)))
+    config = Configurator()
+    config.registry["xom"] = SimpleNamespace(
+        filestore=FakeFileStore(FakeEntry(relpath)),
+        model=model,
+    )
+    config.registry["resolver_probe"] = []
+    config.add_route(
+        route_name,
+        f"/{{user}}/{{index}}/{marker}/{{relpath:.*}}",
+    )
+    config.add_tween(
+        "tests.enforcement.test_resolve.resolver_probe_tween_factory",
+        over=EXCVIEW,
+    )
+    application = config.make_wsgi_app()
+    request = application.request_factory.blank(f"/{relpath}", method=method)
+    for key in RAW_PATH_KEYS:
+        request.environ.pop(key, None)
 
     with pytest.raises(ArtifactIdentityUnavailable) as raised:
         request.get_response(application)
@@ -655,6 +706,7 @@ def test_real_pyramid_tween_refreshes_f_project_metadata_after_entry_miss(
 
     request_factory = application.request_factory
     request = request_factory.blank(DEFAULT_PATH_INFO, method=method)
+    request.environ["REQUEST_URI"] = DEFAULT_PATH_INFO
     response = request.get_response(application)
 
     assert response.status_code == 200
@@ -1085,9 +1137,34 @@ def test_inconsistent_raw_artifact_paths_fail_closed(environ: object) -> None:
 
 
 @pytest.mark.parametrize(
+    ("marker", "route_name"),
+    [("+f", F_ROUTE), ("+e", E_ROUTE)],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_protected_download_without_any_raw_path_fails_closed(
+    marker: str,
+    route_name: str,
+    method: str,
+) -> None:
+    candidate = make_request(
+        marker=marker,
+        route_name=route_name,
+        method=method,
+        environ={},
+    )
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        resolve_release_sha256(candidate)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert candidate.registry["xom"].model.calls == []
+
+
+@pytest.mark.parametrize(
     "environ",
     [
-        {},
         {
             "SCRIPT_NAME": "",
             "REQUEST_URI": DEFAULT_PATH_INFO,
@@ -1307,6 +1384,26 @@ def test_nonprotected_path_ignores_inconsistent_raw_environment() -> None:
             "RAW_URI": object(),
             "RAW_PATH_INFO": "/other",
         },
+    )
+
+    assert resolve_release_sha256(candidate) is None
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("method", "path_info"),
+    [("POST", DEFAULT_PATH_INFO), ("GET", "/+api")],
+)
+def test_unprotected_request_without_raw_path_passes_through(
+    method: str,
+    path_info: str,
+) -> None:
+    model = FakeModel(None)
+    candidate = make_request(
+        method=method,
+        path_info=path_info,
+        model=model,
+        environ={},
     )
 
     assert resolve_release_sha256(candidate) is None

@@ -32,6 +32,17 @@ from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from tests.conftest import RecordingAuditWriter
 
 pytestmark = pytest.mark.integration
+_EXTERNAL_PIP_SOURCE_ENVIRONMENT = (
+    "PIP_FIND_LINKS",
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
 class Links(html.parser.HTMLParser):
@@ -260,6 +271,8 @@ def _assert_concurrent_blocked(
 
 def _pip_environment() -> dict[str, str]:
     environment = os.environ.copy()
+    for variable in _EXTERNAL_PIP_SOURCE_ENVIRONMENT:
+        environment.pop(variable, None)
     environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
     environment["no_proxy"] = "127.0.0.1,localhost,::1"
     environment["PIP_CONFIG_FILE"] = os.devnull
@@ -350,6 +363,36 @@ def _assert_revoked_lock_blocked_by_guardian(
     assert "404" in combined
     assert wheel_filename in combined
     assert direct_path in combined
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "PIP_FIND_LINKS",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ],
+)
+def test_pip_environment_cannot_inherit_an_external_source(
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+) -> None:
+    monkeypatch.setenv(variable, "https://user:secret@external.invalid/simple")
+    monkeypatch.setenv("GUARDIAN_UNRELATED", "preserved")
+
+    environment = _pip_environment()
+
+    assert variable not in environment
+    assert environment["GUARDIAN_UNRELATED"] == "preserved"
+    assert environment["PIP_NO_INDEX"] == "1"
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    assert environment["no_proxy"] == "127.0.0.1,localhost,::1"
 
 
 def test_revoked_lock_assertion_rejects_an_unrelated_failure() -> None:

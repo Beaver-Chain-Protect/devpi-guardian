@@ -145,10 +145,12 @@ def _raw_paths_are_unambiguous(
     path_info_raw_paths = _valid_raw_forms(canonical_path_info)
     path_info_raw_paths |= {encoded_marker_path}
 
+    raw_path_seen = False
     for key in ("RAW_URI", "REQUEST_URI"):
         raw_target = _safe_optional_getitem(environ, key)
         if raw_target is _MISSING:
             continue
+        raw_path_seen = True
         if raw_target is _FAILED or not isinstance(raw_target, str):
             return False
         raw_path = raw_target.partition("?")[0]
@@ -157,7 +159,7 @@ def _raw_paths_are_unambiguous(
 
     raw_path_info = _safe_optional_getitem(environ, "RAW_PATH_INFO")
     if raw_path_info is _MISSING:
-        return True
+        return raw_path_seen
     if raw_path_info is _FAILED or not isinstance(raw_path_info, str):
         return False
     return raw_path_info in path_info_raw_paths
