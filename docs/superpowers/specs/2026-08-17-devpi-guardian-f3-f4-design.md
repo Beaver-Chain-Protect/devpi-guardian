@@ -224,9 +224,11 @@ class ArtifactStore(Protocol):
 - `PRAGMA journal_mode=WAL`
 - `PRAGMA foreign_keys=ON`
 - `PRAGMA synchronous=FULL`
+- `PRAGMA recursive_triggers=ON`
 - 쓰기 전이는 `BEGIN IMMEDIATE`를 사용한다.
 - `busy_timeout`을 설정한다.
 - 프로세스와 스레드마다 별도 연결을 사용한다.
+- reader는 current verdict와 current override를 별도 bounded query로 읽어 손상 DB의 중복 행을 판정 전에 제한한다.
 - migration은 애플리케이션 요청을 받기 전에 한 프로세스만 실행한다.
 - 승인과 취소의 즉시성을 위해 P0에서는 판정 cache를 두지 않는다.
 - 운영 backup은 DB 파일 하나를 복사하지 말고 SQLite backup API 또는 checkpoint 후 일관된 snapshot을 사용한다.

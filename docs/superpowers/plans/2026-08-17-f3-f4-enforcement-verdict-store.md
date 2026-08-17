@@ -34,6 +34,14 @@
 > verification while holding `BEGIN IMMEDIATE`; they must not materialize all
 > historical evidence payloads to prove immutability.
 
+> **2026-08-18 replacement/duplicate-bound correction:** Every connection
+> enables and verifies `PRAGMA recursive_triggers=ON`; immutable-history
+> guards must also reject replacement of an existing row identity. Bounded
+> post-audit checks compare the complete newly requested override row, not
+> only its ID and count. Reader batches query current verdicts and overrides
+> separately and retain at most two rows per SHA-256 so duplicate-current
+> corruption cannot create a Cartesian result before `StoreUnavailable`.
+
 ---
 
 ## Source design
