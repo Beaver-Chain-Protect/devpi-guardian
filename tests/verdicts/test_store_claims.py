@@ -549,11 +549,17 @@ def test_writer_lock_timeout_then_reconnects(
     factory = ConnectionFactory(tmp_path / "guardian.db", busy_timeout_ms=1)
     migrate(factory)
     store = SQLiteArtifactStore(factory, audit_writer, now=lambda: NOW)
+    before = domain_snapshot(store)
+    before_events = list(audit_writer.events)
 
     with closing(factory.connect()) as locker:
         locker.execute("BEGIN IMMEDIATE")
-        with pytest.raises(StoreUnavailable):
+        with pytest.raises(StoreUnavailable) as error:
             store.discover_artifact(artifact(), release())
+        assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+        assert "locked" in str(error.value.__cause__).lower()
+        assert domain_snapshot(store) == before
+        assert audit_writer.events == before_events
         locker.rollback()
 
     store.discover_artifact(artifact(), release())
