@@ -437,6 +437,8 @@ dependencies = [
 
 [package.optional-dependencies]
 test = [
+    { name = "build" },
+    { name = "devpi-client" },
     { name = "flake8" },
     { name = "pytest" },
     { name = "pytest-devpi-server" },
@@ -446,6 +448,8 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "build", marker = "extra == 'test'", specifier = ">=1,<2" },
+    { name = "devpi-client", marker = "extra == 'test'", specifier = ">=7,<8" },
     { name = "devpi-server", specifier = "==6.20.3" },
     { name = "flake8", marker = "extra == 'test'", specifier = ">=7,<9" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
