@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+from devpi_common.metadata import splitbasename
+from devpi_server.markers import Unknown
 
 from devpi_guardian.verdicts.errors import InvalidSha256
 from devpi_guardian.verdicts.models import validate_sha256
@@ -11,6 +16,7 @@ _F_ROUTE = "/{user}/{index}/+f/{relpath:.*}"
 _E_ROUTE = "/{user}/{index}/+e/{relpath:.*}"
 _METADATA_SUFFIX = ".metadata"
 _RELEASE_RELATION = "releasefile"
+_RFC3986_PATH_SAFE = "/:@-._~!$&'()*+,;="
 _UNAVAILABLE_MESSAGE = "protected artifact identity unavailable"
 _FAILED = object()
 _MISSING = object()
@@ -122,6 +128,8 @@ def _raw_paths_are_unambiguous(
     if script_name is _FAILED or not _valid_script_name(script_name):
         return False
     external_path = f"{script_name}{canonical_path_info}"
+    external_raw_paths = _valid_raw_forms(external_path)
+    path_info_raw_paths = _valid_raw_forms(canonical_path_info)
 
     for key in ("RAW_URI", "REQUEST_URI"):
         raw_target = _safe_optional_getitem(environ, key)
@@ -130,7 +138,7 @@ def _raw_paths_are_unambiguous(
         if raw_target is _FAILED or not isinstance(raw_target, str):
             return False
         raw_path = raw_target.partition("?")[0]
-        if raw_path != external_path or _has_unsafe_character(raw_path):
+        if raw_path not in external_raw_paths:
             return False
 
     raw_path_info = _safe_optional_getitem(environ, "RAW_PATH_INFO")
@@ -138,9 +146,19 @@ def _raw_paths_are_unambiguous(
         return True
     if raw_path_info is _FAILED or not isinstance(raw_path_info, str):
         return False
-    if raw_path_info != canonical_path_info:
-        return False
-    return not _has_unsafe_character(raw_path_info)
+    return raw_path_info in path_info_raw_paths
+
+
+def _valid_raw_forms(decoded_path: str) -> frozenset[str]:
+    canonical = quote(
+        decoded_path,
+        safe=_RFC3986_PATH_SAFE,
+        encoding="utf-8",
+        errors="strict",
+    )
+    if decoded_path.isascii():
+        return frozenset((decoded_path, canonical))
+    return frozenset((canonical,))
 
 
 def _classify_path(
@@ -254,9 +272,65 @@ def _crosscheck_routed_attributes(
             _fail()
 
 
-def _get_entry(filestore: object, marker: str, relpath: str) -> object:
+def _project_exists_perstage(stage: object, project: str) -> object:
+    method = _safe_getattr(stage, "has_project_perstage")
+    project_exists = _safe_call(method, project)
+    if project_exists is _FAILED:
+        _fail()
+    if project_exists is True or project_exists is False:
+        return project_exists
+    if isinstance(project_exists, Unknown):
+        return project_exists
+    _fail()
+
+
+def _refresh_f_entry(
+    filestore: object,
+    stage: object,
+    relpath: str,
+) -> object | None:
+    parsed = _safe_call(splitbasename, Path(relpath).name)
+    if (
+        parsed is _FAILED
+        or not isinstance(parsed, tuple)
+        or not parsed
+        or not isinstance(parsed[0], str)
+        or not parsed[0]
+    ):
+        _fail()
+    project = parsed[0]
+
+    project_exists = _project_exists_perstage(stage, project)
+    refresh = project_exists is True
+    if isinstance(project_exists, Unknown):
+        no_project_list = _safe_getattr(stage, "no_project_list")
+        if no_project_list is _FAILED or not isinstance(no_project_list, bool):
+            _fail()
+        refresh = no_project_list
+    if not refresh:
+        return None
+
+    list_versions = _safe_getattr(stage, "list_versions_perstage")
+    if _safe_call(list_versions, project) is _FAILED:
+        _fail()
+    project_exists = _project_exists_perstage(stage, project)
+    if project_exists is not True:
+        return None
+    return _safe_call(_safe_getattr(filestore, "get_file_entry"), relpath)
+
+
+def _get_entry(
+    filestore: object,
+    stage: object,
+    marker: str,
+    relpath: str,
+) -> object:
     if marker == "+f":
         entry = _safe_call(_safe_getattr(filestore, "get_file_entry"), relpath)
+        if entry is _FAILED:
+            _fail()
+        if entry is None:
+            entry = _refresh_f_entry(filestore, stage, relpath)
     else:
         get_key = _safe_getattr(filestore, "get_key_from_relpath")
         key = _safe_call(get_key, relpath)
@@ -350,7 +424,7 @@ def resolve_release_sha256(request) -> str | None:
         tail=tail,
     )
     filestore = _get_filestore(xom)
-    entry = _get_entry(filestore, marker, relpath)
+    entry = _get_entry(filestore, stage, marker, relpath)
     consistent = _entry_is_consistent(entry, relpath, user, index)
     if not consistent:
         _fail()
