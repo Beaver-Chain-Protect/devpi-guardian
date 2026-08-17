@@ -9,7 +9,6 @@ from devpi_guardian.verdicts.models import validate_sha256
 
 _F_ROUTE = "/{user}/{index}/+f/{relpath:.*}"
 _E_ROUTE = "/{user}/{index}/+e/{relpath:.*}"
-_PROTECTED_ROUTES = {_F_ROUTE: "+f", _E_ROUTE: "+e"}
 _METADATA_SUFFIX = ".metadata"
 _RELEASE_RELATION = "releasefile"
 _UNAVAILABLE_MESSAGE = "protected artifact identity unavailable"
@@ -28,6 +27,15 @@ def _fail() -> None:
 def _safe_getattr(value: object, name: str) -> Any:
     try:
         return getattr(value, name)
+    except Exception:
+        return _FAILED
+
+
+def _safe_optional_getattr(value: object, name: str) -> Any:
+    try:
+        return getattr(value, name)
+    except AttributeError:
+        return _MISSING
     except Exception:
         return _FAILED
 
@@ -101,23 +109,35 @@ def _raw_paths_are_unambiguous(request: object) -> bool:
     return True
 
 
-def _extract_relpath(request: object, marker: str) -> tuple[str, str, str]:
-    matchdict = _safe_getattr(request, "matchdict")
-    if not isinstance(matchdict, Mapping):
+def _classify_path(
+    request: object,
+) -> tuple[str, str, str, str, str] | None:
+    path_info = _safe_getattr(request, "path_info")
+    if not isinstance(path_info, str):
+        return None
+
+    path_parts = path_info.split("/")
+    nonempty_parts = [part for part in path_parts if part]
+    marker = path_parts[3] if len(path_parts) > 3 else None
+    if marker not in {"+f", "+e"}:
+        marker = nonempty_parts[2] if len(nonempty_parts) > 2 else None
+    if marker not in {"+f", "+e"}:
+        return None
+
+    if not _raw_paths_are_unambiguous(request):
         _fail()
-    user = _safe_getitem(matchdict, "user")
-    index = _safe_getitem(matchdict, "index")
-    tail = _safe_getitem(matchdict, "relpath")
+    if len(path_parts) < 5 or path_parts[0] or path_parts[3] != marker:
+        _fail()
+    user = path_parts[1]
+    index = path_parts[2]
+    tail = "/".join(path_parts[4:])
     if not _valid_route_segment(user) or not _valid_route_segment(index):
         _fail()
     if not _valid_relpath_tail(tail):
         _fail()
 
     requested_relpath = f"{user}/{index}/{marker}/{tail}"
-    path_info = _safe_getattr(request, "path_info")
     if path_info != f"/{requested_relpath}":
-        _fail()
-    if not _raw_paths_are_unambiguous(request):
         _fail()
 
     artifact_tail = tail
@@ -128,12 +148,21 @@ def _extract_relpath(request: object, marker: str) -> tuple[str, str, str]:
         if nested_metadata or not basename.endswith(".whl"):
             _fail()
     artifact_relpath = f"{user}/{index}/{marker}/{artifact_tail}"
-    return user, index, artifact_relpath
+    return user, index, marker, tail, artifact_relpath
 
 
-def _get_stage(request: object, user: str, index: str) -> object:
-    context = _safe_getattr(request, "context")
-    stage = _safe_getattr(context, "stage")
+def _get_xom(request: object) -> object:
+    registry = _safe_getattr(request, "registry")
+    xom = _safe_getitem(registry, "xom")
+    if xom is _FAILED or xom is None:
+        _fail()
+    return xom
+
+
+def _get_stage(xom: object, user: str, index: str) -> object:
+    model = _safe_getattr(xom, "model")
+    getstage = _safe_getattr(model, "getstage")
+    stage = _safe_call(getstage, user, index)
     if stage is _FAILED or stage is None:
         _fail()
     stage_user = _safe_getattr(stage, "username")
@@ -143,13 +172,51 @@ def _get_stage(request: object, user: str, index: str) -> object:
     return stage
 
 
-def _get_filestore(request: object) -> object:
-    registry = _safe_getattr(request, "registry")
-    xom = _safe_getitem(registry, "xom")
+def _get_filestore(xom: object) -> object:
     filestore = _safe_getattr(xom, "filestore")
     if filestore is _FAILED or filestore is None:
         _fail()
     return filestore
+
+
+def _crosscheck_routed_attributes(
+    request: object,
+    *,
+    user: str,
+    index: str,
+    marker: str,
+    tail: str,
+) -> None:
+    matched_route = _safe_optional_getattr(request, "matched_route")
+    if matched_route is _FAILED:
+        _fail()
+    if matched_route is not _MISSING and matched_route is not None:
+        expected_route = _F_ROUTE if marker == "+f" else _E_ROUTE
+        if _safe_getattr(matched_route, "name") != expected_route:
+            _fail()
+
+    matchdict = _safe_optional_getattr(request, "matchdict")
+    if matchdict is _FAILED:
+        _fail()
+    if matchdict is not _MISSING and matchdict is not None:
+        if not isinstance(matchdict, Mapping):
+            _fail()
+        expected_match = {"user": user, "index": index, "relpath": tail}
+        for key, expected in expected_match.items():
+            if _safe_getitem(matchdict, key) != expected:
+                _fail()
+
+    context = _safe_optional_getattr(request, "context")
+    if context is _FAILED:
+        _fail()
+    if context is not _MISSING and context is not None:
+        context_stage = _safe_getattr(context, "stage")
+        if context_stage is _FAILED or context_stage is None:
+            _fail()
+        context_user = _safe_getattr(context_stage, "username")
+        context_index = _safe_getattr(context_stage, "index")
+        if context_user != user or context_index != index:
+            _fail()
 
 
 def _get_entry(filestore: object, marker: str, relpath: str) -> object:
@@ -233,17 +300,21 @@ def resolve_release_sha256(request) -> str | None:
     if not isinstance(method, str) or method not in {"GET", "HEAD"}:
         return None
 
-    route = _safe_getattr(request, "matched_route")
-    route_name = _safe_getattr(route, "name")
-    if not isinstance(route_name, str):
-        return None
-    marker = _PROTECTED_ROUTES.get(route_name)
-    if marker is None:
+    path_identity = _classify_path(request)
+    if path_identity is None:
         return None
 
-    user, index, relpath = _extract_relpath(request, marker)
-    stage = _get_stage(request, user, index)
-    filestore = _get_filestore(request)
+    user, index, marker, tail, relpath = path_identity
+    xom = _get_xom(request)
+    stage = _get_stage(xom, user, index)
+    _crosscheck_routed_attributes(
+        request,
+        user=user,
+        index=index,
+        marker=marker,
+        tail=tail,
+    )
+    filestore = _get_filestore(xom)
     entry = _get_entry(filestore, marker, relpath)
     consistent = _entry_is_consistent(entry, relpath, user, index)
     if not consistent:

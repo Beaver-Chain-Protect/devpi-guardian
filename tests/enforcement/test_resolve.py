@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import pytest
 from devpi_server.main import XOM
 from devpi_server.views import PyPIView
+from pyramid.config import Configurator
+from pyramid.response import Response
+from pyramid.tweens import EXCVIEW
 
 from devpi_guardian.enforcement.resolve import (
     ArtifactIdentityUnavailable,
@@ -23,6 +26,7 @@ NON_DOWNLOAD_METHODS = ("POST", "PUT", "PATCH", "DELETE", "get", None, [])
 NON_RELEASE_RELATIONS = ("toxresult", "doczip", "other", "releaseFile", "")
 INVALID_SHA256S = (None, "", "A" * 64, "g" * 64, "a" * 63, "a" * 65)
 RAW_PATH_KEYS = ("RAW_URI", "REQUEST_URI", "RAW_PATH_INFO")
+ROUTED_ATTRIBUTES = ("matched_route", "matchdict", "context")
 ENCODED_ARTIFACT_PATH = "/root/pypi/+f/abc%2Fdemo-1.0-py3-none-any.whl"
 ENCODED_ARTIFACT_URI = ENCODED_ARTIFACT_PATH + "?token=secret"
 
@@ -153,6 +157,24 @@ class FakeFileStore:
         return self.entry
 
 
+class FakeModel:
+    def __init__(
+        self,
+        stage: object | None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.stage = stage
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def getstage(self, user: str, index: str):
+        self.calls.append((user, index))
+        if self.error is not None:
+            raise self.error
+        return self.stage
+
+
 def make_request(
     *,
     method: object = "GET",
@@ -166,6 +188,7 @@ def make_request(
     relation: object = "releasefile",
     stage: object | None = None,
     filestore: object | None = None,
+    model: object | None = None,
     environ: object | None = None,
 ):
     full_relpath = f"root/pypi/{marker}/{tail}"
@@ -177,6 +200,8 @@ def make_request(
         stage = FakeStage(link)
     if filestore is None:
         filestore = FakeFileStore(entry)
+    if model is None:
+        model = FakeModel(stage)
     if matchdict is None:
         matchdict = {"user": "root", "index": "pypi", "relpath": tail}
     if path_info is None:
@@ -188,7 +213,7 @@ def make_request(
         matched_route=SimpleNamespace(name=route_name),
         matchdict=matchdict,
         path_info=path_info,
-        registry={"xom": SimpleNamespace(filestore=filestore)},
+        registry={"xom": SimpleNamespace(filestore=filestore, model=model)},
         context=SimpleNamespace(stage=stage),
         environ=environ,
         headers={"X-Artifact-SHA256": "b" * 64},
@@ -218,6 +243,18 @@ def _is_string_constant(value: ast.expr) -> bool:
     return isinstance(value, ast.Constant) and isinstance(value.value, str)
 
 
+def resolver_probe_tween_factory(handler, registry):
+    def probe(request):
+        routed_attributes = {}
+        for name in ROUTED_ATTRIBUTES:
+            routed_attributes[name] = name in request.__dict__
+        resolved = resolve_release_sha256(request)
+        registry["resolver_probe"].append((routed_attributes, resolved))
+        return Response("probe")
+
+    return probe
+
+
 def test_pinned_devpi_registers_the_exact_protected_routes() -> None:
     assert {
         (F_ROUTE, "/{user:[^+/]+}/{index:[^+/]+}/+f/{relpath:.*}"),
@@ -231,6 +268,86 @@ def test_pinned_devpi_views_use_full_path_info_as_filestore_relpath() -> None:
         assert "self._relpath_from_request()" in source
     source = inspect.getsource(PyPIView._relpath_from_request)
     assert 'self.request.path_info.strip("/")' in source
+
+
+@pytest.mark.parametrize(
+    ("marker", "route_name"),
+    [("+f", F_ROUTE), ("+e", E_ROUTE)],
+)
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_real_pyramid_tween_resolves_before_router_populates_attributes(
+    marker: str,
+    route_name: str,
+    method: str,
+) -> None:
+    relpath = f"root/pypi/{marker}/abc/demo-1.0-py3-none-any.whl"
+    entry = FakeEntry(relpath)
+    stage = FakeStage(FakeLink(relpath))
+    model = FakeModel(stage)
+    filestore = FakeFileStore(entry)
+    config = Configurator()
+    config.registry["xom"] = SimpleNamespace(
+        filestore=filestore,
+        model=model,
+    )
+    config.registry["resolver_probe"] = []
+    config.add_route(
+        route_name,
+        f"/{{user:[^+/]+}}/{{index:[^+/]+}}/{marker}/{{relpath:.*}}",
+    )
+    config.add_tween(
+        "tests.enforcement.test_resolve.resolver_probe_tween_factory",
+        over=EXCVIEW,
+    )
+    application = config.make_wsgi_app()
+
+    request = application.request_factory.blank(f"/{relpath}", method=method)
+    response = request.get_response(application)
+
+    assert response.status_code == 200
+    assert config.registry["resolver_probe"] == [
+        (
+            {
+                "matched_route": False,
+                "matchdict": False,
+                "context": False,
+            },
+            SHA256,
+        )
+    ]
+    assert model.calls == [("root", "pypi")]
+
+
+def test_real_pyramid_tween_passes_unrelated_path_before_routing() -> None:
+    config = Configurator()
+    model = FakeModel(None)
+    config.registry["xom"] = SimpleNamespace(
+        filestore=FakeFileStore(None),
+        model=model,
+    )
+    config.registry["resolver_probe"] = []
+    config.add_route("/+api", "/+api")
+    config.add_tween(
+        "tests.enforcement.test_resolve.resolver_probe_tween_factory",
+        over=EXCVIEW,
+    )
+    application = config.make_wsgi_app()
+
+    request = application.request_factory.blank("/+api")
+    response = request.get_response(application)
+
+    assert response.status_code == 200
+    assert config.registry["resolver_probe"] == [
+        (
+            {
+                "matched_route": False,
+                "matchdict": False,
+                "context": False,
+            },
+            None,
+        )
+    ]
+    assert model.calls == []
 
 
 @pytest.mark.parametrize(
@@ -262,6 +379,7 @@ def test_release_routes_resolve_persisted_entry_sha256(
     assert [call[0] for call in calls] == expected_calls
     expected_relpath = f"root/pypi/{marker}/abc/demo-1.0-py3-none-any.whl"
     assert candidate.context.stage.calls == [expected_relpath]
+    assert candidate.registry["xom"].model.calls == [("root", "pypi")]
 
 
 def test_metadata_request_resolves_only_the_original_wheel_entry() -> None:
@@ -315,6 +433,7 @@ def test_non_artifact_routes_pass_through_without_devpi_access(
     route_name: object,
 ) -> None:
     candidate = make_request(route_name=route_name)
+    candidate.path_info = "/+api"
 
     assert resolve_release_sha256(candidate) is None
     assert candidate.registry["xom"].filestore.calls == []
@@ -378,6 +497,9 @@ def test_untrusted_digest_sources_are_ignored() -> None:
     [
         ("", "/root/pypi/+f/"),
         ("/demo.whl", "/root/pypi/+f//demo.whl"),
+        ("demo.whl", "/root//+f/demo.whl"),
+        ("demo.whl", "//root/pypi/+f/demo.whl"),
+        ("demo.whl", "/root/pypi//+f/demo.whl"),
         ("abc//demo.whl", "/root/pypi/+f/abc//demo.whl"),
         ("abc/", "/root/pypi/+f/abc/"),
         ("../demo.whl", "/root/pypi/+f/../demo.whl"),
@@ -398,8 +520,13 @@ def test_ambiguous_or_unsafe_relpaths_fail_closed(
     tail: str,
     path_info: str,
 ) -> None:
+    candidate = make_request(tail=tail, path_info=path_info)
+    del candidate.matched_route
+    del candidate.matchdict
+    del candidate.context
+
     with pytest.raises(ArtifactIdentityUnavailable):
-        resolve_release_sha256(make_request(tail=tail, path_info=path_info))
+        resolve_release_sha256(candidate)
 
 
 @pytest.mark.parametrize("raw_key", RAW_PATH_KEYS)
@@ -447,6 +574,65 @@ def test_missing_or_inconsistent_stage_context_fails_closed(
 ) -> None:
     candidate = make_request()
     candidate.context = SimpleNamespace(stage=stage)
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        FakeModel(None),
+        FakeModel(None, error=RuntimeError("/private?token=secret")),
+        SimpleNamespace(),
+        None,
+    ],
+)
+def test_missing_or_failing_stage_model_lookup_is_sanitized(
+    model: object | None,
+) -> None:
+    candidate = make_request()
+    candidate.registry["xom"].model = model
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        resolve_release_sha256(candidate)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "model_stage",
+    [
+        FakeStage(FakeLink(DEFAULT_RELPATH), username="other"),
+        FakeStage(FakeLink(DEFAULT_RELPATH), index="other"),
+        SimpleNamespace(username="root", index="pypi"),
+    ],
+)
+def test_model_stage_must_match_path_and_support_link_lookup(
+    model_stage: object,
+) -> None:
+    candidate = make_request(model=FakeModel(model_stage))
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+
+@pytest.mark.parametrize("attribute", ROUTED_ATTRIBUTES)
+def test_contradictory_routed_attributes_fail_closed(attribute: str) -> None:
+    candidate = make_request()
+    if attribute == "matched_route":
+        candidate.matched_route = SimpleNamespace(name=E_ROUTE)
+    elif attribute == "matchdict":
+        candidate.matchdict = {
+            "user": "other",
+            "index": "pypi",
+            "relpath": "abc/demo-1.0-py3-none-any.whl",
+        }
+    else:
+        context_stage = SimpleNamespace(username="other", index="pypi")
+        candidate.context = SimpleNamespace(stage=context_stage)
 
     with pytest.raises(ArtifactIdentityUnavailable):
         resolve_release_sha256(candidate)
