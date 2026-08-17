@@ -21,6 +21,7 @@ SHA256 = "a" * 64
 F_ROUTE = "/{user}/{index}/+f/{relpath:.*}"
 E_ROUTE = "/{user}/{index}/+e/{relpath:.*}"
 DEFAULT_RELPATH = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+DEFAULT_PATH_INFO = f"/{DEFAULT_RELPATH}"
 DEFAULT_KEY = object()
 NON_DOWNLOAD_METHODS = ("POST", "PUT", "PATCH", "DELETE", "get", None, [])
 NON_RELEASE_RELATIONS = ("toxresult", "doczip", "other", "releaseFile", "")
@@ -248,7 +249,12 @@ def resolver_probe_tween_factory(handler, registry):
         routed_attributes = {}
         for name in ROUTED_ATTRIBUTES:
             routed_attributes[name] = name in request.__dict__
-        resolved = resolve_release_sha256(request)
+        try:
+            resolved = resolve_release_sha256(request)
+        except ArtifactIdentityUnavailable:
+            probe_result = (routed_attributes, "identity-unavailable")
+            registry["resolver_probe"].append(probe_result)
+            raise
         registry["resolver_probe"].append((routed_attributes, resolved))
         return Response("probe")
 
@@ -345,6 +351,56 @@ def test_real_pyramid_tween_passes_unrelated_path_before_routing() -> None:
                 "context": False,
             },
             None,
+        )
+    ]
+    assert model.calls == []
+
+
+@pytest.mark.parametrize(
+    ("raw_key", "raw_value"),
+    [
+        ("REQUEST_URI", "/unrelated"),
+        ("RAW_URI", "/unrelated"),
+        ("RAW_PATH_INFO", "/unrelated"),
+    ],
+)
+def test_real_pyramid_tween_rejects_inconsistent_raw_artifact_path(
+    raw_key: str,
+    raw_value: str,
+) -> None:
+    relpath = DEFAULT_RELPATH
+    stage = FakeStage(FakeLink(relpath))
+    model = FakeModel(stage)
+    config = Configurator()
+    config.registry["xom"] = SimpleNamespace(
+        filestore=FakeFileStore(FakeEntry(relpath)),
+        model=model,
+    )
+    config.registry["resolver_probe"] = []
+    config.add_route(F_ROUTE, "/{user}/{index}/+f/{relpath:.*}")
+    config.add_tween(
+        "tests.enforcement.test_resolve.resolver_probe_tween_factory",
+        over=EXCVIEW,
+    )
+    application = config.make_wsgi_app()
+
+    request = application.request_factory.blank(DEFAULT_PATH_INFO)
+    request.environ[raw_key] = raw_value
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        request.get_response(application)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert config.registry["resolver_probe"] == [
+        (
+            {
+                "matched_route": False,
+                "matchdict": False,
+                "context": False,
+            },
+            "identity-unavailable",
         )
     ]
     assert model.calls == []
@@ -535,6 +591,81 @@ def test_percent_encoded_raw_artifact_path_fails_closed(raw_key: str) -> None:
 
     with pytest.raises(ArtifactIdentityUnavailable):
         resolve_release_sha256(candidate)
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"REQUEST_URI": "/unrelated"},
+        {"RAW_URI": "/unrelated"},
+        {"RAW_PATH_INFO": "/unrelated"},
+        {
+            "REQUEST_URI": DEFAULT_PATH_INFO,
+            "RAW_URI": "/root/pypi/+f/other.whl",
+        },
+        {"SCRIPT_NAME": "/prefix", "REQUEST_URI": DEFAULT_PATH_INFO},
+        {
+            "SCRIPT_NAME": "/other",
+            "REQUEST_URI": f"/prefix{DEFAULT_PATH_INFO}",
+        },
+        {"SCRIPT_NAME": "prefix", "REQUEST_URI": DEFAULT_PATH_INFO},
+        {"SCRIPT_NAME": "/prefix/", "REQUEST_URI": DEFAULT_PATH_INFO},
+        {"SCRIPT_NAME": None, "REQUEST_URI": DEFAULT_PATH_INFO},
+        {"REQUEST_URI": ""},
+        {"REQUEST_URI": f"https://devpi.invalid{DEFAULT_PATH_INFO}"},
+    ],
+)
+def test_inconsistent_raw_artifact_paths_fail_closed(environ: object) -> None:
+    candidate = make_request(environ=environ)
+
+    with pytest.raises(ArtifactIdentityUnavailable) as raised:
+        resolve_release_sha256(candidate)
+
+    assert str(raised.value) == "protected artifact identity unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert candidate.registry["xom"].model.calls == []
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {},
+        {
+            "SCRIPT_NAME": "",
+            "REQUEST_URI": DEFAULT_PATH_INFO,
+            "RAW_URI": f"{DEFAULT_PATH_INFO}?token=secret",
+            "RAW_PATH_INFO": DEFAULT_PATH_INFO,
+        },
+        {
+            "SCRIPT_NAME": "/prefix",
+            "REQUEST_URI": f"/prefix{DEFAULT_PATH_INFO}?sha256={'b' * 64}",
+            "RAW_URI": f"/prefix{DEFAULT_PATH_INFO}?encoded=%2F",
+            "RAW_PATH_INFO": DEFAULT_PATH_INFO,
+        },
+    ],
+)
+def test_consistent_raw_artifact_paths_resolve(environ: object) -> None:
+    candidate = make_request(environ=environ)
+
+    assert resolve_release_sha256(candidate) == SHA256
+
+
+def test_nonprotected_path_ignores_inconsistent_raw_environment() -> None:
+    model = FakeModel(None)
+    candidate = make_request(
+        path_info="/+api",
+        model=model,
+        environ={
+            "SCRIPT_NAME": None,
+            "REQUEST_URI": "/unrelated",
+            "RAW_URI": object(),
+            "RAW_PATH_INFO": "/other",
+        },
+    )
+
+    assert resolve_release_sha256(candidate) is None
+    assert model.calls == []
 
 
 @pytest.mark.parametrize(

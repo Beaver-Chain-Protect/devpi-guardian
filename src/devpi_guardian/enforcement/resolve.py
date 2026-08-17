@@ -92,21 +92,55 @@ def _valid_relpath_tail(value: object) -> bool:
     return all(part and part not in {".", ".."} for part in parts)
 
 
-def _raw_paths_are_unambiguous(request: object) -> bool:
+def _valid_script_name(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value == "":
+        return True
+    if (
+        not value.startswith("/")
+        or value.endswith("/")
+        or "?" in value
+        or _has_unsafe_character(value)
+    ):
+        return False
+    parts = value[1:].split("/")
+    return all(part and part not in {".", ".."} for part in parts)
+
+
+def _raw_paths_are_unambiguous(
+    request: object,
+    canonical_path_info: str,
+) -> bool:
     environ = _safe_getattr(request, "environ")
     if not isinstance(environ, Mapping):
         return False
 
-    for key in ("RAW_URI", "REQUEST_URI", "RAW_PATH_INFO"):
+    script_name = _safe_optional_getitem(environ, "SCRIPT_NAME")
+    if script_name is _MISSING:
+        script_name = ""
+    if script_name is _FAILED or not _valid_script_name(script_name):
+        return False
+    external_path = f"{script_name}{canonical_path_info}"
+
+    for key in ("RAW_URI", "REQUEST_URI"):
         raw_target = _safe_optional_getitem(environ, key)
         if raw_target is _MISSING:
             continue
         if raw_target is _FAILED or not isinstance(raw_target, str):
             return False
         raw_path = raw_target.partition("?")[0]
-        if "%" in raw_path or "#" in raw_path:
+        if raw_path != external_path or _has_unsafe_character(raw_path):
             return False
-    return True
+
+    raw_path_info = _safe_optional_getitem(environ, "RAW_PATH_INFO")
+    if raw_path_info is _MISSING:
+        return True
+    if raw_path_info is _FAILED or not isinstance(raw_path_info, str):
+        return False
+    if raw_path_info != canonical_path_info:
+        return False
+    return not _has_unsafe_character(raw_path_info)
 
 
 def _classify_path(
@@ -124,8 +158,6 @@ def _classify_path(
     if marker not in {"+f", "+e"}:
         return None
 
-    if not _raw_paths_are_unambiguous(request):
-        _fail()
     if len(path_parts) < 5 or path_parts[0] or path_parts[3] != marker:
         _fail()
     user = path_parts[1]
@@ -137,7 +169,10 @@ def _classify_path(
         _fail()
 
     requested_relpath = f"{user}/{index}/{marker}/{tail}"
-    if path_info != f"/{requested_relpath}":
+    canonical_path_info = f"/{requested_relpath}"
+    if path_info != canonical_path_info:
+        _fail()
+    if not _raw_paths_are_unambiguous(request, canonical_path_info):
         _fail()
 
     artifact_tail = tail
