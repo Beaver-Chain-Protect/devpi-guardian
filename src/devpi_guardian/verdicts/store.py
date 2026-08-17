@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -9,19 +11,24 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 from devpi_common.metadata import normalize_name
 
 from .db import ConnectionFactory
-from .errors import StoreUnavailable, TransitionConflict
+from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
 from .models import (
     ArtifactInput,
     AuditEventInput,
     ClaimedArtifact,
     Decision,
+    EvidenceInput,
     ReleaseInput,
+    VerdictInput,
     require_utc,
     validate_sha256,
 )
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
+_MAX_STORED_TEXT_LENGTH = 4096
+_MAX_DETAILS_JSON_LENGTH = 1024 * 1024
+_MAX_ANALYSIS_ERROR_LENGTH = 4096
 
 
 def _require_datetime(value: object, field_name: str) -> datetime:
@@ -36,9 +43,142 @@ def _require_nonblank_string(value: object, field_name: str) -> str:
     return value
 
 
+def _require_stored_string(value: object, field_name: str) -> str:
+    text = _require_nonblank_string(value, field_name)
+    if len(text) > _MAX_STORED_TEXT_LENGTH or "\x00" in text:
+        raise ValueError(f"{field_name} is not safe to store")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{field_name} is not safe to store") from None
+    return text
+
+
 def _iso(value: datetime, field_name: str) -> str:
     timestamp = _require_datetime(value, field_name)
     return require_utc(timestamp, field_name).isoformat()
+
+
+def _normalize_score(value: object) -> float:
+    if type(value) not in (int, float):
+        raise ValueError("score must be a finite number")
+    try:
+        score = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("score must be a finite number") from None
+    if not math.isfinite(score):
+        raise ValueError("score must be a finite number")
+    return score
+
+
+def _validate_json_value(value: object) -> None:
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("details must contain finite JSON numbers")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("details object keys must be strings")
+            _validate_json_value(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_json_value(item)
+        return
+    raise ValueError("details must be JSON-serializable")
+
+
+def _serialize_details(value: object) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("details must be a dictionary")
+    try:
+        _validate_json_value(value)
+        serialized = json.dumps(
+            value,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+    ) as exc:
+        raise ValueError("details must be JSON-serializable") from exc
+    if len(serialized.encode("utf-8")) > _MAX_DETAILS_JSON_LENGTH:
+        raise ValueError("details JSON is too large")
+    return serialized
+
+
+def _sanitize_analysis_error(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("error must be a string")
+    return "".join(
+        " "
+        if (
+            ord(character) < 32
+            or 127 <= ord(character) <= 159
+            or 0xD800 <= ord(character) <= 0xDFFF
+        )
+        else character
+        for character in value[:_MAX_ANALYSIS_ERROR_LENGTH]
+    )
+
+
+def _prepare_evidence(
+    evidence: object,
+) -> tuple[tuple[str, str, str | None, int | None, str, str], ...]:
+    if isinstance(evidence, (str, bytes, bytearray)) or not isinstance(
+        evidence,
+        Sequence,
+    ):
+        raise ValueError("evidence must be a stable sequence")
+    try:
+        items = tuple(evidence)
+    except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("evidence must be a stable sequence") from exc
+
+    prepared: list[tuple[str, str, str | None, int | None, str, str]] = []
+    for item in items:
+        if type(item) is not EvidenceInput:
+            raise ValueError("evidence items must be EvidenceInput instances")
+        try:
+            rule_id = _require_stored_string(item.rule_id, "rule_id")
+            action = item.action
+            file_path_value = item.file_path
+            line = item.line
+            message = _require_stored_string(item.message, "message")
+            details_json = _serialize_details(item.details)
+        except AttributeError:
+            message = "EvidenceInput missing required fields"
+            raise ValueError(message) from None
+        if type(action) is not Decision:
+            raise ValueError("action must be a Decision")
+        file_path = (
+            None
+            if file_path_value is None
+            else _require_stored_string(file_path_value, "file_path")
+        )
+        line_is_integer = type(line) is int
+        line_in_range = line_is_integer and 0 < line <= _MAX_SQLITE_INTEGER
+        if line is not None and not line_in_range:
+            raise ValueError("line must be a SQLite positive integer or None")
+        prepared.append(
+            (
+                rule_id,
+                action.value,
+                file_path,
+                line,
+                message,
+                details_json,
+            )
+        )
+    return tuple(prepared)
 
 
 def _sanitize_origin_url(value: str) -> str:
@@ -118,6 +258,10 @@ class SQLiteArtifactStore:
         sha256: str,
         reason: str,
         occurred_at: datetime,
+        previous: Decision = Decision.DENY,
+        new: Decision = Decision.DENY,
+        policy_version: str | None = None,
+        analyzer_version: str | None = None,
     ) -> None:
         self._audit_writer.append_in_transaction(
             connection,
@@ -125,11 +269,11 @@ class SQLiteArtifactStore:
                 actor=actor,
                 action=action,
                 sha256=sha256,
-                previous_decision=Decision.DENY,
-                new_decision=Decision.DENY,
+                previous_decision=previous,
+                new_decision=new,
                 reason=reason,
-                policy_version=None,
-                analyzer_version=None,
+                policy_version=policy_version,
+                analyzer_version=analyzer_version,
                 occurred_at=occurred_at,
             ),
         )
@@ -341,3 +485,242 @@ class SQLiteArtifactStore:
                 )
 
         return recovered_count
+
+    def record_verdict(
+        self,
+        verdict: VerdictInput,
+        evidence: Sequence[EvidenceInput],
+    ) -> None:
+        if type(verdict) is not VerdictInput:
+            raise ValueError("verdict must be a VerdictInput")
+        try:
+            sha256 = validate_sha256(verdict.sha256)
+            decision = verdict.decision
+            score = _normalize_score(verdict.score)
+            policy_version = _require_stored_string(
+                verdict.policy_version,
+                "policy_version",
+            )
+            analyzer_version = _require_stored_string(
+                verdict.analyzer_version,
+                "analyzer_version",
+            )
+            baseline_sha256 = verdict.baseline_sha256
+            created_at = _iso(verdict.created_at, "created_at")
+        except AttributeError:
+            message = "VerdictInput missing required fields"
+            raise ValueError(message) from None
+        if type(decision) is not Decision:
+            raise ValueError("decision must be a Decision")
+        if baseline_sha256 is not None:
+            baseline_sha256 = validate_sha256(baseline_sha256)
+
+        prepared_evidence = _prepare_evidence(evidence)
+        operation_at = require_utc(
+            _require_datetime(self._now(), "now"),
+            "now",
+        )
+        updated_at = operation_at.isoformat()
+
+        with self._write() as connection:
+            artifact_row = connection.execute(
+                "SELECT state FROM artifacts WHERE sha256 = ?",
+                (sha256,),
+            ).fetchone()
+            if artifact_row is None or artifact_row["state"] != "SCANNING":
+                raise TransitionConflict(sha256)
+
+            if baseline_sha256 is not None:
+                baseline = connection.execute(
+                    "SELECT 1 FROM artifacts WHERE sha256 = ?",
+                    (baseline_sha256,),
+                ).fetchone()
+                if baseline is None:
+                    raise ArtifactNotFound(baseline_sha256)
+
+            current_rows = connection.execute(
+                "SELECT id FROM verdicts WHERE sha256 = ? AND is_current = 1",
+                (sha256,),
+            ).fetchall()
+            if len(current_rows) > 1:
+                raise TransitionConflict("multiple current verdicts")
+            if current_rows:
+                current_id = current_rows[0]["id"]
+                cleared = connection.execute(
+                    """
+                    UPDATE verdicts SET is_current = 0
+                    WHERE id = ? AND is_current = 1
+                    """,
+                    (current_id,),
+                )
+                if cleared.rowcount != 1:
+                    raise TransitionConflict("current verdict update failed")
+
+            inserted = connection.execute(
+                """
+                INSERT INTO verdicts(
+                    sha256, decision, score, policy_version, analyzer_version,
+                    baseline_sha256, is_current, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    sha256,
+                    decision.value,
+                    score,
+                    policy_version,
+                    analyzer_version,
+                    baseline_sha256,
+                    created_at,
+                ),
+            )
+            if inserted.rowcount != 1 or type(inserted.lastrowid) is not int:
+                raise TransitionConflict("verdict insert was ignored")
+            verdict_id = inserted.lastrowid
+
+            for item in prepared_evidence:
+                evidence_cursor = connection.execute(
+                    """
+                    INSERT INTO evidence(
+                        verdict_id, rule_id, action, file_path, line, message,
+                        details_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (verdict_id, *item),
+                )
+                if evidence_cursor.rowcount != 1:
+                    raise TransitionConflict("evidence insert was ignored")
+
+            terminal = connection.execute(
+                """
+                UPDATE artifacts
+                SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = NULL, updated_at = ?
+                WHERE sha256 = ? AND state = 'SCANNING'
+                """,
+                (decision.value, updated_at, sha256),
+            )
+            if terminal.rowcount != 1:
+                raise TransitionConflict(sha256)
+
+            final_artifact = connection.execute(
+                """
+                SELECT state, lease_owner, lease_expires_at, last_error,
+                       updated_at
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (sha256,),
+            ).fetchone()
+            if final_artifact is None or tuple(final_artifact) != (
+                decision.value,
+                None,
+                None,
+                None,
+                updated_at,
+            ):
+                raise TransitionConflict("artifact terminal state mismatch")
+
+            stored_verdict = connection.execute(
+                """
+                SELECT sha256, decision, score, policy_version,
+                       analyzer_version,
+                       baseline_sha256, is_current, created_at
+                FROM verdicts WHERE id = ?
+                """,
+                (verdict_id,),
+            ).fetchone()
+            if stored_verdict is None or tuple(stored_verdict) != (
+                sha256,
+                decision.value,
+                score,
+                policy_version,
+                analyzer_version,
+                baseline_sha256,
+                1,
+                created_at,
+            ):
+                raise TransitionConflict("stored verdict mismatch")
+
+            stored_evidence = connection.execute(
+                """
+                SELECT rule_id, action, file_path, line, message, details_json
+                FROM evidence WHERE verdict_id = ? ORDER BY id
+                """,
+                (verdict_id,),
+            ).fetchall()
+            persisted_evidence = [tuple(row) for row in stored_evidence]
+            if persisted_evidence != list(prepared_evidence):
+                raise TransitionConflict("stored evidence mismatch")
+
+            current = connection.execute(
+                """
+                SELECT id FROM verdicts
+                WHERE sha256 = ? AND is_current = 1
+                """,
+                (sha256,),
+            ).fetchall()
+            if [row["id"] for row in current] != [verdict_id]:
+                raise TransitionConflict("new verdict is not uniquely current")
+
+            is_allow = decision is Decision.ALLOW
+            effective_decision = Decision.ALLOW if is_allow else Decision.DENY
+            self._audit(
+                connection,
+                actor="guardian-policy",
+                action="artifact.verdict_recorded",
+                sha256=sha256,
+                previous=Decision.DENY,
+                new=effective_decision,
+                reason="automated policy decision",
+                policy_version=policy_version,
+                analyzer_version=analyzer_version,
+                occurred_at=operation_at,
+            )
+
+    def mark_analysis_error(self, sha256: str, error: str) -> None:
+        canonical_sha256 = validate_sha256(sha256)
+        message = _sanitize_analysis_error(error)
+        operation_at = require_utc(
+            _require_datetime(self._now(), "now"),
+            "now",
+        )
+        updated_at = operation_at.isoformat()
+
+        with self._write() as connection:
+            updated = connection.execute(
+                """
+                UPDATE artifacts
+                SET state = 'ERROR', lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE sha256 = ? AND state = 'SCANNING'
+                """,
+                (message, updated_at, canonical_sha256),
+            )
+            if updated.rowcount != 1:
+                raise TransitionConflict(canonical_sha256)
+
+            final_artifact = connection.execute(
+                """
+                SELECT state, lease_owner, lease_expires_at, last_error,
+                       updated_at
+                FROM artifacts WHERE sha256 = ?
+                """,
+                (canonical_sha256,),
+            ).fetchone()
+            if final_artifact is None or tuple(final_artifact) != (
+                "ERROR",
+                None,
+                None,
+                message,
+                updated_at,
+            ):
+                raise TransitionConflict("analysis error state mismatch")
+
+            self._audit(
+                connection,
+                actor="guardian-worker",
+                action="artifact.analysis_error",
+                sha256=canonical_sha256,
+                reason="analysis failed",
+                occurred_at=operation_at,
+            )
