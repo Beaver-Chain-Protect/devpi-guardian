@@ -43,6 +43,7 @@
 P0는 devpi 플러그인이 등록하는 Pyramid tween과 별도 SQLite 판정 저장소로 구현한다.
 
 - 직접 파일 뷰 실행 전에 tween이 판정을 조회한다.
+- Pyramid tween은 main router보다 먼저 실행되므로 resolver는 `matched_route`, `matchdict`, `context`에 의존하지 않는다. `path_info`와 raw request target을 엄격히 분류하고, keyfs transaction 안에서 `registry["xom"].model.getstage(user, index)`로 stage를 조회한다.
 - SQLite는 별도 영구 볼륨의 `guardian.db`를 사용한다.
 - 코어 PR 병합을 기다리지 않는다.
 - 향후 devpi 코어가 파일 다운로드 필터 훅을 제공하면 F3 어댑터만 교체한다.
@@ -295,6 +296,7 @@ URL fragment, 사용자 header, filename에 포함된 값은 SHA-256 근거로 �
 - SHA-256이 없거나 형식이 잘못된 링크는 판정 조회 전에 제거한다.
 - SQL, override 만료, 상태 우선순위를 `GuardianStage`에 복제하지 않는다.
 - `devpiserver_pyramid_configure`에서 F3 tween을 등록하되 실제 집행 함수는 2번 모듈을 사용한다.
+- tween은 `devpi_server.views.tween_keyfs_transaction` 아래에 등록하여 pre-routing resolver의 XOM model 조회가 일관된 read transaction 안에서 실행되게 한다.
 - `root/pypi` 직접 접근도 F3을 통과하도록 파일 route 전체에 tween을 적용한다.
 - PyPI 원본으로 직접 나가는 client egress는 배포 설정에서 차단한다. F3은 devpi를 거치지 않는 네트워크 요청을 막을 수 없다.
 

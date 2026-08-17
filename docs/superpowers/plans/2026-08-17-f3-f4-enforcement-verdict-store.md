@@ -42,6 +42,15 @@
 > separately and retain at most two rows per SHA-256 so duplicate-current
 > corruption cannot create a Cartesian result before `StoreUnavailable`.
 
+> **2026-08-18 Pyramid pre-routing correction:** Pyramid tweens run before
+> `Router.handle_request` populates `matched_route`, `matchdict`, and
+> `context`. The resolver therefore classifies canonical `path_info` plus the
+> raw request target, obtains XOM from the registry, and calls
+> `xom.model.getstage(user, index)` inside the keyfs transaction. It must not
+> return pass-through merely because routed request attributes are absent.
+> The guardian tween remains registered under
+> `devpi_server.views.tween_keyfs_transaction`.
+
 ---
 
 ## Source design
