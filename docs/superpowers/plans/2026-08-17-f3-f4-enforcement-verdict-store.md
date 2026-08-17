@@ -17,6 +17,14 @@
 > SHA-256 for completion. A recovered claim's late result must fail with
 > `TransitionConflict` after any later claim.
 
+> **2026-08-18 administrator-audit correction:** Override set, revoke, and
+> rescan audit events carry the current automated verdict's
+> `policy_version` and `analyzer_version` when a current verdict exists.
+> Stored artifact/verdict/override values that violate schema or state-machine
+> semantics are database corruption and must raise `StoreUnavailable`; they
+> are not ordinary `TransitionConflict` outcomes. This correction supersedes
+> Task 7 snippets below that omit the version fields.
+
 ---
 
 ## Source design
