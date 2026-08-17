@@ -542,6 +542,28 @@ def test_claim_evaluates_now_after_acquiring_writer_lock(
     assert claimed is not None
 
 
+def test_writer_lock_timeout_then_reconnects(
+    tmp_path,
+    audit_writer,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db", busy_timeout_ms=1)
+    migrate(factory)
+    store = SQLiteArtifactStore(factory, audit_writer, now=lambda: NOW)
+
+    with closing(factory.connect()) as locker:
+        locker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            store.discover_artifact(artifact(), release())
+        locker.rollback()
+
+    store.discover_artifact(artifact(), release())
+    claimed = store.claim_next(
+        "worker-after-lock",
+        NOW + timedelta(minutes=5),
+    )
+    assert claimed is not None
+
+
 @pytest.mark.parametrize("operation", ["claim", "recover"])
 @pytest.mark.parametrize("timestamp", [None, "2026-08-17", 123])
 def test_lease_operations_reject_non_datetime_before_side_effects(

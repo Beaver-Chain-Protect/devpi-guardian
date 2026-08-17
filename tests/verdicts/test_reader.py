@@ -1,3 +1,5 @@
+import statistics
+import time
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
@@ -612,3 +614,51 @@ def test_now_is_read_once_for_each_batch_call(tmp_path) -> None:
     )
 
     assert calls == 1
+
+
+@pytest.mark.performance
+def test_fresh_store_single_lookup_p95_is_under_100_ms(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    durations_ms = []
+    for _ in range(1_000):
+        started = time.perf_counter_ns()
+        assert reader.get_effective_decision(SHA_ALLOW).allowed is True
+        durations_ms.append((time.perf_counter_ns() - started) / 1_000_000)
+
+    p95 = statistics.quantiles(durations_ms, n=100)[94]
+    print(f"fresh-store lookup p95={p95:.3f} ms")
+    assert p95 < 100
+
+
+def test_unavailable_reader_factory_fails_closed() -> None:
+    class UnavailableFactory:
+        path = "guardian.db"
+
+        def connect(self):
+            raise StoreUnavailable("guardian.db")
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(
+            UnavailableFactory(),
+            now=lambda: NOW,
+        ).get_effective_decision(SHA_ALLOW)
+
+
+def test_corrupt_database_fails_closed(tmp_path) -> None:
+    path = tmp_path / "guardian.db"
+    path.write_bytes(b"not-a-sqlite-database")
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(
+            ConnectionFactory(path),
+            now=lambda: NOW,
+        ).get_effective_decision(SHA_ALLOW)
