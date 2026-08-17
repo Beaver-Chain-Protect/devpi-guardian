@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -145,7 +145,7 @@ class MirrorArtifact:
     content: bytes
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class RunningDevpi:
     base_url: str
     guardian_db: Path
@@ -154,6 +154,10 @@ class RunningDevpi:
     uv_executable: str
     mirror_artifact: MirrorArtifact | None = None
     mirror_upstream_requests: list[str] | None = None
+    _server: _ServerProcess | None = field(default=None, repr=False)
+    _log_dir: Path | None = field(default=None, repr=False)
+    _offline: bool = field(default=True, repr=False)
+    _restart_generation: int = field(default=0, repr=False)
 
     def api(
         self,
@@ -206,6 +210,38 @@ class RunningDevpi:
 
     def status_code(self, path_or_url: str, *, method: str = "GET") -> int:
         return self.request(path_or_url, method=method).status
+
+    def restart(self) -> None:
+        """Restart on the same port with the same server and Guardian data."""
+        server = self._server
+        log_dir = self._log_dir
+        if server is None or log_dir is None:
+            raise RuntimeError("devpi-server lifecycle is unavailable")
+
+        port = server.port
+        _terminate(server)
+        self._server = None
+        self._restart_generation += 1
+        restarted = _start_server(
+            self.server_dir,
+            self.guardian_db,
+            log_dir,
+            offline=self._offline,
+            preferred_port=port,
+            log_label=f"restart-{self._restart_generation}",
+        )
+        self._server = restarted
+        self.base_url = restarted.base_url
+        self.api("use", restarted.base_url)
+        self.api("login", "root", "--password=")
+        self.api("use", "root/dev")
+
+    def close(self) -> None:
+        """Stop the current process and verify that its port is released."""
+        if self._server is None:
+            return
+        _terminate(self._server)
+        self._server = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +300,12 @@ def _terminate(server: _ServerProcess) -> None:
             process.wait(timeout=_SHUTDOWN_TIMEOUT)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=_SHUTDOWN_TIMEOUT)
+            try:
+                process.wait(timeout=_SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                diagnostic = _read_log(server.log_path)
+                message = "devpi-server did not exit after terminate and kill"
+                raise RuntimeError(f"{message}\n{diagnostic}") from None
 
     deadline = time.monotonic() + 5.0
     while True:
@@ -289,11 +330,13 @@ def _start_server(
     log_dir: Path,
     *,
     offline: bool = True,
+    preferred_port: int | None = None,
+    log_label: str = "initial",
 ) -> _ServerProcess:
     for attempt in range(1, _START_ATTEMPTS + 1):
-        port = _free_port()
+        port = preferred_port if preferred_port is not None else _free_port()
         base_url = f"http://{_HOST}:{port}"
-        log_path = log_dir / f"devpi-server-{attempt}.log"
+        log_path = log_dir / f"devpi-server-{log_label}-{attempt}.log"
         args = [
             _executable("devpi-server"),
             "--serverdir",
@@ -454,6 +497,8 @@ def running_devpi(tmp_path: Path) -> RunningDevpi:
         client_dir,
         server_dir,
         _executable("uv"),
+        _server=server,
+        _log_dir=log_dir,
     )
     try:
         running.api("use", server.base_url)
@@ -462,7 +507,7 @@ def running_devpi(tmp_path: Path) -> RunningDevpi:
         running.api("use", "root/dev")
         yield running
     finally:
-        _terminate(server)
+        running.close()
 
 
 @pytest.fixture
@@ -479,6 +524,7 @@ def running_mirror_devpi(
     _run([_executable("devpi-init"), "--serverdir", str(server_dir)])
 
     protected: _ServerProcess | None = None
+    running: RunningDevpi | None = None
     try:
         protected = _start_server(
             server_dir,
@@ -547,8 +593,13 @@ def running_mirror_devpi(
             _executable("uv"),
             mirror_artifact,
             local_upstream.requests,
+            _server=protected,
+            _log_dir=log_dir,
+            _offline=False,
         )
         yield running
     finally:
-        if protected is not None:
+        if running is not None:
+            running.close()
+        elif protected is not None:
             _terminate(protected)

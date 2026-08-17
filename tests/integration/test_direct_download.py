@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import html.parser
+import http.client
 import io
 import json
 import os
 import subprocess
 import sys
+import threading
 import urllib.parse
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -203,6 +206,109 @@ def _assert_blocked(
                 assert state not in blocked.body
 
 
+def _independent_barrier_get(
+    direct_url: str,
+    barrier: threading.Barrier,
+) -> tuple[int, bytes]:
+    parsed = urllib.parse.urlsplit(direct_url)
+    assert parsed.hostname is not None
+    target = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
+    connection = http.client.HTTPConnection(
+        parsed.hostname,
+        parsed.port,
+        timeout=10,
+    )
+    try:
+        barrier.wait(timeout=10)
+        connection.request("GET", target)
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def _assert_concurrent_blocked(
+    direct_url: str,
+    *,
+    artifact_content: bytes,
+    metadata_content: bytes,
+    sha256: str,
+) -> None:
+    worker_count = 8
+    repetition_count = 8
+    results: list[tuple[int, bytes]] = []
+    for _ in range(repetition_count):
+        barrier = threading.Barrier(worker_count)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _independent_barrier_get,
+                    direct_url,
+                    barrier,
+                )
+                for _ in range(worker_count)
+            ]
+            results.extend(future.result() for future in futures)
+
+    assert len(results) == worker_count * repetition_count
+    assert [status for status, _ in results] == [404] * len(results)
+    for _, body in results:
+        assert artifact_content not in body
+        assert metadata_content not in body
+        assert sha256.encode() not in body
+
+
+def _pip_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    environment["no_proxy"] = "127.0.0.1,localhost,::1"
+    environment["PIP_CONFIG_FILE"] = os.devnull
+    environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    environment["PIP_NO_CACHE_DIR"] = "1"
+    environment["PIP_NO_INDEX"] = "1"
+    environment["PIP_RETRIES"] = "0"
+    return environment
+
+
+def _pip_install_exact(
+    running_devpi,
+    *,
+    venv: Path,
+) -> subprocess.CompletedProcess[str]:
+    environment = _pip_environment()
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", str(venv)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert created.returncode == 0, "stdlib venv creation failed"
+    simple_url = urllib.parse.urljoin(
+        running_devpi.base_url,
+        "/root/dev/+simple/demo-guardian/",
+    )
+    return subprocess.run(
+        [
+            str(venv / "bin" / "python"),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--find-links",
+            simple_url,
+            "demo-guardian==1.0.0",
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
 def _uv_environment(tmp_path: Path) -> dict[str, str]:
     environment = os.environ.copy()
     environment["NO_PROXY"] = "127.0.0.1,localhost,::1"
@@ -277,6 +383,12 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
     assert anchor.get("data-dist-info-metadata") is not None
     _assert_blocked(
         running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
+    _assert_concurrent_blocked(
         direct_url,
         artifact_content=content,
         metadata_content=metadata_content,
@@ -373,6 +485,45 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
     metadata_head = running_devpi.request(metadata_url, method="HEAD")
     assert metadata_head.status == 200
     assert metadata_head.body == b""
+
+    running_devpi.restart()
+    persisted_allow = running_devpi.request(direct_url)
+    assert persisted_allow.status == 200
+    assert persisted_allow.body == content
+    persisted_metadata = running_devpi.request(metadata_url)
+    assert persisted_metadata.status == 200
+    assert persisted_metadata.body == metadata_content
+    repeated_persisted_metadata = running_devpi.request(metadata_url)
+    assert repeated_persisted_metadata.status == 200
+    assert repeated_persisted_metadata.body == metadata_content
+
+    pip_venv = tmp_path / "pip-exact-allowed-venv"
+    pip_allowed = _pip_install_exact(
+        running_devpi,
+        venv=pip_venv,
+    )
+    assert pip_allowed.returncode == 0, (
+        "pip exact-version install did not receive the allowed wheel"
+    )
+    pip_imported = subprocess.run(
+        [
+            str(pip_venv / "bin" / "python"),
+            "-c",
+            (
+                "from pathlib import Path; import demo_guardian; "
+                "print(demo_guardian.__version__); "
+                "print(Path(demo_guardian.__file__).resolve())"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert pip_imported.returncode == 0
+    installed_version, installed_file = pip_imported.stdout.splitlines()
+    assert installed_version == "1.0.0"
+    assert Path(installed_file).is_relative_to(pip_venv.resolve())
 
     toxresult_content = b'{"testenvs":{"py312":{"retcode":0}}}'
     toxresult_post = running_devpi.request(
@@ -526,6 +677,14 @@ dependencies = ["demo-guardian @ {direct_url}"]
         metadata_content=metadata_content,
         sha256=sha256,
     )
+    running_devpi.restart()
+    _assert_blocked(
+        running_devpi,
+        direct_url,
+        artifact_content=content,
+        metadata_content=metadata_content,
+        sha256=sha256,
+    )
     store.set_manual_override(
         ManualOverrideInput(
             sha256,
@@ -558,6 +717,32 @@ dependencies = ["demo-guardian @ {direct_url}"]
         direct_url=direct_url,
         wheel_filename=wheel.name,
     )
+    blocked_pip_venv = tmp_path / "pip-exact-blocked-venv"
+    pip_blocked = _pip_install_exact(
+        running_devpi,
+        venv=blocked_pip_venv,
+    )
+    assert pip_blocked.returncode != 0
+    pip_blocked_output = f"{pip_blocked.stdout}\n{pip_blocked.stderr}"
+    assert "404" in pip_blocked_output
+    assert wheel.name in pip_blocked_output
+    pip_direct_path = urllib.parse.urlsplit(direct_url).path.replace(
+        "/+f/",
+        "/%2Bf/",
+    )
+    assert pip_direct_path in pip_blocked_output
+    package_absent = subprocess.run(
+        [
+            str(blocked_pip_venv / "bin" / "python"),
+            "-c",
+            "import demo_guardian",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert package_absent.returncode != 0
 
     backup = running_devpi.guardian_db.with_suffix(".saved")
     running_devpi.guardian_db.rename(backup)

@@ -5,6 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from devpi_guardian.enforcement.metrics import (
+    BLOCK_METRIC_REGISTRY_KEY,
+    InMemoryBlockMetricRecorder,
+)
 from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
 from devpi_guardian.plugin import (
     devpiserver_add_parser_options,
@@ -78,6 +82,9 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     devpiserver_pyramid_configure(config, pyramid)
 
     assert VERDICT_READER_REGISTRY_KEY in pyramid.registry
+    metrics = pyramid.registry[BLOCK_METRIC_REGISTRY_KEY]
+    assert isinstance(metrics, InMemoryBlockMetricRecorder)
+    assert metrics.snapshot() == {}
     tween_prefix = "devpi_guardian.enforcement.tween."
     tween_suffix = "guardian_enforcement_tween_factory"
     tween_name = tween_prefix + tween_suffix

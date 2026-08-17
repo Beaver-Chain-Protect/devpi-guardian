@@ -7,6 +7,7 @@ import pytest
 from devpi_server.log import TagLogger
 from pyramid.httpexceptions import HTTPNotFound, HTTPServiceUnavailable
 
+from devpi_guardian.enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from devpi_guardian.enforcement.resolve import ArtifactIdentityUnavailable
 from devpi_guardian.enforcement.tween import (
     VERDICT_READER_REGISTRY_KEY,
@@ -98,6 +99,14 @@ class StructuredLog:
         self.calls.append((message, args))
         if self.error is not None:
             raise self.error
+
+
+class MetricRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def record_block(self, dimensions):
+        self.calls.append(dimensions)
 
 
 def make_request(log=MISSING):
@@ -430,6 +439,192 @@ def test_not_allowed_logging_contains_only_safe_structured_fields(
         "not_allowed",
     )
     assert "secret" not in repr(log.calls)
+
+
+def test_not_allowed_records_exact_sanitized_metric_dimensions(
+    protected_request,
+):
+    artifact_path = "/root/pypi/+f/public.whl"
+    protected_request.path_info = f"{artifact_path}?token=metric-secret"
+    metrics = MetricRecorder()
+    calls = []
+    reader = Reader(result=decision(artifact_state=ArtifactState.REVIEW))
+    registry = {
+        VERDICT_READER_REGISTRY_KEY: reader,
+        BLOCK_METRIC_REGISTRY_KEY: metrics,
+    }
+
+    response = make_tween(reader, calls, registry)(protected_request)
+
+    assert response.status_code == 404
+    assert calls == []
+    assert len(metrics.calls) == 1
+    event = metrics.calls[0]
+    assert (
+        event.route,
+        event.sha256,
+        event.effective_decision,
+        event.block_category,
+    ) == ("+f", SHA256, "DENY", "not_allowed")
+    assert "metric-secret" not in repr(metrics.calls)
+
+
+@pytest.mark.parametrize(
+    ("block_path", "expected_status", "expected_dimensions"),
+    [
+        (
+            "identity_error",
+            503,
+            ("+e", "unknown", "unknown", "identity_unavailable"),
+        ),
+        (
+            "resolver_store_error",
+            503,
+            ("+e", "unknown", "unknown", "store_unavailable"),
+        ),
+        (
+            "invalid_identity",
+            503,
+            ("+e", "unknown", "unknown", "identity_unavailable"),
+        ),
+        (
+            "reader_store_error",
+            503,
+            ("+e", SHA256, "unknown", "store_unavailable"),
+        ),
+        (
+            "not_allowed",
+            404,
+            ("+e", SHA256, "DENY", "not_allowed"),
+        ),
+    ],
+)
+def test_every_block_path_records_only_exact_metric_dimensions(
+    monkeypatch,
+    block_path,
+    expected_status,
+    expected_dimensions,
+):
+    request = make_request(Log())
+    request.path_info = "/root/dev/+e/private.whl?token=metric-secret"
+    reader = Reader(result=decision())
+
+    if block_path in {"identity_error", "resolver_store_error"}:
+        error = (
+            ArtifactIdentityUnavailable("private identity detail")
+            if block_path == "identity_error"
+            else StoreUnavailable("private resolver detail")
+        )
+
+        def fail(_request):
+            raise error
+
+        monkeypatch.setattr(
+            "devpi_guardian.enforcement.tween.resolve_release_sha256",
+            fail,
+        )
+    elif block_path == "invalid_identity":
+        monkeypatch.setattr(
+            "devpi_guardian.enforcement.tween.resolve_release_sha256",
+            lambda _request: HostileSha256("b" * 64),
+        )
+    else:
+        monkeypatch.setattr(
+            "devpi_guardian.enforcement.tween.resolve_release_sha256",
+            lambda _request: SHA256,
+        )
+        if block_path == "reader_store_error":
+            reader.error = StoreUnavailable("private reader detail")
+
+    metrics = MetricRecorder()
+    calls = []
+    registry = {
+        VERDICT_READER_REGISTRY_KEY: reader,
+        BLOCK_METRIC_REGISTRY_KEY: metrics,
+    }
+
+    response = make_tween(reader, calls, registry)(request)
+
+    assert response.status_code == expected_status
+    assert calls == []
+    assert len(metrics.calls) == 1
+    event = metrics.calls[0]
+    assert (
+        event.route,
+        event.sha256,
+        event.effective_decision,
+        event.block_category,
+    ) == expected_dimensions
+    assert "private.whl" not in repr(metrics.calls)
+    assert "metric-secret" not in repr(metrics.calls)
+
+
+class ExplodingMetricRecorder:
+    def record_block(self, dimensions):
+        raise RuntimeError("metric adapter failed with token=secret")
+
+
+class ExplodingMetricRegistry(dict):
+    def get(self, key, default=None):
+        raise RuntimeError("metric registry failed with token=secret")
+
+
+@pytest.mark.parametrize(
+    "metric_adapter",
+    [object(), SimpleNamespace(record_block=None), ExplodingMetricRecorder()],
+)
+def test_malformed_metric_adapters_cannot_change_block_response(
+    protected_request,
+    metric_adapter,
+):
+    calls = []
+    reader = Reader(result=decision())
+    registry = {
+        VERDICT_READER_REGISTRY_KEY: reader,
+        BLOCK_METRIC_REGISTRY_KEY: metric_adapter,
+    }
+
+    response = make_tween(reader, calls, registry)(protected_request)
+
+    assert response.status_code == 404
+    assert calls == []
+    assert "secret" not in response.text
+
+
+def test_hostile_metric_registry_lookup_cannot_change_block_response(
+    protected_request,
+):
+    calls = []
+    reader = Reader(result=decision())
+    registry = ExplodingMetricRegistry({VERDICT_READER_REGISTRY_KEY: reader})
+
+    response = make_tween(reader, calls, registry)(protected_request)
+
+    assert response.status_code == 404
+    assert calls == []
+    assert "secret" not in response.text
+
+
+def test_allow_does_not_increment_block_metric(protected_request):
+    calls = []
+    metrics = MetricRecorder()
+    reader = Reader(
+        result=decision(
+            allowed=True,
+            effective_decision=Decision.ALLOW,
+            artifact_state=ArtifactState.ALLOW,
+        )
+    )
+    registry = {
+        VERDICT_READER_REGISTRY_KEY: reader,
+        BLOCK_METRIC_REGISTRY_KEY: metrics,
+    }
+
+    response = make_tween(reader, calls, registry)(protected_request)
+
+    assert response.status_code == 200
+    assert calls == [protected_request]
+    assert metrics.calls == []
 
 
 def test_identity_failure_logging_uses_unknown_fields_without_details(

@@ -13,6 +13,10 @@ from devpi_guardian.verdicts.models import (
     validate_sha256,
 )
 
+from .metrics import (
+    BLOCK_METRIC_REGISTRY_KEY,
+    BlockMetricDimensions,
+)
 from .resolve import ArtifactIdentityUnavailable, resolve_release_sha256
 
 VERDICT_READER_REGISTRY_KEY = "devpi_guardian.verdict_reader"
@@ -87,6 +91,36 @@ def _safe_log(
         return
 
 
+def _safe_record_metric(
+    registry: object,
+    request: object,
+    *,
+    sha256: object,
+    decision: object | None,
+    block_category: str,
+) -> None:
+    """Best-effort metric recording that never changes enforcement behavior."""
+    try:
+        recorder = registry.get(BLOCK_METRIC_REGISTRY_KEY)
+        if recorder is None:
+            return
+        safe_sha256 = sha256 if type(sha256) is str else _UNKNOWN
+        recorder.record_block(
+            BlockMetricDimensions(
+                route=_route_classification(request),
+                sha256=safe_sha256,
+                effective_decision=_safe_decision_field(
+                    decision,
+                    "effective_decision",
+                    Decision,
+                ),
+                block_category=block_category,
+            )
+        )
+    except Exception:
+        return
+
+
 def _is_exact_allow(decision: object, sha256: str) -> bool:
     """Accept only a structurally valid, reader-produced effective ALLOW."""
     if type(decision) is not EnforcementDecision:
@@ -145,9 +179,23 @@ def guardian_enforcement_tween_factory(handler, registry):
                 decision=None,
                 block_category="identity_unavailable",
             )
+            _safe_record_metric(
+                registry,
+                request,
+                sha256=_UNKNOWN,
+                decision=None,
+                block_category="identity_unavailable",
+            )
             return HTTPServiceUnavailable()
         except StoreUnavailable:
             _safe_log(
+                request,
+                sha256=_UNKNOWN,
+                decision=None,
+                block_category="store_unavailable",
+            )
+            _safe_record_metric(
+                registry,
                 request,
                 sha256=_UNKNOWN,
                 decision=None,
@@ -164,6 +212,13 @@ def guardian_enforcement_tween_factory(handler, registry):
                 decision=None,
                 block_category="identity_unavailable",
             )
+            _safe_record_metric(
+                registry,
+                request,
+                sha256=_UNKNOWN,
+                decision=None,
+                block_category="identity_unavailable",
+            )
             return HTTPServiceUnavailable()
 
         try:
@@ -175,10 +230,24 @@ def guardian_enforcement_tween_factory(handler, registry):
                 decision=None,
                 block_category="store_unavailable",
             )
+            _safe_record_metric(
+                registry,
+                request,
+                sha256=sha256,
+                decision=None,
+                block_category="store_unavailable",
+            )
             return HTTPServiceUnavailable(headers={"Retry-After": "5"})
 
         if not _is_exact_allow(decision, sha256):
             _safe_log(
+                request,
+                sha256=sha256,
+                decision=decision,
+                block_category="not_allowed",
+            )
+            _safe_record_metric(
+                registry,
                 request,
                 sha256=sha256,
                 decision=decision,

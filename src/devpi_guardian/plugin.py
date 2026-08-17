@@ -6,6 +6,10 @@ from pathlib import Path
 
 from pluggy import HookimplMarker
 
+from .enforcement.metrics import (
+    BLOCK_METRIC_REGISTRY_KEY,
+    InMemoryBlockMetricRecorder,
+)
 from .enforcement.tween import VERDICT_READER_REGISTRY_KEY
 from .verdicts.db import ConnectionFactory, migrate
 from .verdicts.reader import SQLiteVerdictReader
@@ -35,7 +39,9 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
     factory = ConnectionFactory(db_path)
     migrate(factory)
     reader = SQLiteVerdictReader(factory)
+    block_metrics = InMemoryBlockMetricRecorder()
     pyramid_config.registry[VERDICT_READER_REGISTRY_KEY] = reader
+    pyramid_config.registry[BLOCK_METRIC_REGISTRY_KEY] = block_metrics
     pyramid_config.add_tween(
         "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
         under="devpi_server.views.tween_keyfs_transaction",

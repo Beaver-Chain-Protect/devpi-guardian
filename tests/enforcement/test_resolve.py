@@ -1108,6 +1108,95 @@ def test_consistent_raw_artifact_paths_resolve(environ: object) -> None:
     assert resolve_release_sha256(candidate) == SHA256
 
 
+@pytest.mark.parametrize(
+    ("marker", "route_name"),
+    [("+f", F_ROUTE), ("+e", E_ROUTE)],
+)
+@pytest.mark.parametrize("raw_key", RAW_PATH_KEYS)
+def test_pip_uppercase_encoded_route_marker_resolves(
+    marker: str,
+    route_name: str,
+    raw_key: str,
+) -> None:
+    path_info = DEFAULT_PATH_INFO.replace("/+f/", f"/{marker}/")
+    pip_raw_path = path_info.replace(f"/{marker}/", f"/%2B{marker[1:]}/")
+    raw_value = f"{pip_raw_path}?token=ignored"
+    if raw_key == "RAW_PATH_INFO":
+        raw_value = pip_raw_path
+    candidate = make_request(
+        marker=marker,
+        route_name=route_name,
+        path_info=path_info,
+        environ={raw_key: raw_value},
+    )
+
+    assert resolve_release_sha256(candidate) == SHA256
+
+
+@pytest.mark.parametrize(
+    ("marker", "route_name"),
+    [("+f", F_ROUTE), ("+e", E_ROUTE)],
+)
+def test_pip_uppercase_encoded_route_marker_resolves_under_mount(
+    marker: str,
+    route_name: str,
+) -> None:
+    script_name = "/packages"
+    path_info = DEFAULT_PATH_INFO.replace("/+f/", f"/{marker}/")
+    pip_raw_path = path_info.replace(f"/{marker}/", f"/%2B{marker[1:]}/")
+    candidate = make_request(
+        marker=marker,
+        route_name=route_name,
+        path_info=path_info,
+        environ={
+            "SCRIPT_NAME": script_name,
+            "REQUEST_URI": f"{script_name}{pip_raw_path}?token=ignored",
+            "RAW_URI": f"{script_name}{pip_raw_path}",
+            "RAW_PATH_INFO": pip_raw_path,
+        },
+    )
+
+    assert resolve_release_sha256(candidate) == SHA256
+
+
+@pytest.mark.parametrize(
+    ("candidate", "raw_path"),
+    [
+        (
+            make_request(),
+            DEFAULT_PATH_INFO.replace("/+f/", "/%2bf/"),
+        ),
+        (
+            make_request(),
+            DEFAULT_PATH_INFO.replace("/+f/", "/%252Bf/"),
+        ),
+        (
+            make_request(tail="abc/demo+private-1.0.whl"),
+            DEFAULT_PATH_INFO.replace(
+                "demo-1.0-py3-none-any.whl",
+                "demo%2Bprivate-1.0.whl",
+            ),
+        ),
+        (
+            make_request(user="root+admin"),
+            DEFAULT_PATH_INFO.replace("/root/", "/root%2Badmin/"),
+        ),
+        (
+            make_request(index="pypi+private"),
+            DEFAULT_PATH_INFO.replace("/pypi/", "/pypi%2Bprivate/"),
+        ),
+    ],
+)
+def test_only_fixed_uppercase_encoded_route_marker_is_accepted(
+    candidate,
+    raw_path: str,
+) -> None:
+    candidate.environ = {"REQUEST_URI": raw_path}
+
+    with pytest.raises(ArtifactIdentityUnavailable):
+        resolve_release_sha256(candidate)
+
+
 def test_canonical_unicode_raw_paths_resolve_with_unicode_mount() -> None:
     script_name = "/접두"
     relpath = UNICODE_PATH_INFO.removeprefix("/")
@@ -1167,7 +1256,8 @@ def test_ascii_raw_path_accepts_decoded_and_canonical_forms(
         UNICODE_RAW_PATH.replace("%EC", "%ec", 1),
         UNICODE_RAW_PATH.replace("%EC", "%25EC", 1),
         UNICODE_RAW_PATH.replace("%EC", "%GG", 1),
-        UNICODE_RAW_PATH.replace("/+f/", "/%2Bf/"),
+        UNICODE_RAW_PATH.replace("/+f/", "/%2bf/"),
+        UNICODE_RAW_PATH.replace("/+f/", "/%252Bf/"),
         UNICODE_RAW_PATH.replace("%EC", "%FF", 1),
     ],
 )

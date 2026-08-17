@@ -117,6 +117,7 @@ def _valid_script_name(value: object) -> bool:
 def _raw_paths_are_unambiguous(
     request: object,
     canonical_path_info: str,
+    marker: str,
 ) -> bool:
     environ = _safe_getattr(request, "environ")
     if not isinstance(environ, Mapping):
@@ -128,8 +129,21 @@ def _raw_paths_are_unambiguous(
     if script_name is _FAILED or not _valid_script_name(script_name):
         return False
     external_path = f"{script_name}{canonical_path_info}"
-    external_raw_paths = _valid_raw_forms(external_path)
+    encoded_marker_path = _encoded_route_marker_form(
+        canonical_path_info,
+        marker,
+    )
+    canonical_script_name = quote(
+        script_name,
+        safe=_RFC3986_PATH_SAFE,
+        encoding="utf-8",
+        errors="strict",
+    )
+    external_raw_paths = _valid_raw_forms(external_path) | {
+        f"{canonical_script_name}{encoded_marker_path}"
+    }
     path_info_raw_paths = _valid_raw_forms(canonical_path_info)
+    path_info_raw_paths |= {encoded_marker_path}
 
     for key in ("RAW_URI", "REQUEST_URI"):
         raw_target = _safe_optional_getitem(environ, key)
@@ -161,6 +175,18 @@ def _valid_raw_forms(decoded_path: str) -> frozenset[str]:
     return frozenset((canonical,))
 
 
+def _encoded_route_marker_form(path_info: str, marker: str) -> str:
+    canonical = quote(
+        path_info,
+        safe=_RFC3986_PATH_SAFE,
+        encoding="utf-8",
+        errors="strict",
+    )
+    literal_segment = f"/{marker}/"
+    encoded_segment = f"/%2B{marker[1:]}/"
+    return canonical.replace(literal_segment, encoded_segment, 1)
+
+
 def _classify_path(
     request: object,
 ) -> tuple[str, str, str, str, str] | None:
@@ -190,7 +216,7 @@ def _classify_path(
     canonical_path_info = f"/{requested_relpath}"
     if path_info != canonical_path_info:
         _fail()
-    if not _raw_paths_are_unambiguous(request, canonical_path_info):
+    if not _raw_paths_are_unambiguous(request, canonical_path_info, marker):
         _fail()
 
     artifact_tail = tail
