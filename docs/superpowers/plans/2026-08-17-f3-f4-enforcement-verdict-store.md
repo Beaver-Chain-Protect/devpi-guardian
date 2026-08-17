@@ -8,6 +8,15 @@
 
 **Tech Stack:** Python 3.11–3.14, devpi-server 6.20.3, Pyramid, stdlib sqlite3, setuptools, pytest, pytest-devpi-server 1.8.0, WebTest, Ruff, Flake8, uv
 
+> **2026-08-18 claim-fencing correction:** Every `claim_next` call creates a
+> unique 64-character `lease_token` and returns it in `ClaimedArtifact`.
+> `record_verdict(claim, verdict, evidence)` and
+> `mark_analysis_error(claim, error)` must compare `sha256`, owner, expiry,
+> token, state, and non-expiry before completing work. This correction
+> supersedes older snippets below that omit `lease_token` or accept only a
+> SHA-256 for completion. A recovered claim's late result must fail with
+> `TransitionConflict` after any later claim.
+
 ---
 
 ## Source design
@@ -494,6 +503,7 @@ class ClaimedArtifact:
     size_bytes: int
     worker_id: str
     lease_expires_at: datetime
+    lease_token: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,10 +575,13 @@ class ArtifactStore(Protocol):
     def recover_expired_claims(self, now: datetime) -> int: ...
 
     def record_verdict(
-        self, verdict: VerdictInput, evidence: Sequence[EvidenceInput]
+        self,
+        claim: ClaimedArtifact,
+        verdict: VerdictInput,
+        evidence: Sequence[EvidenceInput],
     ) -> None: ...
 
-    def mark_analysis_error(self, sha256: str, error: str) -> None: ...
+    def mark_analysis_error(self, claim: ClaimedArtifact, error: str) -> None: ...
 
     def request_rescan(self, sha256: str, actor: str, reason: str) -> None: ...
 

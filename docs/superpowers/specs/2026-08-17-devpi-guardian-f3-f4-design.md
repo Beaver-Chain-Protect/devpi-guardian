@@ -86,7 +86,7 @@ F2와 F3는 반드시 같은 `VerdictReader` 구현을 사용한다. 각자 별�
 | 테이블 | 책임 | 주요 필드 |
 |---|---|---|
 | `schema_migrations` | DB 스키마 버전 | `version`, `applied_at` |
-| `artifacts` | Artifact와 분석 생명주기 | `sha256`, `size_bytes`, `state`, `discovered_at`, `updated_at`, `lease_owner`, `lease_expires_at`, `last_error` |
+| `artifacts` | Artifact와 분석 생명주기 | `sha256`, `size_bytes`, `state`, `discovered_at`, `updated_at`, `lease_owner`, `lease_expires_at`, `lease_token`, `last_error` |
 | `release_mappings` | 패키지 파일과 SHA-256 연결 | `stage`, `project`, `version`, `filename`, `sha256`, `origin_url`, `discovered_at` |
 | `verdicts` | 자동 판정의 불변 이력 | `id`, `sha256`, `decision`, `score`, `policy_version`, `analyzer_version`, `baseline_sha256`, `is_current`, `created_at` |
 | `evidence` | 판정 근거 | `id`, `verdict_id`, `rule_id`, `action`, `file_path`, `line`, `message`, `details_json` |
@@ -101,6 +101,7 @@ F2와 F3는 반드시 같은 `VerdictReader` 구현을 사용한다. 각자 별�
 - `version`과 `filename`은 원래 값을 보존한다.
 - `origin_url`에서는 userinfo와 민감한 query parameter를 제거한다.
 - 시간은 UTC RFC 3339 형식으로 저장한다.
+- `SCANNING` claim에는 매번 새로 생성한 64자리 무작위 `lease_token`을 저장한다. 토큰은 로그나 외부 다운로드 URL에 노출하지 않는다.
 - 자동 판정과 evidence는 갱신·삭제하지 않고 추가한다.
 - Artifact마다 `is_current=1`인 자동 판정과 수동 override는 각각 최대 하나다.
 - 수동 override 대상 Artifact가 먼저 존재해야 한다.
@@ -129,7 +130,9 @@ SCANNING
 
 모든 쓰기 전이는 기대 상태를 조건에 포함하는 compare-and-swap으로 처리한다. 기대 상태가 다르면 `TransitionConflict`를 반환하며 호출자가 성공으로 간주하면 안 된다.
 
-`claim_next`는 쓰기 트랜잭션 안에서 하나의 `DISCOVERED` 행만 `SCANNING`으로 변경한다. 여러 워커가 동시에 호출해도 동일 SHA-256을 두 워커가 획득할 수 없다.
+`claim_next`는 쓰기 트랜잭션 안에서 하나의 `DISCOVERED` 행만 `SCANNING`으로 변경하고 고유 `lease_token`을 포함한 `ClaimedArtifact`를 반환한다. 여러 워커가 동시에 호출해도 동일 SHA-256을 두 워커가 획득할 수 없다. 새 claim의 만료 시각은 writer lock을 획득한 시각보다 미래여야 한다.
+
+`record_verdict`와 `mark_analysis_error`는 `ClaimedArtifact`를 다시 받아야 한다. 완료 전이는 `sha256`, `state=SCANNING`, `lease_owner`, `lease_expires_at`, `lease_token`, 미만료 조건을 모두 compare-and-swap에 포함한다. 만료되어 복구된 이전 claim의 늦은 결과는 같은 SHA-256이 다시 claim된 뒤에도 `TransitionConflict`로 거부한다.
 
 ### 5.4 자동 판정과 수동 override
 
@@ -196,8 +199,8 @@ class ArtifactStore(Protocol):
     def discover_artifact(self, artifact, release) -> None: ...
     def claim_next(self, worker_id, lease_until) -> ClaimedArtifact | None: ...
     def recover_expired_claims(self, now) -> int: ...
-    def record_verdict(self, verdict, evidence) -> None: ...
-    def mark_analysis_error(self, sha256, error) -> None: ...
+    def record_verdict(self, claim, verdict, evidence) -> None: ...
+    def mark_analysis_error(self, claim, error) -> None: ...
     def request_rescan(self, sha256, actor, reason) -> None: ...
     def set_manual_override(self, override) -> None: ...
     def revoke_manual_override(self, sha256, actor, reason) -> None: ...
@@ -310,8 +313,10 @@ for link, sha256 in links_with_sha256:
 ### 9.3 5번 — 워커와 관리자 API·CLI
 
 - 워커는 `claim_next()`로만 작업을 가져간다.
-- 다운로드 후 실제 SHA-256이 claim의 SHA-256과 다르면 verdict를 기록하지 않고 `mark_analysis_error()`를 호출한다.
-- 분석 완료 시 evidence 전체를 한 번의 `record_verdict()` 호출로 저장한다.
+- 반환된 `ClaimedArtifact`는 작업 완료까지 보존하며 `worker_id`, `lease_expires_at`, `lease_token`을 바꾸거나 로그에 노출하지 않는다.
+- 다운로드 후 실제 SHA-256이 claim의 SHA-256과 다르면 verdict를 기록하지 않고 `mark_analysis_error(claim, error)`를 호출한다.
+- 분석 완료 시 같은 claim과 evidence 전체를 한 번의 `record_verdict(claim, verdict, evidence)` 호출로 저장한다.
+- claim이 만료됐거나 `TransitionConflict`가 발생하면 결과를 버리고 새 claim을 가져온다. 이전 claim 결과를 새 claim으로 재사용하지 않는다.
 - API·CLI는 SQLite에 직접 SQL을 실행하지 않는다.
 - approve, block, revoke, rescan 요청은 actor와 비어 있지 않은 reason을 필수로 전달한다.
 - HTTP 상태 매핑은 `ArtifactNotFound→404`, `TransitionConflict→409`, `StoreUnavailable→503`으로 통일한다.
@@ -334,6 +339,7 @@ for link, sha256 in links_with_sha256:
 - 잘못된 SHA-256과 금지된 상태 전이가 저장되지 않는다.
 - 동일 Artifact를 동시에 claim하면 한 워커만 성공한다.
 - lease 만료 claim이 안전하게 `DISCOVERED`로 복구된다.
+- 만료·복구된 이전 claim의 늦은 verdict/error가 이후 claim을 완료하지 못한다.
 - 자동 verdict와 evidence가 불변 이력으로 보존된다.
 - current verdict와 current override가 Artifact당 하나만 존재한다.
 - 수동 `ALLOW`와 `DENY`, 취소, 만료가 정해진 우선순위로 계산된다.
