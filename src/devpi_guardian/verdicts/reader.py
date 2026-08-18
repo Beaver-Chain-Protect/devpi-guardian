@@ -173,14 +173,17 @@ class SQLiteVerdictReader:
                         SELECT id, stage, project, version, filename, sha256,
                                origin_url, discovered_at
                         FROM release_mappings
-                        WHERE project = ?
                         ORDER BY id
                         """,
-                        (canonical_project,),
                     )
                     while rows := mapping_cursor.fetchmany(_CHUNK_SIZE):
                         validate_mapping = validate_persisted_release_mapping
                         mappings = tuple(validate_mapping(row) for row in rows)
+                        selected_mappings = []
+                        for mapping in mappings:
+                            if mapping.project == canonical_project:
+                                selected_mappings.append(mapping)
+                        mappings = tuple(selected_mappings)
                         requested = []
                         requested_shas = set()
                         for mapping in mappings:
