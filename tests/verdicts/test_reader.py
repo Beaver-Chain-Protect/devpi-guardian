@@ -133,6 +133,37 @@ class RollbackCloseFailureFactory:
         )
 
 
+class CloseFailureConnection:
+    def __init__(self, connection) -> None:
+        self._connection = connection
+
+    @property
+    def in_transaction(self):
+        return self._connection.in_transaction
+
+    def execute(self, statement, parameters=()):
+        return self._connection.execute(statement, parameters)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+        raise sqlite3.OperationalError("close failure")
+
+
+class CloseFailureFactory:
+    def __init__(self, factory: ConnectionFactory) -> None:
+        self._factory = factory
+        self.path = factory.path
+
+    def connect(self):
+        return CloseFailureConnection(self._factory.connect())
+
+
 def seed_artifact(
     factory: ConnectionFactory,
     sha256: str,
@@ -652,6 +683,55 @@ def test_reader_preserves_sqlite_cause_when_cleanup_fails(tmp_path) -> None:
 
     assert isinstance(error.value.__cause__, sqlite3.OperationalError)
     assert str(error.value.__cause__) == "primary SQL failure"
+
+
+def test_list_reader_surfaces_close_sqlite_error_after_success(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+
+    reader = SQLiteVerdictReader(
+        CloseFailureFactory(factory),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        reader.list_allowed_releases("demo-package")
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert str(error.value.__cause__) == "close failure"
+
+
+def test_batch_reader_surfaces_close_sqlite_error_after_success(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+
+    reader = SQLiteVerdictReader(
+        CloseFailureFactory(factory),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        reader.get_effective_decision(SHA_ALLOW)
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert str(error.value.__cause__) == "close failure"
 
 
 def test_list_allowed_releases_rejects_missing_artifact(tmp_path) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Collection, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from .db import ConnectionFactory
@@ -210,12 +210,14 @@ class SQLiteVerdictReader:
     @contextmanager
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:
         connection: sqlite3.Connection | None = None
+        primary: BaseException | None = None
         try:
             connection = self._factory.connect()
             connection.execute("BEGIN")
             yield connection
             connection.commit()
-        except BaseException:
+        except BaseException as exc:
+            primary = exc
             if connection is not None:
                 try:
                     if connection.in_transaction:
@@ -225,8 +227,11 @@ class SQLiteVerdictReader:
             raise
         finally:
             if connection is not None:
-                with suppress(BaseException):
+                try:
                     connection.close()
+                except BaseException:
+                    if primary is None:
+                        raise
 
     @staticmethod
     def _missing(sha256: str) -> EnforcementDecision:
