@@ -19,6 +19,8 @@ The [approved F3/F4 design][approved-design] is in the repository.
   handling.
 - Automated verdict completion; audited manual `ALLOW`/`DENY`, revoke, and rescan
   transitions; and deterministic read-time override expiry.
+- F6 project lookup of effective `ALLOW` releases through the public
+  `VerdictReader.list_allowed_releases()` API and exported `AllowedRelease` model.
 - A devpi plugin with sanitized structured block logs and bounded in-process metrics.
 - The real devpi subprocess suite covers pip/uv, restarts, concurrency, direct URLs, and
   hashless mirror identity-unavailable fail-closed behavior. Identity failure remains
@@ -87,6 +89,33 @@ decisions = reader.get_effective_decisions(sha256s)
 `source=MISSING`; connection, lock, malformed-database, and persisted-state
 failures raise `StoreUnavailable` instead. F2 and the direct-download tween
 must use this reader rather than duplicate SQL or precedence logic.
+
+F6 consumers can obtain the effective allowed releases for a project from the
+same public reader used by F2 and F3:
+
+```python
+from devpi_guardian.verdicts import AllowedRelease
+from devpi_guardian.verdicts.interfaces import VerdictReader
+
+reader: VerdictReader = pyramid_config.registry[VERDICT_READER_REGISTRY_KEY]
+releases: tuple[AllowedRelease, ...] = reader.list_allowed_releases("Demo_Package")
+for release in releases:
+    print(release.stage, release.version, release.filename, release.sha256, release.origin_url)
+```
+
+The caller project is PEP 503-normalized. The query searches every stage by
+canonical project and returns a deterministic immutable tuple ordered by
+`stage`, `version`, `filename`, `sha256`, and `origin_url`; no results is `()`.
+Only current effective `ALLOW` releases appear, including automatic `ALLOW`
+results and valid manual `ALLOW` overrides. Manual `DENY`, expiry, and automated
+fallback use the same precedence as F2/F3.
+
+`origin_url` is an absolute URL, not a local filesystem path. The existing F4
+sanitizer removes userinfo, query, and fragment, but does not restrict the
+scheme. For F6 integration, F5 MUST record the canonical devpi HTTP(S) `+f`/`+e`
+artifact URL. F6 should download through devpi/Guardian HTTP enforcement, not
+use `origin_url` as a trust bypass; F4 does not fetch the URL or independently
+rehash its contents.
 
 F5 does not receive the in-process factory object created by the devpi plugin.
 Deployment configuration owns one absolute database path. After the migration

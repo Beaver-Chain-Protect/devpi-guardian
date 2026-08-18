@@ -149,3 +149,13 @@ def test_real_devpi_plugin_manager_recognizes_guardian_hooks() -> None:
     assert len(guardian_plugins) == 1
     assert plugin_manager.hook.devpiserver_add_parser_options.get_hookimpls()
     assert plugin_manager.hook.devpiserver_pyramid_configure.get_hookimpls()
+
+
+def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
+    readme = Path(__file__).parents[1].joinpath("README.md").read_text()
+
+    assert "F6" in readme
+    assert "list_allowed_releases" in readme
+    assert "absolute URL" in readme
+    assert "not a local filesystem path" in readme
+    assert "canonical devpi HTTP(S)" in readme
