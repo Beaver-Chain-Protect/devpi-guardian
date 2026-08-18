@@ -94,6 +94,7 @@ F6 consumers can obtain the effective allowed releases for a project from the
 same public reader used by F2 and F3:
 
 ```python
+from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
 from devpi_guardian.verdicts import AllowedRelease
 from devpi_guardian.verdicts.interfaces import VerdictReader
 
@@ -110,20 +111,25 @@ for release in releases:
     )
 ```
 
-The public signature is `list_allowed_releases(project: str) -> tuple[AllowedRelease, ...]`.
-The caller project is PEP 503-normalized. The query searches every stage by canonical project
-and returns a deterministic immutable tuple ordered by
+The public signature is
+`list_allowed_releases(project: str) -> tuple[AllowedRelease, ...]`.
+The caller project is PEP 503-normalized. The query searches every stage by
+canonical project and returns a deterministic immutable tuple ordered by
 `stage/version/filename/sha256/origin_url`; no results is `()`.
 
-The exact precedence is: an unexpired current manual override wins; manual DENY excludes and manual ALLOW includes; expires_at <= evaluation time is ignored, then only automated ALLOW includes (all other fallback decisions exclude).
+The exact precedence is: an unexpired current manual override wins; manual DENY
+excludes and manual ALLOW includes; expires_at <= evaluation time is ignored,
+then only automated ALLOW includes (all other fallback decisions exclude).
 Thus only current effective `ALLOW` releases appear, including automatic ALLOW
 results and valid manual ALLOW overrides, with manual DENY, expiry, and automated
 fallback using the same precedence as F2/F3.
 
 `origin_url` is an absolute URL, not a local filesystem path. The existing F4
-sanitizer removes userinfo, query, and fragment, but does not constrain the stored scheme.
-For F6 integration, F5 MUST record the canonical devpi HTTP(S) `+f`/`+e` artifact URL. F6 MUST issue HTTP(S) through canonical devpi `+f`/`+e` and Guardian enforcement;
-never use `origin_url` as a trust bypass or local open. F4 does not fetch the URL or independently rehash its contents.
+sanitizer removes userinfo, query, and fragment, but does not constrain the
+stored scheme. For F6 integration, F5 MUST record the canonical devpi HTTP(S)
+`+f`/`+e` artifact URL. F6 MUST issue HTTP(S) through canonical devpi `+f`/`+e`
+and Guardian enforcement; never use `origin_url` as a trust bypass or local open.
+F4 does not fetch the URL or independently rehash its contents.
 
 F5 does not receive the in-process factory object created by the devpi plugin.
 Deployment configuration owns one absolute database path. After the migration

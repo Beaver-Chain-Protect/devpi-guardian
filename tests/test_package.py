@@ -153,8 +153,17 @@ def test_real_devpi_plugin_manager_recognizes_guardian_hooks() -> None:
 
 def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
     readme = Path(__file__).parents[1].joinpath("README.md").read_text()
+    f6_section = readme.split("F6 consumers can obtain", 1)[1]
+    f6_section = f6_section.split("F5 does not receive", 1)[0]
+    f6_section = " ".join(f6_section.split())
 
     required_contract = (
+        "".join(
+            (
+                "from devpi_guardian.enforcement.tween import ",
+                "VERDICT_READER_REGISTRY_KEY",
+            )
+        ),
         "list_allowed_releases(project: str) -> tuple[AllowedRelease, ...]",
         "release.project",
         "PEP 503-normalized",
@@ -185,4 +194,4 @@ def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
         "F4 does not fetch the URL or independently rehash its contents",
     )
     for phrase in required_contract:
-        assert phrase in readme
+        assert phrase in f6_section
