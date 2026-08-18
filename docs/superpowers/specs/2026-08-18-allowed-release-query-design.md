@@ -47,7 +47,9 @@ class AllowedRelease:
 `SQLiteVerdictReader`는 하나의 SQLite read transaction과 하나의 `as_of` 시각
 안에서 다음을 수행한다.
 
-1. 정규화된 project에 해당하는 immutable `release_mappings`를 조회한다.
+1. PEP 503으로 정규화한 project를 immutable persisted key로 사용해
+   `WHERE project = ?` 인덱스 조회를 수행하고, 선택된 `release_mappings`를
+   조회한다.
 2. 관련 artifact, current verdict, current manual override를 bounded query로 읽는다.
 3. 기존 `validate_persisted_state()`를 사용해 각 SHA-256의 effective decision을
    계산한다.
@@ -61,6 +63,12 @@ F2/F3/F6 판정 규칙을 갈라놓기 때문이다.
 chunk 크기를 재사용한다. current verdict 또는 current override가 중복되거나
 artifact/release 데이터가 계약을 위반하면 일부 결과를 반환하지 않고
 `StoreUnavailable`로 fail closed 한다.
+
+저장된 project는 canonical key라는 persisted invariant다. 따라서 이 조회는
+정확히 정규화된 project key로 선택된 mapping만 검증한다. 다른 project key에
+있는 row, 그 key의 PEP 503 동의어인 noncanonical row, 그리고 전체 DB 무결성
+감사는 이 조회 범위 밖이다. caller 입력은 계속 PEP 503으로 정규화하며, 잘못된
+입력은 DB 연결 전에 거부한다.
 
 ## `origin_url` 계약
 

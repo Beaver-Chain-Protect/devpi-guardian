@@ -101,7 +101,7 @@ Cover all of these cases explicitly:
 6. An expired manual DENY falls back to automated ALLOW and is included.
 7. Missing project returns `()`.
 8. `None`, bytes, subclasses of `str`, blank input, and a name that normalizes to empty raise `ValueError` before `connect()`.
-9. A malformed mapping field, non-normalized stored project, noncanonical stored origin URL, malformed timestamp, missing artifact, duplicate current verdict, and duplicate current override each raise `StoreUnavailable` without partial results.
+9. A malformed selected mapping field, noncanonical stored origin URL, malformed timestamp, missing artifact, duplicate current verdict, and duplicate current override each raise `StoreUnavailable` without partial results. Unrelated project rows, including noncanonical project spellings, are outside this exact-key lookup; whole-database integrity auditing is out of scope.
 10. At least 401 distinct mapped SHA-256 values cross the existing chunk boundary and return correctly.
 11. The clock and factory are each evaluated once per call.
 
@@ -241,8 +241,9 @@ with closing(self._factory.connect()) as connection:
     )
 ```
 
-Read mapping rows in `_CHUNK_SIZE` batches using `fetchmany()`. Validate every row,
-call `_read_effective_decisions()` for the distinct SHA-256 values in that batch, and
+Read the exact normalized project mapping rows in `_CHUNK_SIZE` batches using
+`fetchmany()`. Validate every selected row, call `_read_effective_decisions()` for
+the distinct SHA-256 values in that batch, and
 append only mappings whose returned decision has `allowed is True`. Sort once using
 the exact public ordering before returning a tuple. Keep all reads inside the same
 `BEGIN` transaction and use the same `as_of` value.

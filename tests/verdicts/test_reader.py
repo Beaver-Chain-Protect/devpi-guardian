@@ -8,6 +8,7 @@ import pytest
 
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import InvalidSha256, StoreUnavailable
+from devpi_guardian.verdicts.invariants import PersistedStateCorruption
 from devpi_guardian.verdicts.models import (
     AllowedRelease,
     ArtifactState,
@@ -39,15 +40,22 @@ class FetchallSpyCursor:
 
 
 class FetchallSpyConnection:
-    def __init__(self, connection, fetched_row_counts: list[int]) -> None:
+    def __init__(
+        self,
+        connection,
+        fetched_row_counts: list[int],
+        executed_statements: list[tuple[str, object]],
+    ) -> None:
         self._connection = connection
         self._fetched_row_counts = fetched_row_counts
+        self._executed_statements = executed_statements
 
     @property
     def in_transaction(self):
         return self._connection.in_transaction
 
     def execute(self, statement, parameters=()):
+        self._executed_statements.append((statement, parameters))
         cursor = self._connection.execute(statement, parameters)
         return FetchallSpyCursor(cursor, self._fetched_row_counts)
 
@@ -66,11 +74,62 @@ class FetchallSpyFactory:
         self._factory = factory
         self.path = factory.path
         self.fetched_row_counts: list[int] = []
+        self.executed_statements: list[tuple[str, object]] = []
 
     def connect(self):
         return FetchallSpyConnection(
             self._factory.connect(),
             self.fetched_row_counts,
+            self.executed_statements,
+        )
+
+
+class RollbackCloseFailureConnection:
+    def __init__(
+        self,
+        connection,
+        *,
+        fail_release_query: bool = False,
+    ) -> None:
+        self._connection = connection
+        self._fail_release_query = fail_release_query
+
+    @property
+    def in_transaction(self):
+        return self._connection.in_transaction
+
+    def execute(self, statement, parameters=()):
+        if self._fail_release_query and "FROM release_mappings" in statement:
+            raise sqlite3.OperationalError("primary SQL failure")
+        return self._connection.execute(statement, parameters)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+        raise sqlite3.OperationalError("secondary rollback failure")
+
+    def close(self) -> None:
+        self._connection.close()
+        raise sqlite3.OperationalError("secondary close failure")
+
+
+class RollbackCloseFailureFactory:
+    def __init__(
+        self,
+        factory: ConnectionFactory,
+        *,
+        fail_release_query: bool,
+    ) -> None:
+        self._factory = factory
+        self.path = factory.path
+        self._fail_release_query = fail_release_query
+
+    def connect(self):
+        return RollbackCloseFailureConnection(
+            self._factory.connect(),
+            fail_release_query=self._fail_release_query,
         )
 
 
@@ -302,14 +361,14 @@ def test_list_allowed_releases_sort_uses_sha_before_origin_url(
     ]
 
 
-def test_list_allowed_releases_fails_closed_on_noncanonical_project_mapping(
+def test_list_allowed_releases_ignores_unrelated_corrupt_project_mapping(
     tmp_path,
 ) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
     canonical_sha = "1" * 64
-    corrupt_sha = "2" * 64
-    for sha in (canonical_sha, corrupt_sha):
+    unrelated_sha = "2" * 64
+    for sha in (canonical_sha, unrelated_sha):
         seed_artifact(
             factory,
             sha,
@@ -317,33 +376,28 @@ def test_list_allowed_releases_fails_closed_on_noncanonical_project_mapping(
             automated=(Decision.ALLOW, "policy-1"),
         )
     seed_release(factory, canonical_sha, project="demo-package")
-    seed_release(factory, corrupt_sha, project="Demo_Package")
-
-    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
-
-    with pytest.raises(StoreUnavailable):
-        reader.list_allowed_releases("demo-package")
-
-
-@pytest.mark.parametrize("project", ["Demo_Package", "demo.package", ""])
-def test_list_allowed_releases_rejects_corrupt_stored_project(
-    tmp_path,
-    project: str,
-) -> None:
-    factory = ConnectionFactory(tmp_path / "guardian.db")
-    migrate(factory)
-    seed_artifact(
+    seed_release(
         factory,
-        SHA_ALLOW,
-        ArtifactState.ALLOW,
-        automated=(Decision.ALLOW, "policy-1"),
+        unrelated_sha,
+        project="other-project",
+        origin_url="https://user:secret@example.test/pkg.whl?token=x#fragment",
     )
-    seed_release(factory, SHA_ALLOW, project=project)
 
-    with pytest.raises(StoreUnavailable):
-        SQLiteVerdictReader(factory, now=lambda: NOW).list_allowed_releases(
-            "demo-package",
-        )
+    spy_factory = FetchallSpyFactory(factory)
+    reader = SQLiteVerdictReader(spy_factory, now=lambda: NOW)
+
+    result = reader.list_allowed_releases("demo-package")
+
+    assert len(result) == 1
+    mapping_queries = [
+        (statement, parameters)
+        for statement, parameters in spy_factory.executed_statements
+        if "FROM release_mappings" in statement
+    ]
+    assert len(mapping_queries) == 1
+    statement, parameters = mapping_queries[0]
+    assert "WHERE project = ?" in statement
+    assert parameters == ("demo-package",)
 
 
 @pytest.mark.parametrize(
@@ -520,6 +574,84 @@ def test_list_allowed_releases_rejects_corrupt_mapping(
         SQLiteVerdictReader(factory, now=lambda: NOW).list_allowed_releases(
             "demo-package",
         )
+
+
+def test_reader_preserves_mapping_corruption_cause_when_cleanup_fails(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            "DROP TRIGGER release_mappings_history_update_guard",
+        )
+        connection.execute(
+            "UPDATE release_mappings SET origin_url = ?",
+            ("https://user:secret@example.test/pkg.whl?token=x#fragment",),
+        )
+
+    reader = SQLiteVerdictReader(
+        RollbackCloseFailureFactory(factory, fail_release_query=False),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        reader.list_allowed_releases("demo-package")
+
+    assert isinstance(error.value.__cause__, PersistedStateCorruption)
+
+
+def test_batch_reader_preserves_corruption_cause_when_cleanup_fails(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+        manual=Decision.ALLOW,
+    )
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            "DROP TRIGGER manual_overrides_history_update_guard",
+        )
+        connection.execute(
+            "UPDATE manual_overrides SET created_at = 'not-a-timestamp'",
+        )
+
+    reader = SQLiteVerdictReader(
+        RollbackCloseFailureFactory(factory, fail_release_query=False),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        reader.get_effective_decision(SHA_REVIEW)
+
+    assert isinstance(error.value.__cause__, PersistedStateCorruption)
+
+
+def test_reader_preserves_sqlite_cause_when_cleanup_fails(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    reader = SQLiteVerdictReader(
+        RollbackCloseFailureFactory(factory, fail_release_query=True),
+        now=lambda: NOW,
+    )
+
+    with pytest.raises(StoreUnavailable) as error:
+        reader.list_allowed_releases("demo-package")
+
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert str(error.value.__cause__) == "primary SQL failure"
 
 
 def test_list_allowed_releases_rejects_missing_artifact(tmp_path) -> None:

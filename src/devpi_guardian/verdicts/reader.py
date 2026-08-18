@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Collection, Mapping
-from contextlib import closing
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 
 from .db import ConnectionFactory
@@ -57,19 +57,12 @@ class SQLiteVerdictReader:
             return results
 
         try:
-            with closing(self._factory.connect()) as connection:
-                try:
-                    connection.execute("BEGIN")
-                    results = self._read_effective_decisions(
-                        connection,
-                        requested,
-                        as_of,
-                    )
-                    connection.commit()
-                except (sqlite3.Error, TypeError, ValueError, OverflowError):
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
+            with self._read_transaction() as connection:
+                results = self._read_effective_decisions(
+                    connection,
+                    requested,
+                    as_of,
+                )
         except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
 
@@ -165,51 +158,41 @@ class SQLiteVerdictReader:
         as_of = require_utc(self._now(), "now")
         results: list[AllowedRelease] = []
         try:
-            with closing(self._factory.connect()) as connection:
-                try:
-                    connection.execute("BEGIN")
-                    mapping_cursor = connection.execute(
-                        """
-                        SELECT id, stage, project, version, filename, sha256,
-                               origin_url, discovered_at
-                        FROM release_mappings
-                        ORDER BY id
-                        """,
+            with self._read_transaction() as connection:
+                mapping_cursor = connection.execute(
+                    """
+                    SELECT id, stage, project, version, filename, sha256,
+                           origin_url, discovered_at
+                    FROM release_mappings
+                    WHERE project = ?
+                    ORDER BY id
+                    """,
+                    (canonical_project,),
+                )
+                while rows := mapping_cursor.fetchmany(_CHUNK_SIZE):
+                    validate_mapping = validate_persisted_release_mapping
+                    mappings = tuple(validate_mapping(row) for row in rows)
+                    requested = []
+                    requested_shas = set()
+                    for mapping in mappings:
+                        if mapping.sha256 not in requested_shas:
+                            requested.append(mapping.sha256)
+                            requested_shas.add(mapping.sha256)
+                    decisions = self._read_effective_decisions(
+                        connection,
+                        requested,
+                        as_of,
                     )
-                    while rows := mapping_cursor.fetchmany(_CHUNK_SIZE):
-                        validate_mapping = validate_persisted_release_mapping
-                        mappings = tuple(validate_mapping(row) for row in rows)
-                        selected_mappings = []
-                        for mapping in mappings:
-                            if mapping.project == canonical_project:
-                                selected_mappings.append(mapping)
-                        mappings = tuple(selected_mappings)
-                        requested = []
-                        requested_shas = set()
-                        for mapping in mappings:
-                            if mapping.sha256 not in requested_shas:
-                                requested.append(mapping.sha256)
-                                requested_shas.add(mapping.sha256)
-                        decisions = self._read_effective_decisions(
-                            connection,
-                            requested,
-                            as_of,
-                        )
-                        missing_state = ArtifactState.MISSING
-                        for mapping in mappings:
-                            decision = decisions[mapping.sha256]
-                            if decision.artifact_state is missing_state:
-                                message = "release mapping artifact is missing"
-                                raise PersistedStateCorruption(
-                                    message,
-                                )
-                            if decision.allowed:
-                                results.append(mapping)
-                    connection.commit()
-                except (sqlite3.Error, TypeError, ValueError, OverflowError):
-                    if connection.in_transaction:
-                        connection.rollback()
-                    raise
+                    missing_state = ArtifactState.MISSING
+                    for mapping in mappings:
+                        decision = decisions[mapping.sha256]
+                        if decision.artifact_state is missing_state:
+                            message = "release mapping artifact is missing"
+                            raise PersistedStateCorruption(
+                                message,
+                            )
+                        if decision.allowed:
+                            results.append(mapping)
         except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
 
@@ -223,6 +206,27 @@ class SQLiteVerdictReader:
             ),
         )
         return tuple(results)
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._factory.connect()
+            connection.execute("BEGIN")
+            yield connection
+            connection.commit()
+        except BaseException:
+            if connection is not None:
+                try:
+                    if connection.in_transaction:
+                        connection.rollback()
+                except BaseException:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                with suppress(BaseException):
+                    connection.close()
 
     @staticmethod
     def _missing(sha256: str) -> EnforcementDecision:
