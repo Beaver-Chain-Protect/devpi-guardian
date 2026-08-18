@@ -6,8 +6,40 @@ path is fail-closed: an unknown Artifact, an in-progress analysis, a denied or
 errored analysis, an identity lookup failure, and a verdict-store failure never
 reach the devpi file handler.
 
-The approved F3/F4 design is in
-docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md.
+The [approved F3/F4 design](docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md)
+is in the repository.
+
+## Implemented features
+
+- Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658 `.metadata` requests.
+- SHA-256 SQLite verdict persistence with migrations, bounded reads, immutable verdict/evidence history, claim fencing, lease recovery, and fail-closed corruption handling.
+- Automated verdict completion plus audited manual `ALLOW`/`DENY`, revoke, expiry, and rescan transitions.
+- A devpi plugin with sanitized structured block logs and bounded in-process metrics.
+- Actual devpi subprocess and official `pytest-devpi-server` integration covering pip/uv, restarts, concurrency, direct URLs, and hashless mirror identity.
+
+## Repository structure
+
+The repository keeps enforcement, verdict storage, integration coverage, and delivery metadata in this layout:
+
+```text
+.
+├── src/
+│   └── devpi_guardian/
+│       ├── enforcement/       # Release identity resolution, tween enforcement, and metrics.
+│       ├── verdicts/           # SQLite schema, reader, models, and transactional store.
+│       └── plugin.py           # devpi-server plugin registration and startup wiring.
+├── tests/
+│   ├── enforcement/           # Direct-download enforcement and metrics tests.
+│   ├── verdicts/               # Persistence, reader, claims, and transition tests.
+│   └── integration/            # Real devpi-server and resolver integration tests.
+├── docs/
+│   └── superpowers/
+│       ├── specs/              # Approved designs and supporting specifications.
+│       └── plans/              # Implementation plans.
+├── news/                       # Release-note fragments.
+├── pyproject.toml              # Packaging, dependencies, and tool configuration.
+└── uv.lock                     # Locked development and runtime dependencies.
+```
 
 ## F3/F4 handoff and connection boundaries
 
