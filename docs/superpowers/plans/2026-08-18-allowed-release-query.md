@@ -66,8 +66,7 @@ def seed_release(
                 version,
                 filename,
                 sha256,
-                origin_url
-                or f"https://devpi.example/{stage}/+f/aa/{filename}",
+                origin_url or f"https://devpi.example/{stage}/+f/aa/{filename}",
                 NOW.isoformat(),
             ),
         )
@@ -83,10 +82,7 @@ assert reader.list_allowed_releases("Demo_Package") == (
         version="1.0.0",
         filename="demo_package-1.0.0-py3-none-any.whl",
         sha256=SHA_ALLOW,
-        origin_url=(
-            "https://devpi.example/root/dev/+f/aa/"
-            "demo_package-1.0.0-py3-none-any.whl"
-        ),
+        origin_url=("https://devpi.example/root/dev/+f/aa/demo_package-1.0.0-py3-none-any.whl"),
     ),
 )
 ```
@@ -211,8 +207,7 @@ def _read_effective_decisions(
     connection: sqlite3.Connection,
     requested: list[str],
     as_of: datetime,
-) -> dict[str, EnforcementDecision]:
-    ...
+) -> dict[str, EnforcementDecision]: ...
 ```
 
 Keep the existing `ROW_NUMBER() ... current_rank <= 2` duplicate bound and
