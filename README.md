@@ -6,31 +6,41 @@ path is fail-closed: an unknown Artifact, an in-progress analysis, a denied or
 errored analysis, an identity lookup failure, and a verdict-store failure never
 reach the devpi file handler.
 
-The [approved F3/F4 design](docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md)
-is in the repository.
+The [approved F3/F4 design][approved-design] is in the repository.
+
+[approved-design]: https://github.com/Beaver-Context-Protocol/devpi-guardian/blob/main/docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md
 
 ## Implemented features
 
-- Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658 `.metadata` requests.
-- SHA-256 SQLite verdict persistence with migrations, bounded reads, immutable verdict/evidence history, claim fencing, lease recovery, and fail-closed corruption handling.
-- Automated verdict completion plus audited manual `ALLOW`/`DENY`, revoke, expiry, and rescan transitions.
+- Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658
+  `.metadata` requests.
+- SHA-256 SQLite verdict persistence with migrations, bounded reads, immutable
+  verdict/evidence history, claim fencing, lease recovery, and fail-closed corruption
+  handling.
+- Automated verdict completion; audited manual `ALLOW`/`DENY`, revoke, and rescan
+  transitions; and deterministic read-time override expiry.
 - A devpi plugin with sanitized structured block logs and bounded in-process metrics.
-- Actual devpi subprocess and official `pytest-devpi-server` integration covering pip/uv, restarts, concurrency, direct URLs, and hashless mirror identity.
+- The real devpi subprocess suite covers pip/uv, restarts, concurrency, direct URLs, and
+  hashless mirror identity-unavailable fail-closed behavior. Identity failure remains
+  `503` even when a matching `ALLOW` exists.
+- A narrower official `pytest-devpi-server` fixture smoke test exercises the installed
+  plugin.
 
 ## Repository structure
 
-The repository keeps enforcement, verdict storage, integration coverage, and delivery metadata in this layout:
+The repository keeps enforcement, verdict storage, integration coverage, and delivery
+metadata in this layout:
 
 ```text
 .
 ├── src/
 │   └── devpi_guardian/
-│       ├── enforcement/       # Release identity resolution, tween enforcement, and metrics.
-│       ├── verdicts/           # SQLite schema, reader, models, and transactional store.
-│       └── plugin.py           # devpi-server plugin registration and startup wiring.
+│       ├── enforcement/       # Resolve identities, enforce, and record metrics.
+│       ├── verdicts/           # SQLite schema, reader, models, and store.
+│       └── plugin.py           # Register the devpi-server plugin and wire startup.
 ├── tests/
 │   ├── enforcement/           # Direct-download enforcement and metrics tests.
-│   ├── verdicts/               # Persistence, reader, claims, and transition tests.
+│   ├── verdicts/               # Persistence, reader, claim, and transition tests.
 │   └── integration/            # Real devpi-server and resolver integration tests.
 ├── docs/
 │   └── superpowers/
