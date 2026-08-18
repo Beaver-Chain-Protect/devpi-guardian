@@ -8,6 +8,7 @@ import pytest
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import InvalidSha256, StoreUnavailable
 from devpi_guardian.verdicts.models import (
+    AllowedRelease,
     ArtifactState,
     Decision,
     DecisionSource,
@@ -134,6 +135,361 @@ def seed_artifact(
                     expiry,
                 ),
             )
+
+
+def seed_release(
+    factory: ConnectionFactory,
+    sha256: str,
+    *,
+    stage: str = "root/dev",
+    project: str = "demo-package",
+    version: str = "1.0.0",
+    filename: str = "demo_package-1.0.0-py3-none-any.whl",
+    origin_url: str | None = None,
+) -> None:
+    with closing(factory.connect()) as connection, connection:
+        default_origin = f"https://devpi.example/{stage}/+f/aa/{filename}"
+        connection.execute(
+            """
+            INSERT INTO release_mappings(
+                stage, project, version, filename, sha256,
+                origin_url, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stage,
+                project,
+                version,
+                filename,
+                sha256,
+                origin_url or default_origin,
+                NOW.isoformat(),
+            ),
+        )
+
+
+def test_list_allowed_releases_normalizes_project_and_returns_immutable_result(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+
+    result = SQLiteVerdictReader(
+        factory,
+        now=lambda: NOW,
+    ).list_allowed_releases("Demo_Package")
+
+    origin_prefix = "https://devpi.example/root/dev/+f/aa/"
+    origin_filename = "demo_package-1.0.0-py3-none-any.whl"
+    expected_origin = origin_prefix + origin_filename
+    assert result == (
+        AllowedRelease(
+            stage="root/dev",
+            project="demo-package",
+            version="1.0.0",
+            filename="demo_package-1.0.0-py3-none-any.whl",
+            sha256=SHA_ALLOW,
+            origin_url=expected_origin,
+        ),
+    )
+    assert isinstance(result, tuple)
+
+
+def test_list_allowed_releases_returns_all_mappings_in_deterministic_order(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    shas = [f"{number:064x}" for number in range(1, 3)]
+    for sha in shas:
+        seed_artifact(
+            factory,
+            sha,
+            ArtifactState.ALLOW,
+            automated=(Decision.ALLOW, "policy-1"),
+        )
+    seed_release(
+        factory,
+        shas[0],
+        stage="root/z",
+        version="2.0.0",
+        filename="z.whl",
+    )
+    seed_release(
+        factory,
+        shas[0],
+        stage="root/a",
+        version="1.0.0",
+        filename="a.whl",
+    )
+    seed_release(
+        factory,
+        shas[1],
+        stage="root/a",
+        version="1.0.0",
+        filename="b.whl",
+    )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    result = reader.list_allowed_releases("demo_package")
+
+    actual = []
+    for item in result:
+        actual.append((item.stage, item.version, item.filename))
+    expected = []
+    for item in sorted(
+        result,
+        key=lambda item: (item.stage, item.version, item.filename),
+    ):
+        expected.append((item.stage, item.version, item.filename))
+    assert actual == expected
+    assert len(result) == 3
+    assert {item.stage for item in result} == {"root/a", "root/z"}
+
+
+@pytest.mark.parametrize(
+    ("state", "automated"),
+    [
+        (ArtifactState.DISCOVERED, Decision.ALLOW),
+        (ArtifactState.SCANNING, Decision.ALLOW),
+        (ArtifactState.REVIEW, Decision.REVIEW),
+        (ArtifactState.DENY, Decision.DENY),
+        (ArtifactState.ERROR, Decision.ALLOW),
+    ],
+)
+def test_list_allowed_releases_excludes_nonallow_states(
+    tmp_path,
+    state: ArtifactState,
+    automated: Decision,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    sha = "1" * 64
+    seed_artifact(factory, sha, state, automated=(automated, "policy-1"))
+    seed_release(factory, sha)
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    result = reader.list_allowed_releases("demo-package")
+
+    assert result == ()
+
+
+def test_list_allowed_releases_applies_manual_override_precedence(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    cases = (
+        ("1" * 64, ArtifactState.ALLOW, Decision.ALLOW, Decision.ALLOW, None),
+        ("2" * 64, ArtifactState.ALLOW, Decision.ALLOW, Decision.DENY, None),
+        (
+            "3" * 64,
+            ArtifactState.REVIEW,
+            Decision.REVIEW,
+            Decision.ALLOW,
+            None,
+        ),
+        (
+            "4" * 64,
+            ArtifactState.REVIEW,
+            Decision.REVIEW,
+            Decision.ALLOW,
+            NOW + timedelta(minutes=1),
+        ),
+        (
+            "5" * 64,
+            ArtifactState.ALLOW,
+            Decision.ALLOW,
+            Decision.DENY,
+            NOW + timedelta(minutes=1),
+        ),
+    )
+    for sha, state, automated, manual, expires in cases:
+        seed_artifact(
+            factory,
+            sha,
+            state,
+            automated=(automated, "policy-1"),
+            manual=manual,
+            expires=expires,
+        )
+        seed_release(factory, sha, filename=f"{sha[:4]}.whl")
+
+    result = SQLiteVerdictReader(
+        factory,
+        now=lambda: NOW + timedelta(minutes=2),
+    ).list_allowed_releases("demo-package")
+
+    assert [item.sha256 for item in result] == [
+        "1" * 64,
+        "3" * 64,
+        "5" * 64,
+    ]
+
+
+@pytest.mark.parametrize("project", [None, b"demo-package", "", " \t"])
+def test_list_allowed_releases_rejects_invalid_project_before_connect(
+    tmp_path,
+    project,
+) -> None:
+    class NoConnectFactory:
+        path = tmp_path / "guardian.db"
+
+        def connect(self):
+            raise AssertionError("connect must not be called")
+
+    reader = SQLiteVerdictReader(NoConnectFactory(), now=lambda: NOW)
+
+    with pytest.raises(ValueError):
+        reader.list_allowed_releases(project)
+
+
+def test_list_allowed_releases_rejects_str_subclass_before_connect(
+    tmp_path,
+) -> None:
+    class Project(str):
+        pass
+
+    class NoConnectFactory:
+        path = tmp_path / "guardian.db"
+
+        def connect(self):
+            raise AssertionError("connect must not be called")
+
+    reader = SQLiteVerdictReader(NoConnectFactory(), now=lambda: NOW)
+
+    with pytest.raises(ValueError):
+        reader.list_allowed_releases(Project("demo-package"))
+
+
+def test_list_allowed_releases_rejects_normalized_empty_project(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "devpi_guardian.verdicts.releases.normalize_name",
+        lambda value: "",
+    )
+
+    class NoConnectFactory:
+        path = tmp_path / "guardian.db"
+
+        def connect(self):
+            raise AssertionError("connect must not be called")
+
+    reader = SQLiteVerdictReader(NoConnectFactory(), now=lambda: NOW)
+
+    with pytest.raises(ValueError):
+        reader.list_allowed_releases("demo-package")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stage", ""),
+        ("version", ""),
+        ("filename", ""),
+        (
+            "origin_url",
+            "https://user:secret@example.test/pkg.whl?token=x#fragment",
+        ),
+        ("discovered_at", "not-a-timestamp"),
+    ],
+)
+def test_list_allowed_releases_rejects_corrupt_mapping(
+    tmp_path,
+    field: str,
+    value: str,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            "DROP TRIGGER release_mappings_history_update_guard",
+        )
+        update = f"UPDATE release_mappings SET {field} = ?"
+        connection.execute(update, (value,))
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).list_allowed_releases(
+            "demo-package",
+        )
+
+
+def test_list_allowed_releases_rejects_missing_artifact(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    with closing(factory.connect()) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN")
+        connection.execute(
+            """
+            INSERT INTO release_mappings(
+                stage, project, version, filename, sha256,
+                origin_url, discovered_at
+            ) VALUES ('root/dev', 'demo-package', '1.0.0', 'demo.whl', ?,
+                      'https://devpi.example/demo.whl', ?)
+            """,
+            (SHA_ALLOW, NOW.isoformat()),
+        )
+        connection.commit()
+
+    with pytest.raises(StoreUnavailable):
+        SQLiteVerdictReader(factory, now=lambda: NOW).list_allowed_releases(
+            "demo-package",
+        )
+
+
+def test_list_allowed_releases_uses_one_clock_and_connection(tmp_path) -> None:
+    underlying = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(underlying)
+    seed_artifact(
+        underlying,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(underlying, SHA_ALLOW)
+
+    class CountingFactory:
+        path = underlying.path
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def connect(self):
+            self.calls += 1
+            return underlying.connect()
+
+    clock_calls = 0
+
+    def now() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return NOW
+
+    factory = CountingFactory()
+    result = SQLiteVerdictReader(factory, now=now).list_allowed_releases(
+        "demo-package",
+    )
+
+    assert len(result) == 1
+    assert factory.calls == 1
+    assert clock_calls == 1
 
 
 def test_reader_allows_only_automated_allow(tmp_path) -> None:

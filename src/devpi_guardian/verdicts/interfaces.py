@@ -6,6 +6,7 @@ from sqlite3 import Connection
 from typing import Protocol
 
 from .models import (
+    AllowedRelease,
     ArtifactInput,
     AuditEventInput,
     ClaimedArtifact,
@@ -23,6 +24,11 @@ class VerdictReader(Protocol):
     def get_effective_decisions(
         self, sha256s: Collection[str]
     ) -> Mapping[str, EnforcementDecision]: ...
+
+    def list_allowed_releases(
+        self,
+        project: str,
+    ) -> tuple[AllowedRelease, ...]: ...
 
 
 class AuditWriter(Protocol):

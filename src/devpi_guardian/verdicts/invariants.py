@@ -5,7 +5,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from .models import ArtifactState, Decision, DecisionSource
+from devpi_common.metadata import normalize_name
+
+from .models import AllowedRelease, ArtifactState, Decision, DecisionSource
+from .releases import sanitize_origin_url
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_STORED_TEXT_LENGTH = 4096
@@ -97,6 +100,60 @@ def _stored_timestamp(value: object, field_name: str) -> datetime:
         raise PersistedStateCorruption(
             f"invalid persisted {field_name}",
         ) from exc
+
+
+def _release_text(value: object, field_name: str) -> str:
+    if type(value) is not str or not value.strip():
+        message = f"invalid persisted release {field_name}"
+        raise PersistedStateCorruption(message)
+    return value
+
+
+def validate_persisted_release_mapping(
+    mapping: Mapping[str, object],
+) -> AllowedRelease:
+    _sqlite_id(_field(mapping, "id"), "release mapping id")
+    stage = _release_text(_field(mapping, "stage"), "stage")
+    project_raw = _field(mapping, "project")
+    project = _release_text(project_raw, "project")
+    try:
+        canonical_project = normalize_name(project)
+    except (TypeError, ValueError) as exc:
+        raise PersistedStateCorruption(
+            "invalid persisted release project",
+        ) from exc
+    if canonical_project != project:
+        raise PersistedStateCorruption("invalid persisted release project")
+    version = _release_text(_field(mapping, "version"), "version")
+    filename = _release_text(_field(mapping, "filename"), "filename")
+    sha256 = _canonical_sha256(
+        _field(mapping, "sha256"),
+        "release mapping sha256",
+    )
+    origin_raw = _field(mapping, "origin_url")
+    origin_url = _release_text(origin_raw, "origin_url")
+    try:
+        canonical_origin = sanitize_origin_url(origin_url)
+    except (TypeError, ValueError) as exc:
+        raise PersistedStateCorruption(
+            "invalid persisted release origin_url",
+        ) from exc
+    if canonical_origin != origin_url:
+        raise PersistedStateCorruption(
+            "noncanonical persisted release origin_url",
+        )
+    _stored_timestamp(
+        _field(mapping, "discovered_at"),
+        "release mapping discovered_at",
+    )
+    return AllowedRelease(
+        stage=stage,
+        project=project,
+        version=version,
+        filename=filename,
+        sha256=sha256,
+        origin_url=origin_url,
+    )
 
 
 def _artifact_context(

@@ -7,7 +7,6 @@ import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from devpi_common.metadata import normalize_name
 
@@ -31,6 +30,7 @@ from .models import (
     require_utc,
     validate_sha256,
 )
+from .releases import sanitize_origin_url
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_STORED_TEXT_LENGTH = 4096
@@ -286,29 +286,6 @@ def _prepare_admin_command(
     )
 
 
-def _sanitize_origin_url(value: str) -> str:
-    origin_url = _require_nonblank_string(value, "origin_url")
-    try:
-        parsed = urlsplit(origin_url)
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        raise ValueError("origin_url must be a valid absolute URL") from None
-    if (
-        not parsed.scheme
-        or not parsed.netloc
-        or hostname is None
-        or not hostname
-        or any(character.isspace() for character in hostname)
-    ):
-        raise ValueError("origin_url must be a valid absolute URL")
-
-    host = f"[{hostname}]" if ":" in hostname else hostname
-    netloc = host if port is None else f"{host}:{port}"
-    sanitized = SplitResult(parsed.scheme, netloc, parsed.path, "", "")
-    return urlunsplit(sanitized)
-
-
 class SQLiteArtifactStore:
     def __init__(
         self,
@@ -410,7 +387,7 @@ class SQLiteArtifactStore:
         origin_input = _require_nonblank_string(release_origin, "origin_url")
 
         project = normalize_name(project_input)
-        origin_url = _sanitize_origin_url(origin_input)
+        origin_url = sanitize_origin_url(origin_input)
         artifact_discovered_at = _iso(artifact.discovered_at, "discovered_at")
         release_discovered_at = _iso(release.discovered_at, "discovered_at")
         operation_at = require_utc(
