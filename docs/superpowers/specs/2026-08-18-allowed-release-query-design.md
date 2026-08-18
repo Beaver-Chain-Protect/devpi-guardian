@@ -64,9 +64,10 @@ artifact/release 데이터가 계약을 위반하면 일부 결과를 반환하�
 
 ## `origin_url` 계약
 
-`origin_url`은 로컬 filesystem 경로가 아니라 artifact를 받기 위한 절대 HTTP(S)
-URL이다. F5 discovery 연결자는 `ReleaseInput.origin_url`에 해당 release의 canonical
-devpi `+f` 또는 `+e` 다운로드 URL을 제공해야 한다.
+`origin_url`은 로컬 filesystem 경로가 아니라 artifact를 받기 위한 절대 URL이다.
+F4의 기존 저장 경계는 URL scheme을 HTTP(S)로 제한하지 않는다. F6 연결을 위한
+배포 계약에서는 F5 discovery 연결자가 `ReleaseInput.origin_url`에 해당 release의
+canonical devpi HTTP(S) `+f` 또는 `+e` 다운로드 URL을 제공해야 한다.
 
 F4는 저장 시 URL에서 userinfo, query, fragment를 제거한다. URL의 원격 콘텐츠를
 직접 내려받아 SHA-256을 재검증하지는 않으므로, F6는 이 값을 신뢰 우회 경로로
@@ -97,4 +98,5 @@ F4는 저장 시 URL에서 userinfo, query, fragment를 제거한다. URL의 원
 - version을 PEP 440 순서로 비교하거나 baseline을 자동 선택하지 않는다.
 - stage 필터나 pagination을 새 공개 옵션으로 추가하지 않는다.
 - artifact를 직접 다운로드하거나 파일을 여는 기능은 제공하지 않는다.
-- schema migration이나 release mapping 쓰기 계약은 변경하지 않는다.
+- URL scheme 제한을 포함해 schema migration이나 release mapping 쓰기 계약은
+  변경하지 않는다.
