@@ -5,6 +5,7 @@ This file applies to the entire repository.
 ## Authoritative inputs
 
 - Approved design: `docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md`
+- F1/F2 design: `docs/superpowers/specs/2026-08-20-f1-f2-guardian-index-simple-filter.md`
 - Execution plan: `docs/superpowers/plans/2026-08-17-f3-f4-enforcement-verdict-store.md`
 - If code, plan, and design disagree, stop implementation and resolve the disagreement before proceeding.
 
@@ -48,7 +49,8 @@ This file applies to the entire repository.
 - All write transitions and audit recording use one SQLite transaction.
 - Do not create worker bypass tokens or trust URL fragments, filenames, or client headers
   as Artifact identity.
-- Keep changes within F3/F4 scope unless the user explicitly expands it.
+- Keep changes within the assigned feature scope. F1/F2 may extend plugin bootstrap only
+  as required to share the already initialized `VerdictReader` with `GuardianStage`.
 
 ## Quality commands
 
