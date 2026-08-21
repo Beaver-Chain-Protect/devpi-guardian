@@ -712,8 +712,8 @@ class _CallVisitor(ast.NodeVisitor):
         instances = dict(self.instance_bindings)
         constructors = dict(self.constructor_bindings)
         for name in clear_names:
-            instances.pop(name, None)
-            constructors.pop(name, None)
+            _clear_reference_path(instances, name)
+            _clear_reference_path(constructors, name)
         if instance_seed:
             instances.update(instance_seed)
         self._instance_scopes.append(instances)
@@ -727,8 +727,8 @@ class _CallVisitor(ast.NodeVisitor):
         instances = dict(self.instance_bindings)
         constructors = dict(self.constructor_bindings)
         for name in clear_names:
-            instances.pop(name, None)
-            constructors.pop(name, None)
+            _clear_reference_path(instances, name)
+            _clear_reference_path(constructors, name)
         self._instance_scopes.append(instances)
         self._constructor_scopes.append(constructors)
         self.visit(expression)
@@ -767,20 +767,7 @@ class _CallVisitor(ast.NodeVisitor):
             receiver = _instance_method_receiver(node, self.aliases)
             summary = self._class_summaries.get(self._class_stack[-1], {})
             if receiver is not None:
-                collector = _ClassAttributeCollector(
-                    receiver,
-                    self.aliases,
-                    self._instance_scopes[0],
-                    self._constructor_scopes[0],
-                )
-                for statement in node.body:
-                    collector.visit(statement)
-                written = {path for path, _ in collector.events}
-                instance_seed = {
-                    f"{receiver}.{path}": kind
-                    for path, kind in summary.items()
-                    if path not in written
-                }
+                instance_seed = {f"{receiver}.{path}": kind for path, kind in summary.items()}
         self._function_depth += 1
         self._visit_scope_body(
             node.body,
@@ -853,14 +840,14 @@ class _CallVisitor(ast.NodeVisitor):
         if node.type is not None:
             self.visit(node.type)
         if node.name is not None:
-            self.instance_bindings.pop(node.name, None)
-            self.constructor_bindings.pop(node.name, None)
+            _clear_reference_path(self.instance_bindings, node.name)
+            _clear_reference_path(self.constructor_bindings, node.name)
         for statement in node.body:
             self.visit(statement)
         # Python clears ``except ... as name`` at the end of the handler.
         if node.name is not None:
-            self.instance_bindings.pop(node.name, None)
-            self.constructor_bindings.pop(node.name, None)
+            _clear_reference_path(self.instance_bindings, node.name)
+            _clear_reference_path(self.constructor_bindings, node.name)
 
     def visit_With(self, node: ast.With) -> None:
         self._visit_with_items(node.items, node.body)

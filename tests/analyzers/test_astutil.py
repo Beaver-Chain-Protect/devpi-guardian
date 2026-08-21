@@ -427,6 +427,49 @@ class Api:
     assert [call for call in calls if call.category == "network"] == []
 
 
+def test_shadowing_root_clears_attribute_descendants_for_function_lambda_and_except() -> None:
+    source = """
+import httpx
+
+holder.client = httpx.Client()
+holder.transport.client = httpx.Client()
+
+def run(holder):
+    holder.client.get("not-network")
+    holder.transport.client.get("not-network")
+
+shadowed = lambda holder: (
+    holder.client.get("not-network"), holder.transport.client.get("not-network")
+)
+
+try:
+    pass
+except Exception as holder:
+    holder.client.get("not-network")
+    holder.transport.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_class_seed_remains_available_before_compatible_later_write() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def reset(self):
+        self.client.get("https://example.test")
+        self.client = httpx.Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 9)
+    ]
+
+
 def test_nested_lambda_parameter_shadows_outer_client_but_capture_remains_network() -> None:
     source = """
 import httpx
