@@ -18,13 +18,61 @@ PROCESS_CALLS = frozenset(
         "os.popen",
     }
 )
-NETWORK_PREFIXES = (
-    "requests.",
-    "urllib.request.",
-    "http.client.",
-    "httpx.",
-    "socket.",
+NETWORK_CALLS = frozenset(
+    {
+        *(
+            f"requests.{name}"
+            for name in ("request", "get", "post", "put", "patch", "delete", "head", "options")
+        ),
+        *(
+            f"requests.api.{name}"
+            for name in ("request", "get", "post", "put", "patch", "delete", "head", "options")
+        ),
+        *(
+            f"httpx.{name}"
+            for name in (
+                "request",
+                "get",
+                "post",
+                "put",
+                "patch",
+                "delete",
+                "head",
+                "options",
+                "stream",
+            )
+        ),
+        "urllib.request.urlopen",
+        "urllib.request.urlretrieve",
+        "socket.create_connection",
+    }
 )
+NETWORK_CONSTRUCTORS = frozenset(
+    {
+        "httpx.Client",
+        "httpx.AsyncClient",
+        "requests.Session",
+        "urllib.request.build_opener",
+        "http.client.HTTPConnection",
+        "http.client.HTTPSConnection",
+        "socket.socket",
+    }
+)
+NETWORK_INSTANCE_METHODS = {
+    "httpx.Client": frozenset(
+        {"request", "get", "post", "put", "patch", "delete", "head", "options", "stream", "send"}
+    ),
+    "httpx.AsyncClient": frozenset(
+        {"request", "get", "post", "put", "patch", "delete", "head", "options", "stream", "send"}
+    ),
+    "requests.Session": frozenset(
+        {"request", "get", "post", "put", "patch", "delete", "head", "options", "send"}
+    ),
+    "urllib.request.build_opener": frozenset({"open"}),
+    "http.client.HTTPConnection": frozenset({"request", "connect", "send"}),
+    "http.client.HTTPSConnection": frozenset({"request", "connect", "send"}),
+    "socket.socket": frozenset({"connect", "connect_ex", "send", "sendall", "sendto"}),
+}
 DYNAMIC_EXEC_CALLS = frozenset(
     {
         "eval",
@@ -33,10 +81,9 @@ DYNAMIC_EXEC_CALLS = frozenset(
         "builtins.eval",
         "builtins.exec",
         "builtins.compile",
-        "__import__",
-        "importlib.import_module",
     }
 )
+DYNAMIC_IMPORT_CALLS = frozenset({"__import__", "builtins.__import__", "importlib.import_module"})
 SENSITIVE_ENV_MARKERS = (
     "TOKEN",
     "SECRET",
@@ -197,11 +244,21 @@ def _open_is_write(call: ast.Call) -> bool:
     return bool(mode and any(flag in mode for flag in ("w", "a", "x", "+")))
 
 
-def categorize_call(call: ast.Call, aliases: dict[str, str]) -> tuple[str | None, str]:
-    qualified = resolve_qualified_name(call.func, aliases) or "<dynamic-call>"
+def categorize_call(
+    call: ast.Call,
+    aliases: dict[str, str],
+    instance_bindings: dict[str, str] | None = None,
+    constructor_bindings: dict[str, str] | None = None,
+) -> tuple[str | None, str]:
+    qualified = _qualified_call_name(
+        call,
+        aliases,
+        instance_bindings or {},
+        constructor_bindings,
+    )
     if qualified in PROCESS_CALLS or qualified.startswith(("os.spawn", "os.exec")):
         return "process", qualified
-    if qualified.startswith(NETWORK_PREFIXES):
+    if qualified in NETWORK_CALLS or _is_network_instance_call(qualified):
         return "network", qualified
     if qualified in DYNAMIC_EXEC_CALLS:
         return "dynamic_exec", qualified
@@ -219,15 +276,220 @@ def categorize_call(call: ast.Call, aliases: dict[str, str]) -> tuple[str | None
     return None, qualified
 
 
+def _is_network_instance_call(qualified: str) -> bool:
+    constructor, separator, method = qualified.rpartition(".")
+    return bool(separator and method in NETWORK_INSTANCE_METHODS.get(constructor, ()))
+
+
+def _constructor_kind(
+    node: ast.AST,
+    aliases: dict[str, str],
+    constructor_bindings: dict[str, str] | None = None,
+) -> str | None:
+    if not isinstance(node, ast.Call):
+        return None
+    qualified = resolve_qualified_name(node.func, aliases)
+    if isinstance(node.func, ast.Name) and constructor_bindings:
+        qualified = constructor_bindings.get(node.func.id, qualified)
+    return qualified if qualified in NETWORK_CONSTRUCTORS else None
+
+
+def _qualified_call_name(
+    call: ast.Call,
+    aliases: dict[str, str],
+    instance_bindings: dict[str, str],
+    constructor_bindings: dict[str, str] | None = None,
+) -> str:
+    if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+        kind = instance_bindings.get(call.func.value.id)
+        if kind is not None:
+            return f"{kind}.{call.func.attr}"
+    qualified = resolve_qualified_name(call.func, aliases)
+    if qualified is not None:
+        return qualified
+    if not isinstance(call.func, ast.Attribute):
+        return "<dynamic-call>"
+    base = call.func.value
+    kind = _constructor_kind(base, aliases, constructor_bindings)
+    if kind is not None:
+        return f"{kind}.{call.func.attr}"
+    return "<dynamic-call>"
+
+
 class _CallVisitor(ast.NodeVisitor):
     def __init__(self, aliases: dict[str, str], source: str) -> None:
         self.aliases = aliases
         self.source = source
         self.calls: list[CallSite] = []
         self.dynamic_imports: list[DynamicImport] = []
+        self._instance_scopes: list[dict[str, str]] = [{}]
+        self._constructor_scopes: list[dict[str, str]] = [{}]
+
+    @property
+    def instance_bindings(self) -> dict[str, str]:
+        return self._instance_scopes[-1]
+
+    @property
+    def constructor_bindings(self) -> dict[str, str]:
+        return self._constructor_scopes[-1]
+
+    def _bind_target(
+        self,
+        target: ast.AST,
+        kind: str | None,
+        constructor: str | None = None,
+    ) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                self._bind_target(element, None)
+            return
+        if isinstance(target, ast.Name):
+            if constructor is not None:
+                self.instance_bindings.pop(target.id, None)
+                self.constructor_bindings[target.id] = constructor
+            elif kind is None:
+                self.instance_bindings.pop(target.id, None)
+                self.constructor_bindings.pop(target.id, None)
+            else:
+                self.instance_bindings[target.id] = kind
+                self.constructor_bindings.pop(target.id, None)
+
+    def _bind_assignment(self, value: ast.AST, targets: list[ast.AST]) -> None:
+        kind = _constructor_kind(value, self.aliases, self.constructor_bindings)
+        if isinstance(value, ast.Name):
+            kind = self.instance_bindings.get(value.id)
+        constructor = None
+        if not isinstance(value, ast.Call):
+            qualified = resolve_qualified_name(value, self.aliases)
+            if isinstance(value, ast.Name):
+                qualified = self.constructor_bindings.get(value.id, qualified)
+            if qualified in NETWORK_CONSTRUCTORS:
+                constructor = qualified
+        for target in targets:
+            self._bind_target(target, kind, constructor)
+
+    def _visit_scope_body(
+        self,
+        body: list[ast.stmt],
+        *,
+        clear_names: Iterable[str] = (),
+    ) -> None:
+        instances = dict(self.instance_bindings)
+        constructors = dict(self.constructor_bindings)
+        for name in clear_names:
+            instances.pop(name, None)
+            constructors.pop(name, None)
+        self._instance_scopes.append(instances)
+        self._constructor_scopes.append(constructors)
+        for statement in body:
+            self.visit(statement)
+        self._instance_scopes.pop()
+        self._constructor_scopes.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for argument in [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]:
+            if argument.annotation is not None:
+                self.visit(argument.annotation)
+        if node.args.vararg and node.args.vararg.annotation is not None:
+            self.visit(node.args.vararg.annotation)
+        if node.args.kwarg and node.args.kwarg.annotation is not None:
+            self.visit(node.args.kwarg.annotation)
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        if node.returns is not None:
+            self.visit(node.returns)
+        parameter_names = {
+            argument.arg
+            for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        }
+        if node.args.vararg:
+            parameter_names.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            parameter_names.add(node.args.kwarg.arg)
+        self._visit_scope_body(node.body, clear_names=parameter_names)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        self._visit_scope_body(node.body)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+        self._bind_assignment(node.value, list(node.targets))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.annotation is not None:
+            self.visit(node.annotation)
+        self.visit(node.target)
+        if node.value is not None:
+            self.visit(node.value)
+        self._bind_assignment(
+            node.value, [node.target]
+        ) if node.value is not None else self._bind_target(node.target, None)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+        self._bind_assignment(node.value, [node.target])
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+        self._bind_target(node.target, None)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self.visit(target)
+            self._bind_target(target, None)
+
+    def visit_With(self, node: ast.With) -> None:
+        self._visit_with_items(node.items, node.body)
+
+    visit_AsyncWith = visit_With
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self.visit(node.target)
+        self._bind_target(node.target, None)
+        for statement in node.body:
+            self.visit(statement)
+        for statement in node.orelse:
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For
+
+    def _visit_with_items(self, items: list[ast.withitem], body: list[ast.stmt]) -> None:
+        for item in items:
+            self.visit(item.context_expr)
+            if item.optional_vars is None:
+                continue
+            self.visit(item.optional_vars)
+            self._bind_assignment(item.context_expr, [item.optional_vars])
+        for statement in body:
+            self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        category, qualified = categorize_call(node, self.aliases)
+        category, qualified = categorize_call(
+            node,
+            self.aliases,
+            self.instance_bindings,
+            self.constructor_bindings,
+        )
         snippet = source_snippet(self.source, node)
         self.calls.append(
             CallSite(
@@ -238,9 +500,7 @@ class _CallVisitor(ast.NodeVisitor):
                 node=node,
             )
         )
-        if (qualified == "__import__" and node.args) or (
-            qualified == "importlib.import_module" and node.args
-        ):
+        if qualified in DYNAMIC_IMPORT_CALLS and node.args:
             module = constant_string(node.args[0])
             if module is not None:
                 self.dynamic_imports.append(

@@ -50,6 +50,21 @@ def test_setup_network_cmdclass_and_file_write_rules(make_sdist) -> None:
     } <= _rules(findings)
 
 
+def test_setup_network_values_and_constructors_are_not_network_findings(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "setup.py": (
+                "import httpx\n"
+                "from requests import Response\n"
+                "httpx.URL('https://example.test')\n"
+                "Response()\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert "setup_py_network" not in _rules(findings)
+
+
 def test_executable_pth_is_denied(make_wheel) -> None:
     artifact = make_wheel({"demo.pth": "import os; os.system('echo blocked')\n"})
     findings = scan_install_surface(str(artifact))

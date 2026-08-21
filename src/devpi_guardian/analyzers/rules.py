@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .types import Action
 
-RULESET_VERSION = "1.2.0"
+RULESET_VERSION = "1.2.1"
 
 
 @dataclass(frozen=True)

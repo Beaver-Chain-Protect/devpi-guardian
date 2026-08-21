@@ -57,6 +57,150 @@ def test_dynamic_import_string_arguments_are_detected() -> None:
     ]
 
 
+def test_network_classification_distinguishes_values_from_real_io() -> None:
+    source = """
+import httpx
+import requests
+from urllib import request
+from socket import create_connection
+
+httpx.URL("https://example.test")
+httpx.Response(200)
+httpx.Client()
+requests.Request("GET", "https://example.test")
+request.Request("https://example.test")
+httpx.get("https://example.test")
+requests.post("https://example.test")
+request.urlopen("https://example.test")
+create_connection(("example.test", 443))
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    network = [call.qualified_name for call in calls if call.category == "network"]
+    assert network == [
+        "httpx.get",
+        "requests.post",
+        "urllib.request.urlopen",
+        "socket.create_connection",
+    ]
+
+
+def test_client_io_tracks_bindings_contexts_and_reassignment() -> None:
+    source = """
+import httpx
+import requests
+from httpx import Client as HttpClient
+
+direct = httpx.Client().get("https://example.test")
+client = HttpClient()
+client.post("https://example.test")
+with requests.Session() as session:
+    session.request("https://example.test")
+session = {}
+session.get("not-network")
+with httpx.AsyncClient() as async_client:
+    async_client.stream("GET", "https://example.test")
+with httpx.Client() as persistent_client:
+    pass
+persistent_client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    network = [call for call in calls if call.category == "network"]
+    assert [(call.qualified_name, call.line) for call in network] == [
+        ("httpx.Client.get", 6),
+        ("httpx.Client.post", 8),
+        ("requests.Session.request", 10),
+        ("httpx.AsyncClient.stream", 14),
+        ("httpx.Client.get", 17),
+    ]
+
+
+def test_connection_and_opener_instance_io_is_precise() -> None:
+    source = """
+import http.client as client_http
+import socket
+from urllib.request import build_opener
+
+client_http.HTTPConnection("example.test")
+connection = client_http.HTTPSConnection("example.test")
+connection.connect()
+opener = build_opener()
+opener.open("https://example.test")
+sock = socket.socket()
+sock.sendall(b"payload")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    network = [call.qualified_name for call in calls if call.category == "network"]
+    assert network == [
+        "http.client.HTTPSConnection.connect",
+        "urllib.request.build_opener.open",
+        "socket.socket.sendall",
+    ]
+
+
+def test_constructor_function_alias_is_tracked() -> None:
+    source = """
+import httpx
+Client = httpx.Client
+client = Client()
+client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("httpx.Client.get", "network")]
+
+
+def test_custom_traversal_keeps_nested_calls_in_ast_children() -> None:
+    source = """
+import requests
+
+def typed(value: requests.get("https://example.test")):
+    return value
+
+values = {}
+values[requests.post("https://example.test")] = 1
+class Example(requests.get("https://example.test"), metaclass=requests.post()):
+    pass
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    network = [(call.qualified_name, call.line) for call in calls if call.category == "network"]
+    assert network == [
+        ("requests.get", 4),
+        ("requests.post", 8),
+        ("requests.get", 9),
+        ("requests.post", 9),
+    ]
+
+
+def test_module_client_binding_is_visible_in_function_but_parameter_shadows_it() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+def send():
+    client.get("https://example.test")
+def unrelated(client):
+    client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 5)
+    ]
+
+
+def test_importlib_dynamic_import_is_not_dynamic_exec_but_dangerous_literal_remains() -> None:
+    source = """
+import importlib
+importlib.import_module("pydantic.fields")
+importlib.import_module("requests")
+"""
+    calls, imports = scan_calls(ast.parse(source), source)
+    assert [call.qualified_name for call in calls if call.category == "dynamic_exec"] == []
+    assert [(item.module, item.line) for item in imports] == [
+        ("pydantic.fields", 3),
+        ("requests", 4),
+    ]
+
+
 def test_getattr_with_constant_string_is_resolved_as_process_call() -> None:
     source = "import os\ngetattr(os, 'sys' + 'tem')('echo blocked')\n"
     calls, _ = scan_calls(ast.parse(source), source)

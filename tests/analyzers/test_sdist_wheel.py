@@ -158,6 +158,26 @@ def test_wheel_only_dangerous_python_is_denied(make_sdist, make_wheel) -> None:
     assert any(item.action == "DENY" for item in findings)
 
 
+def test_wheel_only_literal_dynamic_import_keeps_dangerous_module_handling(
+    make_sdist, make_wheel
+) -> None:
+    sdist = make_sdist({"demo/__init__.py": ""})
+    wheel = make_wheel(
+        {
+            "demo/__init__.py": "",
+            "demo/lazy.py": (
+                "import importlib\n"
+                "importlib.import_module('pydantic.fields')\n"
+                "importlib.import_module('requests')\n"
+            ),
+        }
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    risky = [item for item in findings if item.rule == "wheel_only_risky_python"]
+    assert len(risky) == 1
+    assert risky[0].line == 3
+
+
 def test_wheel_only_credential_network_flow_is_denied(make_sdist, make_wheel) -> None:
     sdist = make_sdist({"demo/__init__.py": ""})
     wheel = make_wheel(
