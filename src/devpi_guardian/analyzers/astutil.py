@@ -510,7 +510,7 @@ def _instance_method_receiver(
 def _relative_receiver_path(path: str, receiver: str) -> str | None:
     prefix = f"{receiver}."
     if path.startswith(prefix):
-        return path[len(prefix) :]
+        return path.removeprefix(prefix)
     return None
 
 
