@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from devpi_guardian.analyzers import Finding
+from devpi_guardian.verdicts.models import ClaimedArtifact, Decision, VerdictInput
+from devpi_guardian.worker.models import (
+    AnalysisBundle,
+    AnalysisEvidence,
+    AnalysisReport,
+    AnalysisStep,
+    VerifiedArtifact,
+)
+from devpi_guardian.worker.pipeline import QuarantineWorker, WorkerCycleStatus
+
+SHA256 = "a" * 64
+
+
+def artifact(tmp_path: Path) -> VerifiedArtifact:
+    path = tmp_path / "demo.whl"
+    path.write_bytes(b"wheel")
+    return VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0-py3-none-any.whl",
+        sha256=SHA256,
+        size_bytes=5,
+        local_path=path,
+    )
+
+
+class Store:
+    def __init__(self, claim: ClaimedArtifact | None) -> None:
+        self.claim = claim
+        self.recorded = []
+        self.errors = []
+
+    def claim_next(self, worker_id, lease_until):
+        self.claim_args = worker_id, lease_until
+        claim, self.claim = self.claim, None
+        return claim
+
+    def record_verdict(self, claim, verdict, evidence):
+        self.recorded.append((claim, verdict, tuple(evidence)))
+
+    def mark_analysis_error(self, claim, error):
+        self.errors.append((claim, error))
+
+    def recover_expired_claims(self, now):
+        self.recovered_at = now
+        return 2
+
+
+class Preparer:
+    def __init__(self, bundle) -> None:
+        self.bundle = bundle
+
+    def prepare(self, claim):
+        self.claim = claim
+        return self.bundle
+
+
+class Engine:
+    def __init__(self, report) -> None:
+        self.report = report
+
+    def analyze(self, bundle):
+        self.bundle = bundle
+        return self.report
+
+
+class Policy:
+    def evaluate(self, target, report):
+        self.call = target, report
+        return VerdictInput(
+            sha256=target.sha256,
+            decision=Decision.REVIEW,
+            score=30,
+            policy_version="policy-1",
+            analyzer_version=report.analyzer_version,
+            baseline_sha256=report.baseline_sha256,
+        )
+
+
+def make_claim(now: datetime) -> ClaimedArtifact:
+    return ClaimedArtifact(
+        sha256=SHA256,
+        size_bytes=5,
+        worker_id="worker-1",
+        lease_expires_at=now + timedelta(minutes=5),
+        lease_token="b" * 64,
+    )
+
+
+def test_worker_runs_one_analysis_and_records_attributed_evidence(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = artifact(tmp_path)
+    bundle = AnalysisBundle(target=target)
+    finding = Finding(
+        rule="credential_to_network",
+        action="DENY",
+        file="demo/update.py",
+        line=41,
+        snippet="requests.post(secret)",
+        message="credential is sent to the network",
+        source="os.environ",
+        sink="requests.post",
+    )
+    report = AnalysisReport(
+        analyzer_version="analyzers-1",
+        has_baseline=True,
+        baseline_sha256="c" * 64,
+        evidence=(
+            AnalysisEvidence(
+                analyzer="F7",
+                finding=finding,
+                origin="diff_changed",
+                baseline_tier="same_tag",
+            ),
+        ),
+        steps=(AnalysisStep("F7", "completed"),),
+    )
+    store = Store(make_claim(now))
+    preparer = Preparer(bundle)
+    engine = Engine(report)
+    policy = Policy()
+    worker = QuarantineWorker(
+        store=store,
+        preparer=preparer,
+        analysis_engine=engine,
+        policy_engine=policy,
+        worker_id="worker-1",
+        lease_duration=timedelta(minutes=5),
+        now=lambda: now,
+    )
+
+    result = worker.run_once()
+
+    assert result.status is WorkerCycleStatus.COMPLETED
+    assert result.sha256 == SHA256
+    assert engine.bundle is bundle
+    assert len(store.recorded) == 1
+    _, verdict, evidence = store.recorded[0]
+    assert verdict.decision is Decision.REVIEW
+    assert len(evidence) == 1
+    assert evidence[0].rule_id == "credential_to_network"
+    assert evidence[0].details == {
+        "analyzer": "F7",
+        "baseline_tier": "same_tag",
+        "fingerprint": evidence[0].details["fingerprint"],
+        "origin": "diff_changed",
+        "sink": "requests.post",
+        "snippet": "requests.post(secret)",
+        "source": "os.environ",
+    }
+    assert store.errors == []
+
+
+def test_worker_marks_claim_error_when_preparation_fails(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    store = Store(make_claim(now))
+
+    class BrokenPreparer:
+        def prepare(self, claim):
+            raise RuntimeError("download failed")
+
+    worker = QuarantineWorker(
+        store=store,
+        preparer=BrokenPreparer(),
+        analysis_engine=Engine(None),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    result = worker.run_once()
+
+    assert result.status is WorkerCycleStatus.ERROR
+    assert result.sha256 == SHA256
+    assert store.recorded == []
+    assert store.errors == [(store.errors[0][0], "RuntimeError: download failed")]
+
+
+def test_worker_returns_idle_without_calling_dependencies() -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    store = Store(None)
+    worker = QuarantineWorker(
+        store=store,
+        preparer=object(),
+        analysis_engine=object(),
+        policy_engine=object(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    result = worker.run_once()
+
+    assert result.status is WorkerCycleStatus.IDLE
+    assert result.sha256 is None
+
+
+def test_worker_recovers_expired_claims() -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    store = Store(None)
+    worker = QuarantineWorker(
+        store=store,
+        preparer=object(),
+        analysis_engine=object(),
+        policy_engine=object(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    assert worker.recover_expired_claims() == 2
+    assert store.recovered_at == now
