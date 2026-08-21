@@ -501,6 +501,98 @@ class Api:
     ]
 
 
+def test_class_collector_clears_inherited_bindings_for_local_names() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+Client = httpx.Client
+
+class Api:
+    def __init__(self, client, Client):
+        self.client = client
+        self.other = Client()
+
+    def run(self):
+        self.client.get("not-network")
+        self.other.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_class_collector_invalidates_constructor_aliases_on_loop_and_except_targets() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        Client = httpx.Client
+        for Client in values:
+            pass
+        self.client = Client()
+
+    def run(self):
+        self.client.get("not-network")
+
+class Other:
+    def __init__(self):
+        Client = httpx.Client
+        try:
+            pass
+        except Exception as Client:
+            pass
+        self.client = Client()
+
+    def run(self):
+        self.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_class_collector_restores_name_bindings_after_comprehension() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        client = httpx.Client()
+        [value for client in values]
+        self.client = client
+
+    def run(self):
+        self.client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 11)
+    ]
+
+
+def test_guarded_roots_require_active_imports_after_parameter_shadowing() -> None:
+    source = """
+import shutil
+from pathlib import Path
+
+def copy(shutil):
+    shutil.copy("a", "b")
+
+def path(Path):
+    Path("~/.ssh/config")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category in {"file_write", "credential_path"}] == []
+
+
+def test_relative_imports_bind_as_noncanonical_local_names() -> None:
+    source = """
+from . import httpx
+httpx.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
 def test_module_binding_deletion_is_not_carried_into_class_summaries() -> None:
     source = """
 import httpx

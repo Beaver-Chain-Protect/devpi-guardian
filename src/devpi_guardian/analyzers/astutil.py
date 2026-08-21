@@ -86,7 +86,14 @@ DYNAMIC_EXEC_CALLS = frozenset(
 DYNAMIC_IMPORT_CALLS = frozenset({"__import__", "builtins.__import__", "importlib.import_module"})
 _ALIASED_ROOTS = frozenset(
     name.split(".", 1)[0]
-    for name in (*NETWORK_CALLS, *NETWORK_CONSTRUCTORS, *PROCESS_CALLS, "importlib")
+    for name in (
+        *NETWORK_CALLS,
+        *NETWORK_CONSTRUCTORS,
+        *PROCESS_CALLS,
+        "importlib",
+        "shutil",
+        "Path",
+    )
 )
 SENSITIVE_ENV_MARKERS = (
     "TOKEN",
@@ -179,6 +186,10 @@ class ImportAliasVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module is None:
+            for imported in node.names:
+                if imported.name != "*":
+                    visible = imported.asname or imported.name
+                    self.aliases[visible] = f".{imported.name}"
             return
         for imported in node.names:
             if imported.name == "*":
@@ -517,12 +528,22 @@ class _ClassAttributeCollector(ast.NodeVisitor):
     ) -> None:
         self.receiver = receiver
         self.aliases = dict(aliases)
-        for name in local_names:
-            self.aliases.pop(name, None)
-        self.module_instances = module_instances
+        self.module_instances = dict(module_instances)
         self.constructors = dict(module_constructors)
         self.known = dict(initial or {})
         self.events: list[tuple[str, str | None]] = []
+        for name in local_names:
+            self._clear_local_name(name)
+
+    def _clear_local_name(self, name: str) -> None:
+        self.aliases.pop(name, None)
+        _clear_reference_path(self.module_instances, name)
+        _clear_reference_path(self.constructors, name)
+        _clear_reference_path(self.known, name)
+
+    def _clear_target_state(self, target: ast.AST) -> None:
+        for name in _binding_names(target):
+            self._clear_local_name(name)
 
     def _invalidate_alias_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
@@ -531,14 +552,22 @@ class _ClassAttributeCollector(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for imported in node.names:
             visible = imported.asname or imported.name.split(".", 1)[0]
+            self._clear_local_name(visible)
             self.aliases[visible] = imported.name if imported.asname else visible
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module is None:
+            for imported in node.names:
+                if imported.name != "*":
+                    visible = imported.asname or imported.name
+                    self._clear_local_name(visible)
+                    self.aliases[visible] = f".{imported.name}"
             return
         for imported in node.names:
             if imported.name != "*":
-                self.aliases[imported.asname or imported.name] = f"{node.module}.{imported.name}"
+                visible = imported.asname or imported.name
+                self._clear_local_name(visible)
+                self.aliases[visible] = f"{node.module}.{imported.name}"
 
     def _kind(self, value: ast.AST | None) -> str | None:
         if value is None:
@@ -603,6 +632,7 @@ class _ClassAttributeCollector(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:
+            self._clear_target_state(target)
             self._update_constructor_alias(target, node.value)
             self._record(target, node.value)
             self._invalidate_alias_target(target)
@@ -612,12 +642,16 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
+            self._clear_target_state(node.target)
             self._update_constructor_alias(node.target, node.value)
+        else:
+            self._clear_target_state(node.target)
         self._record(node.target, node.value)
         self._invalidate_alias_target(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
+        self._clear_target_state(node.target)
         self._update_constructor_alias(node.target, node.value)
         self._record(node.target, node.value)
         self._invalidate_alias_target(node.target)
@@ -627,16 +661,19 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         self.visit(node.value)
         self._record(node.target, None)
         self._invalidate_alias_target(node.target)
+        self._clear_target_state(node.target)
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
             self._record(target, None)
             self._invalidate_alias_target(target)
+            self._clear_target_state(target)
 
     def visit_For(self, node: ast.For) -> None:
         self.visit(node.iter)
         self._record(node.target, None)
         self._invalidate_alias_target(node.target)
+        self._clear_target_state(node.target)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
 
@@ -648,25 +685,46 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             if item.optional_vars is not None:
                 self._record(item.optional_vars, item.context_expr)
                 self._invalidate_alias_target(item.optional_vars)
+                self._clear_target_state(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
 
     visit_AsyncWith = visit_With
 
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self._clear_local_name(node.name)
+        for statement in node.body:
+            self.visit(statement)
+        if node.name is not None:
+            self._clear_local_name(node.name)
+
     def _visit_comprehension(
         self, generators: list[ast.comprehension], expressions: list[ast.AST]
     ) -> None:
         aliases = self.aliases
+        module_instances = self.module_instances
+        constructors = self.constructors
+        known = self.known
         for generator in generators:
             self.visit(generator.iter)
             self.aliases = dict(self.aliases)
+            self.module_instances = dict(self.module_instances)
+            self.constructors = dict(self.constructors)
+            self.known = dict(self.known)
             self._record(generator.target, None)
             self._invalidate_alias_target(generator.target)
+            self._clear_target_state(generator.target)
             for condition in generator.ifs:
                 self.visit(condition)
         for expression in expressions:
             self.visit(expression)
         self.aliases = aliases
+        self.module_instances = module_instances
+        self.constructors = constructors
+        self.known = known
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt])
@@ -797,16 +855,25 @@ class _CallVisitor(ast.NodeVisitor):
     def _bind_import(self, node: ast.Import) -> None:
         for imported in node.names:
             visible = imported.asname or imported.name.split(".", 1)[0]
+            _clear_reference_path(self.instance_bindings, visible)
+            _clear_reference_path(self.constructor_bindings, visible)
             self.active_aliases[visible] = imported.name if imported.asname else visible
 
     def _bind_import_from(self, node: ast.ImportFrom) -> None:
         if node.module is None:
+            for imported in node.names:
+                if imported.name != "*":
+                    visible = imported.asname or imported.name
+                    _clear_reference_path(self.instance_bindings, visible)
+                    _clear_reference_path(self.constructor_bindings, visible)
+                    self.active_aliases[visible] = f".{imported.name}"
             return
         for imported in node.names:
             if imported.name != "*":
-                self.active_aliases[imported.asname or imported.name] = (
-                    f"{node.module}.{imported.name}"
-                )
+                visible = imported.asname or imported.name
+                _clear_reference_path(self.instance_bindings, visible)
+                _clear_reference_path(self.constructor_bindings, visible)
+                self.active_aliases[visible] = f"{node.module}.{imported.name}"
 
     def visit_Import(self, node: ast.Import) -> None:
         self._bind_import(node)
