@@ -222,6 +222,104 @@ def _canonical_requirement_name(requirement: str) -> str:
     return text.lower().replace("_", "-").replace(".", "-")
 
 
+def _is_active_sdist_build_file(
+    internal_path: str,
+    *,
+    artifact_kind: _ArtifactKind,
+    all_files: tuple[str, ...],
+) -> bool:
+    """Recognize build metadata at an sdist archive/common project root only."""
+
+    if artifact_kind != "sdist":
+        return False
+    path = PurePosixPath(internal_path)
+    if path.name.lower() not in {"setup.py", "pyproject.toml", "setup.cfg"}:
+        return False
+    if len(path.parts) == 1:
+        return True
+
+    file_parts = [PurePosixPath(candidate).parts for candidate in all_files]
+    if not file_parts or not all(len(parts) > 1 for parts in file_parts):
+        return False
+    common_root = file_parts[0][0].casefold()
+    if not all(parts[0].casefold() == common_root for parts in file_parts):
+        return False
+    return len(path.parts) == 2 and path.parts[0].casefold() == common_root
+
+
+def _bounded_backend_paths(values: list[str], *, max_items: int = 5) -> str:
+    unique = sorted(set(values))
+    shown = [value if len(value) <= 24 else value[:23] + "…" for value in unique[:max_items]]
+    if len(unique) > max_items:
+        shown.append(f"+{len(unique) - max_items}개")
+    return repr(shown)
+
+
+def _is_contained_backend_path(value: str) -> bool:
+    """Validate a backend-path without consulting the extracted filesystem."""
+
+    if "\x00" in value:
+        return False
+    portable = value.replace("\\", "/")
+    drive, _ = ntpath.splitdrive(portable)
+    if drive or portable.startswith("/"):
+        return False
+
+    depth = 0
+    for part in portable.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        else:
+            depth += 1
+    return True
+
+
+def _backend_path_findings(build_system: dict[object, object], internal_path: str) -> list[Finding]:
+    if "backend-path" not in build_system:
+        return []
+    backend_path = build_system["backend-path"]
+    if not isinstance(backend_path, list) or any(
+        not isinstance(value, str) for value in backend_path
+    ):
+        return [
+            _rule_finding(
+                "in_tree_build_backend",
+                file=internal_path,
+                line=None,
+                snippet="invalid backend-path configuration: expected list[str]",
+            )
+        ]
+    if not backend_path:
+        return []
+
+    valid = [value for value in backend_path if _is_contained_backend_path(value)]
+    unsafe = [value for value in backend_path if not _is_contained_backend_path(value)]
+    findings: list[Finding] = []
+    if valid:
+        findings.append(
+            _rule_finding(
+                "in_tree_build_backend",
+                file=internal_path,
+                line=None,
+                snippet=f"backend-path={_bounded_backend_paths(valid)}",
+            )
+        )
+    if unsafe:
+        findings.append(
+            _rule_finding(
+                "unsafe_backend_path",
+                file=internal_path,
+                line=None,
+                snippet=f"unsafe backend-path={_bounded_backend_paths(unsafe)}",
+            )
+        )
+    return findings
+
+
 def _pyproject_findings(path: Path, internal_path: str) -> list[Finding]:
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -232,6 +330,7 @@ def _pyproject_findings(path: Path, internal_path: str) -> list[Finding]:
     if not isinstance(build_system, dict):
         return []
     findings: list[Finding] = []
+    findings.extend(_backend_path_findings(build_system, internal_path))
     backend = build_system.get("build-backend")
     if isinstance(backend, str) and backend not in STANDARD_BUILD_BACKENDS:
         findings.append(
@@ -391,22 +490,11 @@ def _is_root_setup_py(
     all_files: tuple[str, ...],
 ) -> bool:
     """Recognize only the project's root/common-root build setup.py."""
-
-    path = PurePosixPath(internal_path)
-    if path.name.lower() != "setup.py":
-        return False
-    if len(path.parts) == 1:
-        return True
-    if artifact_kind == "wheel":
-        return False
-
-    file_parts = [PurePosixPath(candidate).parts for candidate in all_files]
-    if not file_parts or not all(len(parts) > 1 for parts in file_parts):
-        return False
-    common_root = file_parts[0][0].casefold()
-    if not all(parts[0].casefold() == common_root for parts in file_parts):
-        return False
-    return tuple(part.casefold() for part in path.parts[1:]) == ("setup.py",)
+    return _is_active_sdist_build_file(
+        internal_path,
+        artifact_kind=artifact_kind,
+        all_files=all_files,
+    )
 
 
 def _wheel_script_path(internal_path: str) -> bool:
@@ -849,10 +937,18 @@ def _scan_extracted(
             elif source is not None and tree is not None:
                 findings.extend(_setup_py_findings(internal_path, source, tree))
                 findings.extend(_setup_py_entry_point_findings(internal_path, source, tree))
-        elif name == "pyproject.toml":
+        elif name == "pyproject.toml" and _is_active_sdist_build_file(
+            internal_path,
+            artifact_kind=artifact_kind,
+            all_files=extracted.files,
+        ):
             findings.extend(_pyproject_findings(path, internal_path))
             findings.extend(_pyproject_entry_point_findings(path, internal_path))
-        elif name == "setup.cfg":
+        elif name == "setup.cfg" and _is_active_sdist_build_file(
+            internal_path,
+            artifact_kind=artifact_kind,
+            all_files=extracted.files,
+        ):
             findings.extend(_setup_cfg_findings(path, internal_path))
         elif name == "entry_points.txt" and any(
             part.lower().endswith((".dist-info", ".egg-info"))

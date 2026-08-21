@@ -109,6 +109,25 @@ F8 wheel 설치 스크립트 규칙은 다음과 같습니다.
 | `wheel_install_script_risky` | REVIEW | Python으로 인식된 설치 스크립트의 process/network/dynamic-exec/file-write 호출 및 지정된 literal dynamic import |
 | `wheel_install_script_credential_network` | DENY | credential source가 network sink로 흐르는 확인된 데이터 흐름 |
 
+F8의 `setup.py`, `pyproject.toml`, `setup.cfg` 빌드 설정은 sdist에서만 활성화합니다.
+아카이브 루트의 파일 또는 모든 파일이 공유하는 통상적인 sdist 공통 루트 바로 아래의
+파일만 프로젝트 빌드 설정으로 취급하며, `docs/example/` 같은 중첩 파일과 wheel의
+루트 lookalike는 무시합니다. wheel의 `*.dist-info/entry_points.txt`는 설치 메타데이터로
+계속 검사합니다.
+
+PEP 517 `build-system.backend-path`는 다음 규칙으로 제한적으로 기록합니다.
+
+| 규칙 | 기본 action | 적용 범위 |
+| --- | --- | --- |
+| `in_tree_build_backend` | REVIEW | 활성 sdist `pyproject.toml`의 비어 있지 않은 유효한 상대 경로 목록 또는 잘못된 설정의 방어적 근거 |
+| `unsafe_backend_path` | DENY | 절대·드라이브 경로, NUL, 또는 `..`로 프로젝트 루트 밖으로 정규화되는 backend-path 항목 |
+
+경로는 파일시스템을 resolve하거나 backend 코드를 import·실행하지 않고 portable 구분자로
+검사합니다. 유효 항목은 정렬·제한된 한 건으로 요약하고, 잘못된 항목은 별도 제한된 DENY
+근거로 요약합니다. `backend/../backend_impl`처럼 정규화 후 소스 트리 안에 남는 경로는
+유효한 in-tree backend로 처리합니다. 목록이 비어 있으면 근거를 만들지 않으며, 목록 타입이
+아니거나 문자열이 아닌 항목이 있으면 `in_tree_build_backend` REVIEW 한 건으로 방어합니다.
+
 F9 메타데이터 의존성 규칙은 다음과 같습니다.
 
 | 규칙 | 기본 action | 적용 범위 |

@@ -22,6 +22,12 @@ RULES: dict[str, Rule] = {
     "setup_py_cmdclass": Rule("DENY", "setup.py가 설치 명령을 사용자 정의 코드로 재정의합니다."),
     "setup_py_file_write": Rule("REVIEW", "setup.py가 설치 중 파일을 쓰거나 이동합니다."),
     "nonstandard_build_backend": Rule("REVIEW", "표준 허용 목록에 없는 빌드 백엔드를 사용합니다."),
+    "in_tree_build_backend": Rule(
+        "REVIEW", "프로젝트 소스 트리 안의 빌드 백엔드 경로를 사용합니다."
+    ),
+    "unsafe_backend_path": Rule(
+        "DENY", "PEP 517 빌드 백엔드 경로가 프로젝트 소스 트리 밖을 가리킵니다."
+    ),
     "unknown_build_requirement": Rule(
         "REVIEW", "알려진 빌드 도구 목록에 없는 빌드 의존성이 있습니다."
     ),

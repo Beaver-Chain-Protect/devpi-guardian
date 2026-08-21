@@ -160,9 +160,132 @@ def test_wheel_install_script_setup_py_is_not_build_setup(make_wheel) -> None:
     assert not any(rule.startswith("setup_py_") for rule in rules)
 
 
+def test_nested_build_configs_are_not_active(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "docs/example/pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\nbackend-path = ['../backend']\n"
+            ),
+            "docs/example/setup.cfg": (
+                "[options.entry_points]\nconsole_scripts =\n    example = docs:main\n"
+            ),
+        }
+    )
+    assert scan_install_surface(str(artifact)) == []
+
+
+def test_wheel_root_build_config_lookalikes_are_not_active(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\nbackend-path = ['backend']\n"
+            ),
+            "setup.cfg": "[options.entry_points]\nconsole_scripts =\n    demo = demo:main\n",
+        }
+    )
+    assert scan_install_surface(str(artifact)) == []
+
+
+def test_root_pyproject_backend_path_is_reviewed(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                "backend-path = ['backend_impl', 'backend/../backend_impl']\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    backend = [item for item in findings if item.rule == "in_tree_build_backend"]
+    assert len(backend) == 1
+    assert backend[0].action == "REVIEW"
+    assert "backend_impl" in backend[0].snippet
+    assert "unsafe_backend_path" not in _rules(findings)
+
+
+@pytest.mark.parametrize(
+    "backend_path",
+    ["/tmp/backend", r"C:\\backend", "../backend", "backend\x00impl"],
+)
+def test_unsafe_backend_path_is_denied(make_sdist, backend_path: str) -> None:
+    toml_value = '"backend\\u0000impl"' if "\x00" in backend_path else repr(backend_path)
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                f"backend-path = [{toml_value}]\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    unsafe = [item for item in findings if item.rule == "unsafe_backend_path"]
+    assert len(unsafe) == 1
+    assert unsafe[0].action == "DENY"
+    assert "in_tree_build_backend" not in _rules(findings)
+
+
+def test_mixed_backend_paths_report_valid_and_unsafe_sets(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                "backend-path = ['backend', '../escape', 'impl/../backend_impl']\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert {item.rule for item in findings} >= {
+        "in_tree_build_backend",
+        "unsafe_backend_path",
+    }
+    assert len([item for item in findings if item.rule == "in_tree_build_backend"]) == 1
+    assert len([item for item in findings if item.rule == "unsafe_backend_path"]) == 1
+
+
+@pytest.mark.parametrize("backend_path", ["'backend'", "[1, 'backend']", "{foo = 'bar'}"])
+def test_invalid_backend_path_configuration_is_bounded_review(
+    make_sdist, backend_path: str
+) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                f"backend-path = {backend_path}\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    backend = [item for item in findings if item.rule == "in_tree_build_backend"]
+    assert len(backend) == 1
+    assert backend[0].action == "REVIEW"
+    assert "invalid" in backend[0].snippet
+    assert len(backend[0].snippet) <= 200
+
+
 def test_sdist_common_root_setup_py_remains_build_setup(make_sdist) -> None:
     artifact = make_sdist({"setup.py": "import subprocess\nsubprocess.run(['echo', 'x'])\n"})
     assert "setup_py_process" in _rules(scan_install_surface(str(artifact)))
+
+
+def test_rootless_sdist_build_configs_remain_active(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\n"
+            ),
+            "setup.cfg": "[options.entry_points]\nconsole_scripts =\n    demo = demo:main\n",
+        },
+        prefix=None,
+    )
+    rules = _rules(scan_install_surface(str(artifact)))
+    assert {"nonstandard_build_backend", "setup_cfg_entry_points", "entry_point"} <= rules
 
 
 def test_setup_network_cmdclass_and_file_write_rules(make_sdist) -> None:
