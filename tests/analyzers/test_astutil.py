@@ -593,6 +593,50 @@ httpx.get("not-network")
     assert [call for call in calls if call.category == "network"] == []
 
 
+def test_class_collector_preserves_with_item_instance_bindings() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        with httpx.Client() as client:
+            self.client = client
+
+    def run(self):
+        self.client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 10)
+    ]
+
+
+def test_class_collector_local_names_do_not_erase_receiver_summary_paths() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client = httpx.Client()
+        self.transport.client = httpx.Client()
+
+    def clone(self):
+        client = {}
+        self.other = self.client
+        transport = {}
+        self.other_nested = self.transport.client
+
+    def run(self):
+        self.other.get("https://one.example")
+        self.other_nested.get("https://two.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 16),
+        ("httpx.Client.get", 17),
+    ]
+
+
 def test_module_binding_deletion_is_not_carried_into_class_summaries() -> None:
     source = """
 import httpx

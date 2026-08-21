@@ -530,7 +530,8 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         self.aliases = dict(aliases)
         self.module_instances = dict(module_instances)
         self.constructors = dict(module_constructors)
-        self.known = dict(initial or {})
+        self.known: dict[str, str] = {}
+        self.receiver_known = dict(initial or {})
         self.events: list[tuple[str, str | None]] = []
         for name in local_names:
             self._clear_local_name(name)
@@ -581,41 +582,31 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             if kind is None:
                 relative = _relative_receiver_path(reference, self.receiver)
                 if relative is not None:
-                    kind = self.known.get(relative)
+                    kind = self.receiver_known.get(relative)
         return kind
 
     def _record(self, target: ast.AST, value: ast.AST | None) -> None:
         kind = self._kind(value)
         for path in _target_reference_paths(target):
             relative = _relative_receiver_path(path, self.receiver)
+            binding_map = self.receiver_known if relative is not None else self.known
+            binding_path = relative if relative is not None else path
             descendants = [
                 known_path
-                for known_path in self.known
-                if known_path.startswith(f"{path}.")
-                or (relative is not None and known_path.startswith(f"{relative}."))
+                for known_path in binding_map
+                if known_path.startswith(f"{binding_path}.")
             ]
             for descendant in descendants:
-                descendant_relative = _relative_receiver_path(descendant, self.receiver)
-                if (
-                    descendant_relative is None
-                    and relative is not None
-                    and descendant.startswith(f"{relative}.")
-                ):
-                    descendant_relative = descendant
-                if descendant_relative is not None:
-                    self.events.append((descendant_relative, None))
-            _clear_reference_path(self.known, path)
-            if relative is not None:
-                for known_path in list(self.known):
-                    if known_path == relative or known_path.startswith(f"{relative}."):
-                        self.known.pop(known_path, None)
+                if relative is not None:
+                    self.events.append((descendant, None))
+            _clear_reference_path(binding_map, binding_path)
             if relative is not None:
                 self.events.append((relative, kind))
                 if kind is None:
-                    self.known.pop(relative, None)
+                    self.receiver_known.pop(relative, None)
                 else:
-                    self.known[relative] = kind
-            if kind is not None:
+                    self.receiver_known[relative] = kind
+            elif kind is not None:
                 self.known[path] = kind
 
     def _update_constructor_alias(self, target: ast.AST, value: ast.AST) -> None:
@@ -683,9 +674,9 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         for item in node.items:
             self.visit(item.context_expr)
             if item.optional_vars is not None:
+                self._clear_target_state(item.optional_vars)
                 self._record(item.optional_vars, item.context_expr)
                 self._invalidate_alias_target(item.optional_vars)
-                self._clear_target_state(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
 
@@ -708,12 +699,14 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         module_instances = self.module_instances
         constructors = self.constructors
         known = self.known
+        receiver_known = self.receiver_known
         for generator in generators:
             self.visit(generator.iter)
             self.aliases = dict(self.aliases)
             self.module_instances = dict(self.module_instances)
             self.constructors = dict(self.constructors)
             self.known = dict(self.known)
+            self.receiver_known = dict(self.receiver_known)
             self._record(generator.target, None)
             self._invalidate_alias_target(generator.target)
             self._clear_target_state(generator.target)
@@ -725,6 +718,7 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         self.module_instances = module_instances
         self.constructors = constructors
         self.known = known
+        self.receiver_known = receiver_known
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt])
