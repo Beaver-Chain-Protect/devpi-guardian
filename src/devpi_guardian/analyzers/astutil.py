@@ -386,6 +386,18 @@ class _CallVisitor(ast.NodeVisitor):
         self._instance_scopes.pop()
         self._constructor_scopes.pop()
 
+    def _visit_scope_expr(self, expression: ast.AST, *, clear_names: Iterable[str] = ()) -> None:
+        instances = dict(self.instance_bindings)
+        constructors = dict(self.constructor_bindings)
+        for name in clear_names:
+            instances.pop(name, None)
+            constructors.pop(name, None)
+        self._instance_scopes.append(instances)
+        self._constructor_scopes.append(constructors)
+        self.visit(expression)
+        self._instance_scopes.pop()
+        self._constructor_scopes.pop()
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
@@ -416,6 +428,20 @@ class _CallVisitor(ast.NodeVisitor):
         self._visit_scope_body(node.body, clear_names=parameter_names)
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        parameter_names = {
+            argument.arg
+            for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        }
+        if node.args.vararg:
+            parameter_names.add(node.args.vararg.arg)
+        if node.args.kwarg:
+            parameter_names.add(node.args.kwarg.arg)
+        self._visit_scope_expr(node.body, clear_names=parameter_names)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for decorator in node.decorator_list:
@@ -457,6 +483,19 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(target)
             self._bind_target(target, None)
 
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self.instance_bindings.pop(node.name, None)
+            self.constructor_bindings.pop(node.name, None)
+        for statement in node.body:
+            self.visit(statement)
+        # Python clears ``except ... as name`` at the end of the handler.
+        if node.name is not None:
+            self.instance_bindings.pop(node.name, None)
+            self.constructor_bindings.pop(node.name, None)
+
     def visit_With(self, node: ast.With) -> None:
         self._visit_with_items(node.items, node.body)
 
@@ -472,6 +511,34 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     visit_AsyncFor = visit_For
+
+    def _visit_comprehension(
+        self, generators: list[ast.comprehension], expressions: list[ast.AST]
+    ) -> None:
+        self._instance_scopes.append(dict(self.instance_bindings))
+        self._constructor_scopes.append(dict(self.constructor_bindings))
+        for generator in generators:
+            self.visit(generator.iter)
+            self.visit(generator.target)
+            self._bind_target(generator.target, None)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for expression in expressions:
+            self.visit(expression)
+        self._instance_scopes.pop()
+        self._constructor_scopes.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
 
     def _visit_with_items(self, items: list[ast.withitem], body: list[ast.stmt]) -> None:
         for item in items:

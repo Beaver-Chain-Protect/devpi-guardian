@@ -187,6 +187,53 @@ def unrelated(client):
     ]
 
 
+def test_nested_lambda_parameter_shadows_outer_client_but_capture_remains_network() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+captured = lambda: client.get("https://example.test")
+shadowed = lambda client: client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 4)
+    ]
+
+
+def test_exception_target_shadows_and_then_clears_outer_client() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+try:
+    pass
+except Exception as client:
+    client.get("not-network")
+client.get("https://example.test")
+    """
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_comprehension_target_shadows_outer_client_in_element_and_nested_generators() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+captured = [client.get("https://example.test") for _ in ({},)]
+shadowed = [client.get("not-network") for client in ({},)]
+nested = [
+    client.get("not-network")
+    for values in ({},)
+    for client in values
+]
+client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 4),
+        ("httpx.Client.get", 11),
+    ]
+
+
 def test_importlib_dynamic_import_is_not_dynamic_exec_but_dangerous_literal_remains() -> None:
     source = """
 import importlib
