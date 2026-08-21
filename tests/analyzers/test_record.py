@@ -154,6 +154,16 @@ def test_signature_siblings_may_be_unlisted(tmp_path):
     assert _rules(artifact) == []
 
 
+def test_missing_signature_listed_in_record_is_denied(tmp_path):
+    files = {"demo/__init__.py": b""}
+    record = _record_for(
+        files,
+        [("demo-1.0.0.dist-info/RECORD.jws", "", "")],
+    )
+    artifact = _wheel(tmp_path, files, record)
+    assert any(f.rule == "wheel_record_integrity" for f in _rules(artifact))
+
+
 def test_sdist_is_unaffected(make_sdist):
     artifact = make_sdist({"demo/__init__.py": ""})
     assert not _rules(artifact)

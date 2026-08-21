@@ -644,8 +644,6 @@ def _wheel_record_findings(extracted: ExtractedArtifact) -> list[Finding]:
     for path, (hash_value, size_value) in sorted(seen.items()):
         is_self = path == record_path
         if path not in extracted_files:
-            if path in signature_paths:
-                continue
             findings.append(_record_finding(path, f"추출되지 않은 RECORD 경로: {path}"))
             continue
         file_path = extracted.root / Path(*PurePosixPath(path).parts)
