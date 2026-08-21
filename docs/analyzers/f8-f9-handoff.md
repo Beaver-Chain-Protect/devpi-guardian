@@ -11,7 +11,8 @@ entry point, 네이티브·실행 파일, 경로 이탈과 압축 폭탄을 검�
 빌드 메타데이터 차이를 제거하고 Python AST를 정규화한 뒤, wheel에만 추가된 위험
 코드·실행 가능한 `.pth`·네이티브 파일과 entry point/AST 불일치를 보고합니다.
 `src/` 기반 sdist와 wheel 루트의 차이, 서로 다른 entry point 표기도 비교 전에
-정규화합니다.
+정규화합니다. 또한 sdist의 `PKG-INFO`와 wheel의 `*.dist-info/METADATA`에서
+`Requires-Dist`를 비교해 런타임 의존성 변경을 `REVIEW`로 보고합니다.
 
 이 모듈은 devpi 훅, 판정 DB, 워커, REST API, CLI 또는 최종 `ALLOW/REVIEW/DENY`
 정책을 구현하지 않습니다. 결과가 비어 있다는 것은 정의된 규칙에서 탐지되지 않았다는
@@ -107,6 +108,27 @@ F8 wheel 설치 스크립트 규칙은 다음과 같습니다.
 | `wheel_install_script` | REVIEW | wheel 최상위 `<distribution>.data/scripts/<file>` regular file 하나당 한 건 |
 | `wheel_install_script_risky` | REVIEW | Python으로 인식된 설치 스크립트의 process/network/dynamic-exec/file-write 호출 및 지정된 literal dynamic import |
 | `wheel_install_script_credential_network` | DENY | credential source가 network sink로 흐르는 확인된 데이터 흐름 |
+
+F9 메타데이터 의존성 규칙은 다음과 같습니다.
+
+| 규칙 | 기본 action | 적용 범위 |
+| --- | --- | --- |
+| `requires_dist_mismatch` | REVIEW | sdist `PKG-INFO`와 wheel `*.dist-info/METADATA`의 의미적으로 다른 `Requires-Dist` 집합 |
+
+`Requires-Dist` 비교는 sdist의 `Metadata-Version`을 기준으로 합니다. 버전이 없거나
+해석되지 않거나 2.2 미만이면 비교하지 않습니다. 2.2 이상 2.6 미만에서 sdist가
+`Dynamic: Requires-Dist`를 선언하면 비교하지 않고, 그 외에는 두 집합이 같아야 합니다.
+2.6 이상에서 `Dynamic: Requires-Dist`이면 wheel이 의존성을 추가하는 것은 허용하지만,
+sdist의 값을 삭제하거나 변경하면 검토 대상입니다. `Dynamic` 이름과 쉼표로 나뉜
+헤더 값은 대소문자를 구분하지 않습니다. 메타데이터 파일을 찾거나 읽지 못한 경우에는
+이 규칙만 생략하고 다른 방어적 Finding은 유지합니다.
+
+비교 시 프로젝트명과 extra 이름의 PEP 503 구분자·대소문자, extra 순서, 괄호·specifier
+공백·절 순서를 정규화하고, marker는 값을 평가하지 않은 채 공백·인용부호만 보수적으로
+정규화합니다. 직접 URL의 내부 의미는 보존합니다. 해석할 수 없는 요구사항은 안정적인
+공백 정규화 표현으로 비교하며 예외를 외부에 노출하지 않습니다. 요구사항은 순서와
+중복을 무시하는 집합으로 처리합니다. 근거는 `wheel 전용=[...]; sdist 전용=[...]`
+형식으로 각 측 최대 5개와 `+N개`를 표시합니다.
 
 스크립트 Python 인식은 `.py`/`.pyw`, `#!python`/`#!pythonw`, 일반적인 python·python3·python.exe
 shebang으로 제한합니다. 파싱 실패 시에도 일반 설치 스크립트 REVIEW는 유지하며,

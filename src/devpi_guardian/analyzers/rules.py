@@ -51,7 +51,7 @@ RULES: dict[str, Rule] = {
     "wheel_record_integrity": Rule(
         "DENY", "wheel의 dist-info/RECORD가 파일 목록·해시·크기와 일치하지 않습니다."
     ),
-    # F9: the six sdist/wheel mismatch rules in section 4.4.
+    # F9: sdist/wheel mismatch rules in the analyzer handoff contract.
     "wheel_only_risky_python": Rule(
         "DENY",
         "sdist에는 없고 wheel에만 있는 Python 파일에 위험 동작이 있습니다.",
@@ -67,6 +67,9 @@ RULES: dict[str, Rule] = {
     "entry_point_mismatch": Rule("REVIEW", "sdist와 wheel이 서로 다른 실행 진입점을 등록합니다."),
     "python_ast_mismatch": Rule(
         "REVIEW", "같은 경로의 Python 코드가 의미 있는 AST 차이를 보입니다."
+    ),
+    "requires_dist_mismatch": Rule(
+        "REVIEW", "sdist와 wheel의 런타임 의존성(Requires-Dist)이 서로 다릅니다."
     ),
     # Defensive error reporting required by the public contract.
     "artifact_identity_mismatch": Rule(
