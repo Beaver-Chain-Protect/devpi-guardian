@@ -41,6 +41,10 @@ BASELINE_SHA256 = "b" * 64
 MISSING_SHA256 = "c" * 64
 
 
+class DerivedTier(str):
+    pass
+
+
 def verdict(**changes: Any) -> VerdictInput:
     values = {
         "sha256": SHA256,
@@ -731,9 +735,22 @@ def test_record_verdict_rejects_claim_verdict_sha_mismatch_before_connecting(
         ({"analyzer_version": "a" * 4097}, ValueError),
         ({"baseline_sha256": "invalid"}, InvalidSha256),
         ({"baseline_tier": "same_tag"}, ValueError),
-        ({"baseline_tier": "unknown"}, ValueError),
-        ({"baseline_tier": 1}, ValueError),
         ({"baseline_sha256": BASELINE_SHA256}, ValueError),
+        (
+            {"baseline_sha256": BASELINE_SHA256, "baseline_tier": "unknown"},
+            ValueError,
+        ),
+        (
+            {"baseline_sha256": BASELINE_SHA256, "baseline_tier": 1},
+            ValueError,
+        ),
+        (
+            {
+                "baseline_sha256": BASELINE_SHA256,
+                "baseline_tier": DerivedTier("same_tag"),
+            },
+            ValueError,
+        ),
         ({"created_at": NOW.replace(tzinfo=None)}, ValueError),
         ({"created_at": "2026-08-17"}, ValueError),
     ],

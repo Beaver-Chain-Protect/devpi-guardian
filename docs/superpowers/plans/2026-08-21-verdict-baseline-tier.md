@@ -400,9 +400,22 @@ Keep the missing-baseline test but pass `baseline_tier="same_tag"`. Add these ca
 ```python
 [
     ({"baseline_tier": "same_tag"}, ValueError),
-    ({"baseline_tier": "unknown"}, ValueError),
-    ({"baseline_tier": 1}, ValueError),
     ({"baseline_sha256": BASELINE_SHA256}, ValueError),
+    (
+        {"baseline_sha256": BASELINE_SHA256, "baseline_tier": "unknown"},
+        ValueError,
+    ),
+    (
+        {"baseline_sha256": BASELINE_SHA256, "baseline_tier": 1},
+        ValueError,
+    ),
+    (
+        {
+            "baseline_sha256": BASELINE_SHA256,
+            "baseline_tier": DerivedTier("same_tag"),
+        },
+        ValueError,
+    ),
 ]
 ```
 
