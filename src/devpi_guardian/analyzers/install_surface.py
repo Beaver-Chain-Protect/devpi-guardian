@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import configparser
+import csv
+import hashlib
+import hmac
+import io
+import ntpath
+import re
+import stat
 import tempfile
 import tokenize
 import tomllib
@@ -27,6 +36,10 @@ from .types import Action, Finding, make_finding, sort_findings
 _NATIVE_SUFFIXES = (".so", ".dll", ".dylib", ".exe")
 _CMDCLASS_KEYS = frozenset({"install", "develop", "build_py"})
 _ArtifactKind = Literal["wheel", "sdist"]
+_RECORD_CHUNK_SIZE = 1024 * 1024
+_RECORD_SIGNATURE_NAMES = frozenset({"RECORD.jws", "RECORD.p7s"})
+_RECORD_SIZE_RE = re.compile(r"[0-9]+\Z")
+_RECORD_HASH_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 
 def _rule_finding(
@@ -492,6 +505,195 @@ def _is_customize_module(
     }
 
 
+def _record_path(raw_path: str) -> tuple[str | None, str | None]:
+    """Normalize and validate one path from a wheel RECORD row."""
+
+    if not raw_path or "\x00" in raw_path:
+        return None, "비어 있거나 NUL 문자를 포함한 RECORD 경로"
+    portable = raw_path.replace("\\", "/")
+    drive, _ = ntpath.splitdrive(portable)
+    if drive or portable.startswith("/"):
+        return None, f"절대경로 또는 드라이브 경로: {raw_path}"
+    parts = portable.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None, f"비정규화 또는 상위 경로: {raw_path}"
+    if any(":" in part for part in parts):
+        return None, f"안전하지 않은 콜론 경로: {raw_path}"
+    normalized = "/".join(parts)
+    return normalized, None
+
+
+def _record_finding(file: str, snippet: str) -> Finding:
+    return _rule_finding(
+        "wheel_record_integrity",
+        file=file,
+        line=None,
+        snippet=snippet,
+    )
+
+
+def _record_hash_spec(value: str) -> tuple[str, bytes] | None:
+    algorithm, separator, encoded = value.partition("=")
+    if not separator or not algorithm or not encoded or not _RECORD_HASH_RE.fullmatch(encoded):
+        return None
+    algorithm = algorithm.lower()
+    try:
+        digest = hashlib.new(algorithm)
+    except (ValueError, TypeError):
+        return None
+    if digest.digest_size < hashlib.sha256().digest_size:
+        return None
+    if len(encoded) % 4 == 1:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    except (ValueError, binascii.Error):
+        return None
+    if len(decoded) != digest.digest_size:
+        return None
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if canonical != encoded:
+        return None
+    return algorithm, decoded
+
+
+def _record_file_digest(path: Path, algorithm: str) -> bytes:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as source:
+        while chunk := source.read(_RECORD_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _wheel_record_findings(extracted: ExtractedArtifact) -> list[Finding]:
+    """Validate a wheel's RECORD against the safely extracted regular files."""
+
+    candidates = sorted(
+        path
+        for path in extracted.files
+        if PurePosixPath(path).name == "RECORD"
+        and PurePosixPath(path).parent.name.endswith(".dist-info")
+    )
+    if not candidates:
+        return [
+            _rule_finding(
+                "wheel_record_missing",
+                file="*.dist-info/RECORD",
+                line=None,
+                snippet="wheel에 RECORD가 없습니다.",
+            )
+        ]
+    if len(candidates) != 1:
+        return [
+            _record_finding(
+                "*.dist-info/RECORD",
+                f"RECORD가 여러 개입니다: {', '.join(candidates)}",
+            )
+        ]
+
+    record_path = candidates[0]
+    record_file = extracted.root / Path(*PurePosixPath(record_path).parts)
+    findings: list[Finding] = []
+    rows: list[tuple[str, str, str]] = []
+    try:
+        with record_file.open("rb") as raw:
+            text = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+            try:
+                for row in csv.reader(text, strict=True):
+                    if len(row) != 3:
+                        findings.append(
+                            _record_finding(
+                                record_path,
+                                f"RECORD 행의 열 수가 3이 아닙니다: {len(row)}",
+                            )
+                        )
+                        continue
+                    rows.append((row[0], row[1], row[2]))
+            finally:
+                text.detach()
+    except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+        findings.append(_record_finding(record_path, f"RECORD 파싱 실패: {type(exc).__name__}"))
+        return findings
+
+    extracted_files = set(extracted.files)
+    seen: dict[str, tuple[str, str]] = {}
+    self_listed = False
+    for raw_path, hash_value, size_value in rows:
+        normalized, rejection = _record_path(raw_path)
+        if rejection:
+            findings.append(_record_finding(record_path, rejection))
+            continue
+        assert normalized is not None
+        if normalized in seen:
+            findings.append(_record_finding(record_path, f"중복된 RECORD 경로: {normalized}"))
+            continue
+        seen[normalized] = (hash_value, size_value)
+        if normalized == record_path:
+            self_listed = True
+
+    if not self_listed:
+        findings.append(_record_finding(record_path, "RECORD 자신이 목록에 없습니다."))
+
+    signature_paths = {
+        f"{PurePosixPath(record_path).parent.as_posix()}/{name}" for name in _RECORD_SIGNATURE_NAMES
+    }
+    for path in sorted(extracted_files - set(seen)):
+        if path not in signature_paths:
+            findings.append(_record_finding(path, f"RECORD에 없는 추출 파일: {path}"))
+
+    for path, (hash_value, size_value) in sorted(seen.items()):
+        is_self = path == record_path
+        if path not in extracted_files:
+            if path in signature_paths:
+                continue
+            findings.append(_record_finding(path, f"추출되지 않은 RECORD 경로: {path}"))
+            continue
+        file_path = extracted.root / Path(*PurePosixPath(path).parts)
+        try:
+            if not stat.S_ISREG(file_path.stat().st_mode):
+                findings.append(_record_finding(path, f"일반 파일이 아닌 RECORD 경로: {path}"))
+                continue
+        except OSError as exc:
+            findings.append(_record_finding(path, f"RECORD 파일 확인 실패: {type(exc).__name__}"))
+            continue
+
+        if size_value:
+            if not _RECORD_SIZE_RE.fullmatch(size_value):
+                findings.append(_record_finding(path, f"유효하지 않은 파일 크기: {size_value}"))
+            else:
+                try:
+                    expected_size = int(size_value)
+                except (ValueError, OverflowError):
+                    findings.append(_record_finding(path, f"유효하지 않은 파일 크기: {size_value}"))
+                else:
+                    actual_size = file_path.stat().st_size
+                    if expected_size != actual_size:
+                        findings.append(
+                            _record_finding(
+                                path,
+                                f"파일 크기가 다릅니다: RECORD={expected_size}, 실제={actual_size}",
+                            )
+                        )
+
+        if not hash_value:
+            if not is_self:
+                findings.append(_record_finding(path, f"파일 해시가 없습니다: {path}"))
+            continue
+        hash_spec = _record_hash_spec(hash_value)
+        if hash_spec is None:
+            findings.append(_record_finding(path, f"유효하지 않은 파일 해시: {path}"))
+            continue
+        algorithm, expected_digest = hash_spec
+        try:
+            actual_digest = _record_file_digest(file_path, algorithm)
+        except OSError as exc:
+            findings.append(_record_finding(path, f"파일 해시 계산 실패: {type(exc).__name__}"))
+            continue
+        if not hmac.compare_digest(actual_digest, expected_digest):
+            findings.append(_record_finding(path, f"파일 해시가 다릅니다: {path}"))
+    return findings
+
+
 def _scan_extracted(
     extracted: ExtractedArtifact,
     *,
@@ -500,6 +702,9 @@ def _scan_extracted(
     findings: list[Finding] = list(extracted.findings)
     if not extracted.usable:
         return findings
+
+    if artifact_kind == "wheel":
+        findings.extend(_wheel_record_findings(extracted))
 
     for internal_path in extracted.files:
         path = extracted.root / Path(*PurePosixPath(internal_path).parts)

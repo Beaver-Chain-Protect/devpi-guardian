@@ -5,8 +5,9 @@
 wheel 또는 sdist의 코드를 import하거나 실행하지 않고, 아카이브를 정적으로 확인한 뒤
 결정적인 `Finding` 목록을 반환합니다.
 
-F8은 `setup.py`, 비표준 빌드 설정, `.pth`, customize 모듈, 제한된 import 시점 부작용,
-entry point, 네이티브·실행 파일, 경로 이탈과 압축 폭탄을 검사합니다. F9는 정상적인
+F8은 wheel의 `dist-info/RECORD` 파일 목록·해시·크기 무결성, `setup.py`, 비표준 빌드 설정,
+`.pth`, customize 모듈, 제한된 import 시점 부작용, entry point, 네이티브·실행 파일,
+경로 이탈과 압축 폭탄을 검사합니다. F9는 정상적인
 빌드 메타데이터 차이를 제거하고 Python AST를 정규화한 뒤, wheel에만 추가된 위험
 코드·실행 가능한 `.pth`·네이티브 파일과 entry point/AST 불일치를 보고합니다.
 `src/` 기반 sdist와 wheel 루트의 차이, 서로 다른 entry point 표기도 비교 전에
@@ -91,6 +92,13 @@ POSIX 환경에서 적용되며 Windows에서는 제한 시간이 안전장치�
 F8에는 분석할 wheel 또는 sdist의 로컬 파일 경로를 전달합니다. F9에는 같은 프로젝트와
 버전의 sdist 및 wheel 경로를 함께 전달합니다. 따라서 다운로드 담당 컴포넌트가
 artifact SHA-256뿐 아니라 실제 저장 경로와 같은 버전의 파일 쌍을 제공해야 합니다.
+
+wheel에는 정확히 하나의 `*.dist-info/RECORD`가 있어야 합니다. F8은 RECORD를 UTF-8
+CSV로 읽어 모든 추출 regular file의 목록·SHA-256 이상 해시·크기를 검증하며, 목록이
+없거나 모호하거나 불일치하면 `wheel_record_missing` 또는 `wheel_record_integrity`
+DENY Finding을 반환합니다. `RECORD.jws`와 `RECORD.p7s` 서명 형제는 호환성을 위해
+목록에서 생략할 수 있습니다. 이 검사는 `.whl`에만 적용되고 sdist `.zip`/`.tar*`에는
+적용되지 않습니다.
 
 반환값은 정렬된 `Finding` 목록이며 주요 필드는 다음과 같습니다.
 

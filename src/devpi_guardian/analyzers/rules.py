@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .types import Action
 
-RULESET_VERSION = "1.2.2"
+RULESET_VERSION = "1.3.0"
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class Rule:
 
 
 RULES: dict[str, Rule] = {
-    # F8: the fourteen installation-surface rules in SPEC-F8-F9 section 3.1.
+    # F8: installation-surface rules in SPEC-F8-F9 section 3.1 plus wheel RECORD integrity.
     "setup_py_process": Rule("DENY", "setup.py가 설치 중 외부 프로세스를 실행합니다."),
     "setup_py_network": Rule("DENY", "setup.py가 설치 중 네트워크 통신을 시도합니다."),
     "setup_py_cmdclass": Rule("DENY", "setup.py가 설치 명령을 사용자 정의 코드로 재정의합니다."),
@@ -38,6 +38,10 @@ RULES: dict[str, Rule] = {
     ),
     "archive_unsafe_member": Rule("DENY", "아카이브에 경로 이탈·링크·특수 파일 멤버가 있습니다."),
     "archive_bomb": Rule("DENY", "아카이브가 크기·압축률·파일 수 안전 한도를 초과합니다."),
+    "wheel_record_missing": Rule("DENY", "wheel에 정확히 하나의 dist-info/RECORD가 없습니다."),
+    "wheel_record_integrity": Rule(
+        "DENY", "wheel의 dist-info/RECORD가 파일 목록·해시·크기와 일치하지 않습니다."
+    ),
     # F9: the six sdist/wheel mismatch rules in section 4.4.
     "wheel_only_risky_python": Rule(
         "DENY",
