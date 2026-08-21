@@ -637,6 +637,25 @@ class Api:
     ]
 
 
+def test_class_collector_comprehension_receiver_target_mutation_persists() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def mutate(self, values):
+        [self.client for self.client in values]
+        self.other = self.client
+
+    def run(self):
+        self.other.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
 def test_module_binding_deletion_is_not_carried_into_class_summaries() -> None:
     source = """
 import httpx

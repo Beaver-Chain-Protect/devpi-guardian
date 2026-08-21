@@ -700,6 +700,9 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         constructors = self.constructors
         known = self.known
         receiver_known = self.receiver_known
+        receiver_mutations = [
+            path for generator in generators for path in _attribute_target_paths(generator.target)
+        ]
         for generator in generators:
             self.visit(generator.iter)
             self.aliases = dict(self.aliases)
@@ -714,11 +717,20 @@ class _ClassAttributeCollector(ast.NodeVisitor):
                 self.visit(condition)
         for expression in expressions:
             self.visit(expression)
+        receiver_after = self.receiver_known
         self.aliases = aliases
         self.module_instances = module_instances
         self.constructors = constructors
         self.known = known
         self.receiver_known = receiver_known
+        for path in receiver_mutations:
+            relative = _relative_receiver_path(path, self.receiver)
+            if relative is None:
+                continue
+            _clear_reference_path(self.receiver_known, relative)
+            for known_path, kind in receiver_after.items():
+                if known_path == relative or known_path.startswith(f"{relative}."):
+                    self.receiver_known[known_path] = kind
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt])
