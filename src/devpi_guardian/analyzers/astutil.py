@@ -587,7 +587,7 @@ def _class_attribute_summary(
     aliases: dict[str, str],
     module_instances: dict[str, str],
     module_constructors: dict[str, str],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, frozenset[int]]]:
     methods = [
         child
         for child in node.body
@@ -609,6 +609,7 @@ def _class_attribute_summary(
 
     provisional = {path: next(iter(kinds)) for path, kinds in direct.items() if len(kinds) == 1}
     all_events: dict[str, list[str | None]] = {}
+    event_methods: dict[str, set[int]] = {}
     for method in methods:
         receiver = _instance_method_receiver(method, aliases)
         assert receiver is not None
@@ -623,12 +624,15 @@ def _class_attribute_summary(
             collector.visit(statement)
         for path, kind in collector.events:
             all_events.setdefault(path, []).append(kind)
+            event_methods.setdefault(path, set()).add(id(method))
 
-    return {
+    summary = {
         path: kinds[0]
         for path, kinds in all_events.items()
         if kinds and None not in kinds and len(set(kinds)) == 1
     }
+    writers = {path: frozenset(event_methods[path]) for path in summary}
+    return summary, writers
 
 
 class _CallVisitor(ast.NodeVisitor):
@@ -640,6 +644,7 @@ class _CallVisitor(ast.NodeVisitor):
         self._instance_scopes: list[dict[str, str]] = [{}]
         self._constructor_scopes: list[dict[str, str]] = [{}]
         self._class_summaries: dict[ast.ClassDef, dict[str, str]] = {}
+        self._class_summary_writers: dict[ast.ClassDef, dict[str, frozenset[int]]] = {}
         self._class_stack: list[ast.ClassDef] = []
         self._class_function_depths: list[int] = []
         self._function_depth = 0
@@ -648,12 +653,14 @@ class _CallVisitor(ast.NodeVisitor):
         module_instances, module_constructors = _module_bindings(tree, self.aliases)
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
-                self._class_summaries[node] = _class_attribute_summary(
+                summary, writers = _class_attribute_summary(
                     node,
                     self.aliases,
                     module_instances,
                     module_constructors,
                 )
+                self._class_summaries[node] = summary
+                self._class_summary_writers[node] = writers
 
     @property
     def instance_bindings(self) -> dict[str, str]:
@@ -766,8 +773,14 @@ class _CallVisitor(ast.NodeVisitor):
         if self._class_stack and self._function_depth == self._class_function_depths[-1]:
             receiver = _instance_method_receiver(node, self.aliases)
             summary = self._class_summaries.get(self._class_stack[-1], {})
+            writers = self._class_summary_writers.get(self._class_stack[-1], {})
             if receiver is not None:
-                instance_seed = {f"{receiver}.{path}": kind for path, kind in summary.items()}
+                instance_seed = {
+                    f"{receiver}.{path}": kind
+                    for path, kind in summary.items()
+                    if node.name != "__init__"
+                    and any(writer != id(node) for writer in writers.get(path, ()))
+                }
         self._function_depth += 1
         self._visit_scope_body(
             node.body,

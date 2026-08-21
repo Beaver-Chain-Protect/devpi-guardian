@@ -470,6 +470,32 @@ class Api:
     ]
 
 
+def test_class_path_future_assignment_does_not_seed_current_method() -> None:
+    source = """
+import httpx
+
+class Api:
+    def run(self):
+        self.client.get("not-proven")
+        self.client = httpx.Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_init_future_assignment_does_not_seed_before_first_assignment() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client.get("not-proven")
+        self.client = httpx.Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
 def test_nested_lambda_parameter_shadows_outer_client_but_capture_remains_network() -> None:
     source = """
 import httpx
