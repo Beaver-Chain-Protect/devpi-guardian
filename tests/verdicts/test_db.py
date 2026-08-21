@@ -447,6 +447,192 @@ def _seed_version_one_schema(path: Path, sql: str) -> None:
         )
 
 
+def _seed_legacy_v1_verdict(path: Path) -> tuple[str, str]:
+    _seed_version_one_schema(path, _packaged_migration_sql())
+    subject_sha256 = "a" * 64
+    baseline_sha256 = "b" * 64
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'REVIEW', ?, ?),
+                   (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            (
+                subject_sha256,
+                timestamp,
+                timestamp,
+                baseline_sha256,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO verdicts(
+                sha256, decision, score, policy_version, analyzer_version,
+                baseline_sha256, is_current, created_at
+            ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?)
+            """,
+            (subject_sha256, baseline_sha256, timestamp),
+        )
+    return subject_sha256, baseline_sha256
+
+
+def _assert_v1_state(
+    path: Path,
+    subject_sha256: str,
+    baseline_sha256: str,
+    *,
+    has_legacy_row: bool,
+) -> None:
+    with closing(sqlite3.connect(path)) as connection, connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+        verdict_columns = {row[1] for row in connection.execute("PRAGMA table_info(verdicts)")}
+        trigger = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'trigger' AND name = 'verdicts_history_update_guard'
+            """
+        ).fetchone()
+        assert [row[0] for row in versions] == [1]
+        assert "baseline_tier" not in verdict_columns
+        assert trigger is not None
+        if has_legacy_row:
+            row = connection.execute(
+                "SELECT baseline_sha256 FROM verdicts WHERE sha256 = ?",
+                (subject_sha256,),
+            ).fetchone()
+            assert tuple(row) == (baseline_sha256,)
+        else:
+            assert connection.execute("SELECT COUNT(*) FROM verdicts").fetchone() == (0,)
+            timestamp = "2026-08-17T00:00:00+00:00"
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    sha256, size_bytes, state, discovered_at, updated_at
+                ) VALUES (?, 1, 'REVIEW', ?, ?),
+                       (?, 1, 'DISCOVERED', ?, ?)
+                """,
+                (
+                    subject_sha256,
+                    timestamp,
+                    timestamp,
+                    baseline_sha256,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO verdicts(
+                    sha256, decision, score, policy_version, analyzer_version,
+                    baseline_sha256, is_current, created_at
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?)
+                """,
+                (subject_sha256, baseline_sha256, timestamp),
+            )
+
+        connection.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE verdicts SET decision = 'DENY'")
+
+
+@pytest.mark.parametrize("seed_legacy_row", [False, True], ids=["fresh", "v1"])
+def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
+    tmp_path,
+    monkeypatch,
+    seed_legacy_row: bool,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    if seed_legacy_row:
+        subject_sha256, baseline_sha256 = _seed_legacy_v1_verdict(factory.path)
+    else:
+        subject_sha256, baseline_sha256 = "a" * 64, "b" * 64
+
+    real_read_migration = db._read_migration
+
+    def failing_read_migration(version: int) -> str:
+        sql = real_read_migration(version)
+        if version == 2:
+            return sql + "\nTHIS IS INVALID SQL;\n"
+        return sql
+
+    monkeypatch.setattr(db, "_read_migration", failing_read_migration)
+    with pytest.raises(MigrationError):
+        migrate(factory)
+
+    _assert_v1_state(
+        factory.path,
+        subject_sha256,
+        baseline_sha256,
+        has_legacy_row=seed_legacy_row,
+    )
+
+    monkeypatch.setattr(db, "_read_migration", real_read_migration)
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier FROM verdicts WHERE sha256 = ?",
+            (subject_sha256,),
+        ).fetchone()
+    assert [version[0] for version in versions] == [1, 2]
+    assert tuple(row) == (baseline_sha256, None)
+
+
+def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    subject_sha256, baseline_sha256 = _seed_legacy_v1_verdict(factory.path)
+    real_validate_catalog = db._validate_catalog
+    calls = 0
+
+    def fail_after_v2(
+        connection: sqlite3.Connection,
+        expected: db._Catalog,
+        path: Path,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise MigrationError(str(path))
+        real_validate_catalog(connection, expected, path)
+
+    monkeypatch.setattr(db, "_validate_catalog", fail_after_v2)
+    with pytest.raises(MigrationError):
+        migrate(factory)
+
+    _assert_v1_state(
+        factory.path,
+        subject_sha256,
+        baseline_sha256,
+        has_legacy_row=True,
+    )
+
+    monkeypatch.setattr(db, "_validate_catalog", real_validate_catalog)
+    migrate(factory)
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier FROM verdicts WHERE sha256 = ?",
+            (subject_sha256,),
+        ).fetchone()
+    assert [version[0] for version in versions] == [1, 2]
+    assert tuple(row) == (baseline_sha256, None)
+
+
 def test_migrate_rejects_constraintless_same_shape_schema(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     sql = _packaged_migration_sql()
@@ -552,6 +738,168 @@ def test_schema_requires_baseline_sha_and_tier_pair(
                 """,
                 ("a" * 64, baseline_sha256, baseline_tier, timestamp),
             )
+
+
+def _seed_classified_verdict(connection: sqlite3.Connection) -> None:
+    timestamp = "2026-08-17T00:00:00+00:00"
+    connection.execute(
+        """
+        INSERT INTO artifacts(
+            sha256, size_bytes, state, discovered_at, updated_at
+        ) VALUES (?, 1, 'REVIEW', ?, ?),
+               (?, 1, 'DISCOVERED', ?, ?)
+        """,
+        (
+            "a" * 64,
+            timestamp,
+            timestamp,
+            "b" * 64,
+            timestamp,
+            timestamp,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO verdicts(
+            sha256, decision, score, policy_version, analyzer_version,
+            baseline_sha256, is_current, created_at, baseline_tier
+        ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?, 'same_tag')
+        """,
+        ("a" * 64, "b" * 64, timestamp),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation_sql",
+    [
+        "UPDATE verdicts SET baseline_tier = 'sdist'",
+        "UPDATE verdicts SET baseline_tier = 'sdist', is_current = 0",
+        "UPDATE verdicts SET baseline_tier = NULL",
+        "UPDATE verdicts SET baseline_tier = NULL, is_current = 0",
+    ],
+)
+def test_schema_rejects_classified_verdict_tier_mutation(
+    tmp_path,
+    mutation_sql: str,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    with closing(factory.connect()) as connection, connection:
+        _seed_classified_verdict(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(mutation_sql)
+
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier, is_current FROM verdicts",
+        ).fetchone()
+    assert tuple(row) == ("b" * 64, "same_tag", 1)
+
+
+def test_schema_allows_only_classified_verdict_current_marker_deactivation(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    with closing(factory.connect()) as connection, connection:
+        _seed_classified_verdict(connection)
+        connection.execute("UPDATE verdicts SET is_current = 0")
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier, is_current FROM verdicts",
+        ).fetchone()
+
+    assert tuple(row) == ("b" * 64, "same_tag", 0)
+
+
+@pytest.mark.parametrize(
+    "baseline_tier",
+    [1, True, sqlite3.Binary(b"same_tag")],
+    ids=["integer", "boolean", "blob"],
+)
+def test_schema_rejects_nontext_baseline_tier(
+    tmp_path,
+    baseline_tier,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'REVIEW', ?, ?),
+                   (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            (
+                "a" * 64,
+                timestamp,
+                timestamp,
+                "b" * 64,
+                timestamp,
+                timestamp,
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO verdicts(
+                    sha256, decision, score, policy_version, analyzer_version,
+                    baseline_sha256, baseline_tier, is_current, created_at
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?, 1, ?)
+                """,
+                ("a" * 64, "b" * 64, baseline_tier, timestamp),
+            )
+
+
+@pytest.mark.parametrize(
+    ("baseline_sha256", "baseline_tier"),
+    [
+        ("b" * 64, "same_tag"),
+        ("b" * 64, "universal_wheel"),
+        ("b" * 64, "sdist"),
+        (None, None),
+    ],
+    ids=["same-tag", "universal-wheel", "sdist", "both-null"],
+)
+def test_schema_accepts_exact_baseline_pairs(
+    tmp_path,
+    baseline_sha256,
+    baseline_tier,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'REVIEW', ?, ?),
+                   (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            (
+                "a" * 64,
+                timestamp,
+                timestamp,
+                "b" * 64,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO verdicts(
+                sha256, decision, score, policy_version, analyzer_version,
+                baseline_sha256, baseline_tier, is_current, created_at
+            ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?, 1, ?)
+            """,
+            ("a" * 64, baseline_sha256, baseline_tier, timestamp),
+        )
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier FROM verdicts",
+        ).fetchone()
+
+    assert tuple(row) == (baseline_sha256, baseline_tier)
 
 
 def test_migrate_rejects_wrong_same_named_index(tmp_path) -> None:
