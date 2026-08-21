@@ -149,3 +149,49 @@ def test_real_devpi_plugin_manager_recognizes_guardian_hooks() -> None:
     assert len(guardian_plugins) == 1
     assert plugin_manager.hook.devpiserver_add_parser_options.get_hookimpls()
     assert plugin_manager.hook.devpiserver_pyramid_configure.get_hookimpls()
+
+
+def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
+    readme = Path(__file__).parents[1].joinpath("README.md").read_text()
+    f6_section = readme.split("F6 consumers can obtain", 1)[1]
+    f6_section = f6_section.split("F5 does not receive", 1)[0]
+    f6_section = " ".join(f6_section.split())
+
+    required_contract = (
+        "".join(
+            (
+                "from devpi_guardian.enforcement.tween import ",
+                "VERDICT_READER_REGISTRY_KEY",
+            )
+        ),
+        "list_allowed_releases(project: str) -> tuple[AllowedRelease, ...]",
+        "release.project",
+        "PEP 503-normalized",
+        "every stage by canonical project",
+        "stage/version/filename/sha256/origin_url",
+        "no results is `()`",
+        "unexpired current manual override wins",
+        "manual DENY excludes",
+        "manual ALLOW includes",
+        "expires_at <= evaluation time is ignored",
+        "only automated ALLOW includes",
+        "origin_url` is an absolute URL, not a local filesystem path",
+        "".join(
+            (
+                "removes userinfo, query, and fragment, but does not ",
+                "constrain ",
+                "the stored scheme",
+            )
+        ),
+        "F5 MUST record the canonical devpi HTTP(S) `+f`/`+e` artifact URL",
+        "".join(
+            (
+                "F6 MUST issue HTTP(S) through canonical devpi `+f`/`+e` and ",
+                "Guardian enforcement",
+            )
+        ),
+        "never use `origin_url` as a trust bypass or local open",
+        "F4 does not fetch the URL or independently rehash its contents",
+    )
+    for phrase in required_contract:
+        assert phrase in f6_section

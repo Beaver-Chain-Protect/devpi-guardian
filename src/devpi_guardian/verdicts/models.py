@@ -161,6 +161,16 @@ class ReleaseInput:
 
 
 @dataclass(frozen=True, slots=True)
+class AllowedRelease:
+    stage: str
+    project: str
+    version: str
+    filename: str
+    sha256: str
+    origin_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceInput:
     rule_id: str
     action: Decision
