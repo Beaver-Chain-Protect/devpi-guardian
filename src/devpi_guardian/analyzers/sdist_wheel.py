@@ -190,6 +190,7 @@ def _split_requirement_marker(value: str) -> tuple[str, str | None]:
     quote: str | None = None
     escaped = False
     depth = 0
+    direct_reference = False
     for index, character in enumerate(value):
         if quote is not None:
             if escaped:
@@ -205,8 +206,14 @@ def _split_requirement_marker(value: str) -> tuple[str, str | None]:
             depth += 1
         elif character in ")]":
             depth = max(depth - 1, 0)
-        elif character == ";" and depth == 0:
-            return value[:index], value.split(";", 1)[1]
+        elif character == "@" and depth == 0:
+            direct_reference = True
+        elif (
+            character == ";"
+            and depth == 0
+            and (not direct_reference or (index > 0 and value[index - 1].isspace()))
+        ):
+            return value[:index], value.removeprefix(value[:index] + ";")
     return value, None
 
 

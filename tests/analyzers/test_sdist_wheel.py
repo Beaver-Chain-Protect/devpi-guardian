@@ -117,6 +117,72 @@ def test_requires_dist_direct_url_same_and_changed(make_sdist, make_wheel) -> No
     assert len([item for item in findings if item.rule == "requires_dist_mismatch"]) == 1
 
 
+def test_requires_dist_direct_url_internal_semicolon_preserves_marker(
+    make_sdist, make_wheel
+) -> None:
+    sdist = make_sdist(
+        {
+            "PKG-INFO": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                "Requires-Dist: dep @ https://e.test/a;b ; python_version>='3.11'\n"
+            )
+        },
+        name="semicolon-url.tar.gz",
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                'Requires-Dist: dep @ https://e.test/a;b ; python_version >= "3.11"\n'
+            )
+        },
+        name="semicolon-url-demo-1.0.0-py3-none-any.whl",
+    )
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
+def test_requires_dist_direct_url_internal_semicolon_change_is_reviewed(
+    make_sdist, make_wheel
+) -> None:
+    def pair(sdist_url: str, wheel_url: str):
+        sdist = make_sdist(
+            {
+                "PKG-INFO": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    f"Requires-Dist: dep @ {sdist_url}\n"
+                )
+            },
+            name="semicolon-only.tar.gz",
+        )
+        wheel = make_wheel(
+            {
+                "demo-1.0.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    f"Requires-Dist: dep @ {wheel_url}\n"
+                )
+            },
+            name="semicolon-only-demo-1.0.0-py3-none-any.whl",
+        )
+        return sdist, wheel
+
+    sdist, wheel = pair("https://e.test/a;b", "https://e.test/a;b")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair("https://e.test/a;b", "https://e.test/a;c")
+    assert [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
 def test_requires_dist_dynamic_semantics_for_25_and_26(make_sdist, make_wheel) -> None:
     def pair(version: str, dynamic: str, wheel_requirements: str):
         sdist = make_sdist(
