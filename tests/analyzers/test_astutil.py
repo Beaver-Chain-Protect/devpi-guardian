@@ -308,6 +308,37 @@ def test_local_redefinition_shadows_imported_safe_name() -> None:
     assert calls[0].func.id == "cast"
 
 
+def test_comprehension_target_does_not_shadow_imported_safe_name() -> None:
+    source = "from typing import cast\nvalues = [cast for cast in items]\ncast(str, 'value')\n"
+    assert top_level_calls(ast.parse(source)) == []
+
+
+def test_except_handler_name_shadows_imported_safe_name() -> None:
+    source = (
+        "from typing import cast\n"
+        "try:\n"
+        "    pass\n"
+        "except Exception as cast:\n"
+        "    cast(str, 'value')\n"
+    )
+    calls = top_level_calls(ast.parse(source))
+    assert len(calls) == 1
+    assert isinstance(calls[0].func, ast.Name)
+    assert calls[0].func.id == "cast"
+
+
+def test_named_expression_in_comprehension_conservatively_shadows_import() -> None:
+    source = (
+        "from typing import cast\n"
+        "values = [(cast := value) for value in items]\n"
+        "cast(str, 'value')\n"
+    )
+    calls = top_level_calls(ast.parse(source))
+    assert len(calls) == 1
+    assert isinstance(calls[0].func, ast.Name)
+    assert calls[0].func.id == "cast"
+
+
 def test_safe_wrapper_does_not_hide_nested_network_call() -> None:
     source = (
         "import typing\nimport requests\ntyping.cast(str, requests.get('https://example.test'))\n"
