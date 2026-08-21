@@ -7,7 +7,13 @@ from datetime import UTC, datetime, timedelta
 
 from devpi_common.metadata import normalize_name
 
-from .models import AllowedRelease, ArtifactState, Decision, DecisionSource
+from .models import (
+    AllowedRelease,
+    ArtifactState,
+    Decision,
+    DecisionSource,
+    validate_baseline_tier,
+)
 from .releases import sanitize_origin_url
 
 _MAX_SQLITE_INTEGER = 2**63 - 1
@@ -248,6 +254,18 @@ def _current_verdict(
     baseline_sha256 = _field(verdict, "baseline_sha256")
     if baseline_sha256 is not None:
         _canonical_sha256(baseline_sha256, "baseline sha256")
+    baseline_tier = _field(verdict, "baseline_tier")
+    if baseline_tier is not None:
+        try:
+            validate_baseline_tier(baseline_tier)
+        except ValueError as exc:
+            raise PersistedStateCorruption(
+                "invalid persisted baseline tier",
+            ) from exc
+        if baseline_sha256 is None:
+            raise PersistedStateCorruption(
+                "persisted baseline tier has no baseline sha256",
+            )
     current_marker = _field(verdict, "is_current")
     if type(current_marker) is not int or current_marker != 1:
         raise PersistedStateCorruption("invalid current verdict marker")

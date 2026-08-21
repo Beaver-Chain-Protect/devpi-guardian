@@ -36,6 +36,7 @@ def persisted_rows() -> tuple[
         "policy_version": "policy-1",
         "analyzer_version": "analyzer-1",
         "baseline_sha256": None,
+        "baseline_tier": None,
         "is_current": 1,
         "created_at": CANONICAL_TIMESTAMP,
     }
@@ -106,3 +107,41 @@ def test_writer_canonical_utc_timestamps_are_valid(timestamp: str) -> None:
     context = validate_persisted_state(artifact, verdict, override, NOW)
 
     assert context.current_override_id == 1
+
+
+@pytest.mark.parametrize("baseline_tier", ["same_tag", "universal_wheel", "sdist"])
+def test_current_verdict_accepts_classified_baseline(baseline_tier: str) -> None:
+    artifact, verdict, override = persisted_rows()
+    verdict.update(baseline_sha256="b" * 64, baseline_tier=baseline_tier)
+
+    context = validate_persisted_state(artifact, verdict, override, NOW)
+
+    assert context.current_verdict_id == 1
+
+
+def test_current_verdict_accepts_legacy_unclassified_baseline() -> None:
+    artifact, verdict, override = persisted_rows()
+    verdict["baseline_sha256"] = "b" * 64
+
+    context = validate_persisted_state(artifact, verdict, override, NOW)
+
+    assert context.current_verdict_id == 1
+
+
+@pytest.mark.parametrize("baseline_tier", ["unknown", 1, b"same_tag"])
+def test_current_verdict_rejects_invalid_persisted_baseline_tier(
+    baseline_tier: object,
+) -> None:
+    artifact, verdict, override = persisted_rows()
+    verdict.update(baseline_sha256="b" * 64, baseline_tier=baseline_tier)
+
+    with pytest.raises(PersistedStateCorruption, match="baseline tier"):
+        validate_persisted_state(artifact, verdict, override, NOW)
+
+
+def test_current_verdict_rejects_baseline_tier_without_sha256() -> None:
+    artifact, verdict, override = persisted_rows()
+    verdict["baseline_tier"] = "same_tag"
+
+    with pytest.raises(PersistedStateCorruption, match="baseline tier"):
+        validate_persisted_state(artifact, verdict, override, NOW)

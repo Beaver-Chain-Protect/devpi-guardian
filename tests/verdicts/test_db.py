@@ -75,6 +75,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "verdicts_history_insert_guard",
         "verdicts_history_update_guard",
         "verdicts_history_delete_guard",
+        "verdicts_baseline_pair_insert_guard",
         "evidence_history_insert_guard",
         "evidence_history_update_guard",
         "evidence_history_delete_guard",
@@ -84,7 +85,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     }
     assert expected_tables <= tables
     assert triggers == expected_triggers
-    assert version == 1
+    assert version == 2
 
 
 def test_connection_enables_required_pragmas(tmp_path) -> None:
@@ -387,7 +388,7 @@ def test_migrate_rejects_v1_without_schema(tmp_path) -> None:
 
 def test_migrate_rejects_future_schema_version(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
-    _seed_schema_version(factory.path, 2)
+    _seed_schema_version(factory.path, 3)
 
     with pytest.raises(MigrationError):
         migrate(factory)
@@ -428,10 +429,11 @@ def test_migrate_rejects_incomplete(tmp_path, corruption_sql: str) -> None:
         migrate(factory)
 
 
-def _packaged_migration_sql() -> str:
+def _packaged_migration_sql(version: int = 1) -> str:
+    names = {1: "001_initial.sql", 2: "002_baseline_tier.sql"}
     return (
         db.resources.files("devpi_guardian.verdicts.sql")
-        .joinpath("001_initial.sql")
+        .joinpath(names[version])
         .read_text(encoding="utf-8")
     )
 
@@ -460,6 +462,96 @@ def test_migrate_rejects_constraintless_same_shape_schema(tmp_path) -> None:
 
     with pytest.raises(MigrationError):
         migrate(factory)
+
+
+def test_migrate_upgrades_v1_and_preserves_unclassified_legacy_baseline(
+    tmp_path,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    _seed_version_one_schema(factory.path, _packaged_migration_sql())
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(sqlite3.connect(factory.path)) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'REVIEW', ?, ?),
+                   (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            (
+                "a" * 64,
+                timestamp,
+                timestamp,
+                "b" * 64,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO verdicts(
+                sha256, decision, score, policy_version, analyzer_version,
+                baseline_sha256, is_current, created_at
+            ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?)
+            """,
+            ("a" * 64, "b" * 64, timestamp),
+        )
+
+    migrate(factory)
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+        row = connection.execute(
+            "SELECT baseline_sha256, baseline_tier FROM verdicts",
+        ).fetchone()
+
+    assert [version[0] for version in versions] == [1, 2]
+    assert tuple(row) == ("b" * 64, None)
+
+
+@pytest.mark.parametrize(
+    ("baseline_sha256", "baseline_tier"),
+    [(None, "same_tag"), ("b" * 64, None), ("b" * 64, "unknown")],
+    ids=["tier-only", "sha-only", "unknown-tier"],
+)
+def test_schema_requires_baseline_sha_and_tier_pair(
+    tmp_path,
+    baseline_sha256,
+    baseline_tier,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    timestamp = "2026-08-17T00:00:00+00:00"
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, 1, 'REVIEW', ?, ?),
+                   (?, 1, 'DISCOVERED', ?, ?)
+            """,
+            (
+                "a" * 64,
+                timestamp,
+                timestamp,
+                "b" * 64,
+                timestamp,
+                timestamp,
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO verdicts(
+                    sha256, decision, score, policy_version, analyzer_version,
+                    baseline_sha256, baseline_tier, is_current, created_at
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?, 1, ?)
+                """,
+                ("a" * 64, baseline_sha256, baseline_tier, timestamp),
+            )
 
 
 def test_migrate_rejects_wrong_same_named_index(tmp_path) -> None:
@@ -555,6 +647,8 @@ def _seed_history_rows(connection: sqlite3.Connection) -> None:
         f"UPDATE artifacts SET sha256 = {'b' * 64!r}",
         "UPDATE verdicts SET decision = 'DENY'",
         "UPDATE verdicts SET decision = 'DENY', is_current = 0",
+        "UPDATE verdicts SET baseline_tier = 'sdist'",
+        "UPDATE verdicts SET baseline_tier = 'sdist', is_current = 0",
         "DELETE FROM verdicts",
         "UPDATE evidence SET message = 'changed'",
         "DELETE FROM evidence",

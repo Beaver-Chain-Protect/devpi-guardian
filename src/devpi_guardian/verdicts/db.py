@@ -10,7 +10,8 @@ from pathlib import Path
 from .errors import MigrationError, StoreUnavailable
 
 _MAX_BUSY_TIMEOUT_MS = 2_147_483_647
-_SUPPORTED_SCHEMA_VERSION = 1
+_MIGRATION_FILES = ("001_initial.sql", "002_baseline_tier.sql")
+_SUPPORTED_SCHEMA_VERSION = len(_MIGRATION_FILES)
 _CATALOG_QUERY = """
     SELECT type, name, tbl_name, sql
     FROM sqlite_master
@@ -69,17 +70,33 @@ class ConnectionFactory:
 
 
 def _read_version(connection: sqlite3.Connection, path: Path) -> int:
-    query = "SELECT version FROM schema_migrations"
+    query = "SELECT version FROM schema_migrations ORDER BY version"
     rows = connection.execute(query).fetchall()
     versions = [row[0] for row in rows]
     if not versions:
         raise MigrationError(str(path))
-    for version in versions:
-        is_integer = type(version) is int
-        is_supported = is_integer and 1 <= version <= _SUPPORTED_SCHEMA_VERSION
-        if not is_supported:
-            raise MigrationError(str(path))
-    return max(versions)
+    if any(
+        type(version) is not int or not 1 <= version <= _SUPPORTED_SCHEMA_VERSION
+        for version in versions
+    ):
+        raise MigrationError(str(path))
+    current = versions[-1]
+    if versions != list(range(1, current + 1)):
+        raise MigrationError(str(path))
+    return current
+
+
+def _read_migration(version: int) -> str:
+    filename = _MIGRATION_FILES[version - 1]
+    return (
+        resources.files("devpi_guardian.verdicts.sql")
+        .joinpath(filename)
+        .read_text(encoding="utf-8")
+    )
+
+
+def _migration_sql_through(version: int) -> str:
+    return "\n".join(_read_migration(number) for number in range(1, version + 1))
 
 
 def _catalog_fingerprint(connection: sqlite3.Connection) -> _Catalog:
@@ -115,24 +132,27 @@ def migrate(factory: ConnectionFactory) -> None:
         ).fetchone()
         if has_migrations:
             current = _read_version(connection, factory.path)
-            if current != _SUPPORTED_SCHEMA_VERSION:
-                raise MigrationError(str(factory.path))
-        sql = (
-            resources.files("devpi_guardian.verdicts.sql")
-            .joinpath("001_initial.sql")
-            .read_text(encoding="utf-8")
-        )
-        expected_catalog = _expected_catalog(sql)
-        if has_migrations:
-            _validate_catalog(connection, expected_catalog, factory.path)
-            return
-        connection.executescript("BEGIN IMMEDIATE;\n" + sql)
-        connection.execute(
-            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-            (_SUPPORTED_SCHEMA_VERSION, datetime.now(UTC).isoformat()),
-        )
-        _validate_catalog(connection, expected_catalog, factory.path)
-        connection.commit()
+            _validate_catalog(
+                connection,
+                _expected_catalog(_migration_sql_through(current)),
+                factory.path,
+            )
+        else:
+            current = 0
+
+        for version in range(current + 1, _SUPPORTED_SCHEMA_VERSION + 1):
+            sql = _read_migration(version)
+            connection.executescript("BEGIN IMMEDIATE;\n" + sql)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (version, datetime.now(UTC).isoformat()),
+            )
+            _validate_catalog(
+                connection,
+                _expected_catalog(_migration_sql_through(version)),
+                factory.path,
+            )
+            connection.commit()
     except MigrationError:
         if connection.in_transaction:
             connection.rollback()
