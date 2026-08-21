@@ -840,6 +840,7 @@ class _CallVisitor(ast.NodeVisitor):
         self.source = source
         self.calls: list[CallSite] = []
         self.dynamic_imports: list[DynamicImport] = []
+        self.credential_subscripts: list[ast.Subscript] = []
         self._instance_scopes: list[dict[str, str]] = [{}]
         self._constructor_scopes: list[dict[str, str]] = [{}]
         self._alias_scopes: list[dict[str, str]] = [{}]
@@ -1217,20 +1218,36 @@ class _CallVisitor(ast.NodeVisitor):
                 )
         self.generic_visit(node)
 
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if _scoped_resolve_qualified_name(node.value, self.active_aliases) == "os.environ":
+            self.credential_subscripts.append(node)
+        self.generic_visit(node)
 
-def scan_calls(tree: ast.AST, source: str) -> tuple[list[CallSite], list[DynamicImport]]:
+
+def _scan_call_visitor(tree: ast.AST, source: str) -> _CallVisitor:
     aliases = build_alias_table(tree)
     visitor = _CallVisitor(aliases, source)
     visitor.visit(tree)
-    calls = sorted(
+    return visitor
+
+
+def _sorted_call_sites(visitor: _CallVisitor) -> list[CallSite]:
+    return sorted(
         visitor.calls,
         key=lambda item: (item.line, item.qualified_name, item.snippet),
     )
-    imports = sorted(
+
+
+def _sorted_dynamic_imports(visitor: _CallVisitor) -> list[DynamicImport]:
+    return sorted(
         visitor.dynamic_imports,
         key=lambda item: (item.line, item.module, item.snippet),
     )
-    return calls, imports
+
+
+def scan_calls(tree: ast.AST, source: str) -> tuple[list[CallSite], list[DynamicImport]]:
+    visitor = _scan_call_visitor(tree, source)
+    return _sorted_call_sites(visitor), _sorted_dynamic_imports(visitor)
 
 
 def _sensitive_env_key(key: str | None) -> bool:
@@ -1240,52 +1257,51 @@ def _sensitive_env_key(key: str | None) -> bool:
     return any(marker in upper for marker in SENSITIVE_ENV_MARKERS)
 
 
-def credential_accesses(tree: ast.AST, source: str) -> list[CredentialAccess]:
-    aliases = build_alias_table(tree)
+def _credential_accesses_from_visitor(visitor: _CallVisitor, source: str) -> list[CredentialAccess]:
     found: list[CredentialAccess] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Subscript):
-            qualified = resolve_qualified_name(node.value, aliases)
-            if qualified == "os.environ":
-                key = constant_string(node.slice)
-                if _sensitive_env_key(key):
-                    description = f"os.environ[{key!r}]" if key is not None else "os.environ[...]"
-                    found.append(
-                        CredentialAccess(
-                            description,
-                            getattr(node, "lineno", 1),
-                            source_snippet(source, node),
-                            node,
-                        )
+    for node in visitor.credential_subscripts:
+        key = constant_string(node.slice)
+        if _sensitive_env_key(key):
+            description = f"os.environ[{key!r}]" if key is not None else "os.environ[...]"
+            found.append(
+                CredentialAccess(
+                    description,
+                    getattr(node, "lineno", 1),
+                    source_snippet(source, node),
+                    node,
+                )
+            )
+    for call in visitor.calls:
+        node = call.node
+        if call.category == "credential_env":
+            qualified = call.qualified_name
+            key = constant_string(node.args[0]) if node.args else None
+            if _sensitive_env_key(key):
+                description = f"{qualified}({key!r})" if key is not None else f"{qualified}(...)"
+                found.append(
+                    CredentialAccess(
+                        description,
+                        getattr(node, "lineno", 1),
+                        source_snippet(source, node),
+                        node,
                     )
-        elif isinstance(node, ast.Call):
-            qualified = resolve_qualified_name(node.func, aliases)
-            if qualified in {"os.getenv", "os.environ.get"}:
-                key = constant_string(node.args[0]) if node.args else None
-                if _sensitive_env_key(key):
-                    description = (
-                        f"{qualified}({key!r})" if key is not None else f"{qualified}(...)"
+                )
+        for argument in node.args:
+            literal = constant_string(argument)
+            if literal and any(path in literal for path in SENSITIVE_PATHS):
+                found.append(
+                    CredentialAccess(
+                        literal,
+                        getattr(node, "lineno", 1),
+                        source_snippet(source, node),
+                        node,
                     )
-                    found.append(
-                        CredentialAccess(
-                            description,
-                            getattr(node, "lineno", 1),
-                            source_snippet(source, node),
-                            node,
-                        )
-                    )
-            for argument in node.args:
-                literal = constant_string(argument)
-                if literal and any(path in literal for path in SENSITIVE_PATHS):
-                    found.append(
-                        CredentialAccess(
-                            literal,
-                            getattr(node, "lineno", 1),
-                            source_snippet(source, node),
-                            node,
-                        )
-                    )
+                )
     return sorted(found, key=lambda item: (item.line, item.description, item.snippet))
+
+
+def credential_accesses(tree: ast.AST, source: str) -> list[CredentialAccess]:
+    return _credential_accesses_from_visitor(_scan_call_visitor(tree, source), source)
 
 
 class _ScopeNodeVisitor(ast.NodeVisitor):
@@ -1509,8 +1525,9 @@ def _function_return_sources(
 def find_credential_network_flows(tree: ast.Module, source: str) -> list[CredentialFlow]:
     """Find simple same-scope and one-helper credential-to-network flows."""
 
-    all_sources = credential_accesses(tree, source)
-    calls, _ = scan_calls(tree, source)
+    visitor = _scan_call_visitor(tree, source)
+    all_sources = _credential_accesses_from_visitor(visitor, source)
+    calls = _sorted_call_sites(visitor)
     network_calls = [call for call in calls if call.category == "network"]
     flows: list[CredentialFlow] = []
 

