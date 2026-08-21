@@ -69,19 +69,19 @@ class ConnectionFactory:
             raise StoreUnavailable(str(self.path)) from exc
 
 
+def _version_out_of_range(version: int) -> bool:
+    return version < 1 or version > _SUPPORTED_SCHEMA_VERSION
+
+
 def _read_version(connection: sqlite3.Connection, path: Path) -> int:
     query = "SELECT version FROM schema_migrations ORDER BY version"
     rows = connection.execute(query).fetchall()
     versions = [row[0] for row in rows]
     if not versions:
         raise MigrationError(str(path))
-    # fmt: off
-    if any(
-        type(version) is not int
-        or not 1 <= version <= _SUPPORTED_SCHEMA_VERSION
-        for version in versions
+    if any(type(version) is not int for version in versions) or any(
+        _version_out_of_range(version) for version in versions
     ):
-        # fmt: on
         raise MigrationError(str(path))
     current = versions[-1]
     if versions != list(range(1, current + 1)):
@@ -99,11 +99,14 @@ def _read_migration(version: int) -> str:
 
 
 def _migration_sql_through(version: int) -> str:
-    # fmt: off
-    return "\n".join(
-        _read_migration(number) for number in range(1, version + 1)
+    migrations = (
+        _read_migration(number)
+        for number in range(
+            1,
+            version + 1,
+        )
     )
-    # fmt: on
+    return "\n".join(migrations)
 
 
 def _catalog_fingerprint(connection: sqlite3.Connection) -> _Catalog:
@@ -150,13 +153,16 @@ def migrate(factory: ConnectionFactory) -> None:
         for version in range(current + 1, _SUPPORTED_SCHEMA_VERSION + 1):
             sql = _read_migration(version)
             connection.executescript("BEGIN IMMEDIATE;\n" + sql)
-            # fmt: off
+            insert_migration = " ".join(
+                (
+                    "INSERT INTO schema_migrations(version, applied_at)",
+                    "VALUES (?, ?)",
+                )
+            )
             connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) "
-                "VALUES (?, ?)",
+                insert_migration,
                 (version, datetime.now(UTC).isoformat()),
             )
-            # fmt: on
             _validate_catalog(
                 connection,
                 _expected_catalog(_migration_sql_through(version)),
