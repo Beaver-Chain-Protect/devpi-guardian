@@ -1030,6 +1030,13 @@ def _top_level_binding_names(tree: ast.Module) -> set[str]:
     return visitor.names
 
 
+def _attribute_root_name(node: ast.AST) -> str | None:
+    current = node
+    while isinstance(current, ast.Attribute):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
+
+
 def _is_whitelisted_top_level_call(
     call: ast.Call,
     aliases: dict[str, str],
@@ -1038,11 +1045,7 @@ def _is_whitelisted_top_level_call(
     qualified = resolve_qualified_name(call.func, aliases) or ""
     if isinstance(call.func, ast.Name) and call.func.id in shadowed_names:
         return False
-    if (
-        isinstance(call.func, ast.Attribute)
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id in shadowed_names
-    ):
+    if _attribute_root_name(call.func) in shadowed_names:
         return False
     return qualified in {
         "logging.getLogger",

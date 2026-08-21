@@ -308,6 +308,14 @@ def test_local_redefinition_shadows_imported_safe_name() -> None:
     assert calls[0].func.id == "cast"
 
 
+def test_nested_safe_path_is_not_whitelisted_after_root_redefinition() -> None:
+    source = "import importlib.metadata\nimportlib = evil\nimportlib.metadata.version('demo')\n"
+    calls = top_level_calls(ast.parse(source))
+    assert len(calls) == 1
+    assert isinstance(calls[0].func, ast.Attribute)
+    assert calls[0].func.attr == "version"
+
+
 def test_comprehension_target_does_not_shadow_imported_safe_name() -> None:
     source = "from typing import cast\nvalues = [cast for cast in items]\ncast(str, 'value')\n"
     assert top_level_calls(ast.parse(source)) == []
