@@ -18,6 +18,11 @@ from devpi_guardian.verdicts.models import (
 )
 
 SHA256 = "a" * 64
+BASELINE_SHA256 = "b" * 64
+
+
+class DerivedTier(str):
+    pass
 
 
 def make_evidence(details: dict[str, object] | None = None) -> EvidenceInput:
@@ -228,6 +233,7 @@ def test_verdict_decision_must_be_a_decision() -> None:
             policy_version="policy-1",
             analyzer_version="analyzer-1",
             baseline_sha256=None,
+            baseline_tier=None,
         )
 
 
@@ -244,6 +250,7 @@ def test_verdict_score_must_be_finite_number(score: object) -> None:
             policy_version="policy-1",
             analyzer_version="analyzer-1",
             baseline_sha256=None,
+            baseline_tier=None,
         )
 
 
@@ -255,10 +262,63 @@ def test_verdict_score_normalizes_int_to_float() -> None:
         policy_version="policy-1",
         analyzer_version="analyzer-1",
         baseline_sha256=None,
+        baseline_tier=None,
     )
 
     assert verdict.score == 1.0
     assert isinstance(verdict.score, float)
+
+
+@pytest.mark.parametrize("baseline_tier", ["same_tag", "universal_wheel", "sdist"])
+def test_verdict_accepts_valid_baseline_tier(baseline_tier: str) -> None:
+    verdict = VerdictInput(
+        sha256=SHA256,
+        decision=Decision.ALLOW,
+        score=1.0,
+        policy_version="policy-1",
+        analyzer_version="analyzer-1",
+        baseline_sha256=BASELINE_SHA256,
+        baseline_tier=baseline_tier,  # type: ignore[arg-type]
+    )
+
+    assert verdict.baseline_tier == baseline_tier
+
+
+@pytest.mark.parametrize(
+    "baseline_tier",
+    ["same-tag", "", 1, True, DerivedTier("same_tag")],
+)
+def test_verdict_rejects_invalid_baseline_tier(baseline_tier: object) -> None:
+    with pytest.raises(ValueError, match="baseline_tier"):
+        VerdictInput(
+            sha256=SHA256,
+            decision=Decision.ALLOW,
+            score=1.0,
+            policy_version="policy-1",
+            analyzer_version="analyzer-1",
+            baseline_sha256=BASELINE_SHA256,
+            baseline_tier=baseline_tier,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("baseline_sha256", "baseline_tier"),
+    [(None, "same_tag"), (BASELINE_SHA256, None)],
+)
+def test_verdict_requires_baseline_fields_to_be_paired(
+    baseline_sha256: str | None,
+    baseline_tier: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="baseline_sha256 and baseline_tier"):
+        VerdictInput(
+            sha256=SHA256,
+            decision=Decision.ALLOW,
+            score=1.0,
+            policy_version="policy-1",
+            analyzer_version="analyzer-1",
+            baseline_sha256=baseline_sha256,
+            baseline_tier=baseline_tier,  # type: ignore[arg-type]
+        )
 
 
 def test_claimed_artifact_carries_opaque_lease_token() -> None:

@@ -49,6 +49,7 @@ def verdict(**changes: Any) -> VerdictInput:
         "policy_version": "policy-1",
         "analyzer_version": "analyzer-1",
         "baseline_sha256": None,
+        "baseline_tier": None,
         "created_at": NOW,
     }
     values.update(changes)
@@ -77,6 +78,7 @@ def unchecked_verdict(**changes: Any) -> VerdictInput:
         "policy_version": valid.policy_version,
         "analyzer_version": valid.analyzer_version,
         "baseline_sha256": valid.baseline_sha256,
+        "baseline_tier": valid.baseline_tier,
         "created_at": valid.created_at,
     }
     values.update(changes)
@@ -599,7 +601,7 @@ def test_record_verdict_accepts_existing_baseline_foreign_key(
 
     store.record_verdict(
         claim,
-        verdict(baseline_sha256=BASELINE_SHA256),
+        verdict(baseline_sha256=BASELINE_SHA256, baseline_tier="same_tag"),
         (),
     )
 
@@ -616,7 +618,7 @@ def test_record_verdict_rejects_missing_baseline_without_changes(
     with pytest.raises(ArtifactNotFound):
         store.record_verdict(
             claim,
-            verdict(baseline_sha256=BASELINE_SHA256),
+            verdict(baseline_sha256=BASELINE_SHA256, baseline_tier="same_tag"),
             (),
         )
 
