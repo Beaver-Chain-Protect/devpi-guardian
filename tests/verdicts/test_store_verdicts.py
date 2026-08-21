@@ -584,7 +584,10 @@ def test_record_verdict_preserves_history_and_replaces_only_current_marker(
     ]
 
 
-@pytest.mark.parametrize("baseline_tier", ["same_tag", "universal_wheel", "sdist"])
+@pytest.mark.parametrize(
+    "baseline_tier",
+    ["same_tag", "universal_wheel", "sdist"],
+)
 def test_record_verdict_persists_existing_baseline_foreign_key(
     tmp_path,
     audit_writer,

@@ -341,8 +341,8 @@ def test_schema_rejects_new_invalid_baseline_tier_pairs(
 Extend the verdict mutation parameter list with:
 
 ```python
-"UPDATE verdicts SET baseline_tier = 'sdist'",
-"UPDATE verdicts SET baseline_tier = 'sdist', is_current = 0",
+("UPDATE verdicts SET baseline_tier = 'sdist'",)
+("UPDATE verdicts SET baseline_tier = 'sdist', is_current = 0",)
 ```
 
 In `tests/test_package.py`, change the plugin migration assertion to:
@@ -396,10 +396,10 @@ def test_record_verdict_persists_baseline_sha256_and_tier(
 Keep the missing-baseline test but pass `baseline_tier="same_tag"`. Add these cases to `test_record_verdict_validates_mutated_dto_before_connecting`:
 
 ```python
-({"baseline_tier": "same_tag"}, ValueError),
-({"baseline_tier": "unknown"}, ValueError),
-({"baseline_tier": 1}, ValueError),
-({"baseline_sha256": BASELINE_SHA256}, ValueError),
+(({"baseline_tier": "same_tag"}, ValueError),)
+(({"baseline_tier": "unknown"}, ValueError),)
+(({"baseline_tier": 1}, ValueError),)
+(({"baseline_sha256": BASELINE_SHA256}, ValueError),)
 ```
 
 Add `"baseline_tier": valid.baseline_tier` to `unchecked_verdict()` so mutated DTOs carry the full slot set.

@@ -216,7 +216,8 @@ class VerdictInput:
         if self.baseline_sha256 is not None:
             validate_sha256(self.baseline_sha256)
         if (self.baseline_sha256 is None) != (self.baseline_tier is None):
-            raise ValueError("baseline_sha256 and baseline_tier must be paired")
+            message = "baseline_sha256 and baseline_tier must be paired"
+            raise ValueError(message)
         if self.baseline_tier is not None:
             validate_baseline_tier(self.baseline_tier)
         versions = self.policy_version.strip(), self.analyzer_version.strip()

@@ -672,7 +672,8 @@ class SQLiteArtifactStore:
         if baseline_sha256 is not None:
             baseline_sha256 = validate_sha256(baseline_sha256)
         if (baseline_sha256 is None) != (baseline_tier is None):
-            raise ValueError("baseline_sha256 and baseline_tier must be paired")
+            message = "baseline_sha256 and baseline_tier must be paired"
+            raise ValueError(message)
         if baseline_tier is not None:
             baseline_tier = validate_baseline_tier(baseline_tier)
         if sha256 != claim_sha256:

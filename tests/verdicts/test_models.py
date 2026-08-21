@@ -269,7 +269,10 @@ def test_verdict_score_normalizes_int_to_float() -> None:
     assert isinstance(verdict.score, float)
 
 
-@pytest.mark.parametrize("baseline_tier", ["same_tag", "universal_wheel", "sdist"])
+@pytest.mark.parametrize(
+    "baseline_tier",
+    ["same_tag", "universal_wheel", "sdist"],
+)
 def test_verdict_accepts_valid_baseline_tier(baseline_tier: str) -> None:
     verdict = VerdictInput(
         sha256=SHA256,

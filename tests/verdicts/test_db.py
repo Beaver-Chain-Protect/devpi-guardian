@@ -492,7 +492,8 @@ def _assert_v1_state(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
-        verdict_columns = {row[1] for row in connection.execute("PRAGMA table_info(verdicts)")}
+        query = "PRAGMA table_info(verdicts)"
+        verdict_columns = {row[1] for row in connection.execute(query)}
         trigger = connection.execute(
             """
             SELECT sql FROM sqlite_master
@@ -509,7 +510,8 @@ def _assert_v1_state(
             ).fetchone()
             assert tuple(row) == (baseline_sha256,)
         else:
-            assert connection.execute("SELECT COUNT(*) FROM verdicts").fetchone() == (0,)
+            query = "SELECT COUNT(*) FROM verdicts"
+            assert connection.execute(query).fetchone() == (0,)
             timestamp = "2026-08-17T00:00:00+00:00"
             connection.execute(
                 """
@@ -580,8 +582,14 @@ def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
+        query = " ".join(
+            (
+                "SELECT baseline_sha256, baseline_tier FROM verdicts",
+                "WHERE sha256 = ?",
+            )
+        )
         row = connection.execute(
-            "SELECT baseline_sha256, baseline_tier FROM verdicts WHERE sha256 = ?",
+            query,
             (subject_sha256,),
         ).fetchone()
     assert [version[0] for version in versions] == [1, 2]
@@ -625,8 +633,14 @@ def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
+        query = " ".join(
+            (
+                "SELECT baseline_sha256, baseline_tier FROM verdicts",
+                "WHERE sha256 = ?",
+            )
+        )
         row = connection.execute(
-            "SELECT baseline_sha256, baseline_tier FROM verdicts WHERE sha256 = ?",
+            query,
             (subject_sha256,),
         ).fetchone()
     assert [version[0] for version in versions] == [1, 2]
@@ -734,7 +748,8 @@ def test_schema_requires_baseline_sha_and_tier_pair(
                 INSERT INTO verdicts(
                     sha256, decision, score, policy_version, analyzer_version,
                     baseline_sha256, baseline_tier, is_current, created_at
-                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?, 1, ?)
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?,
+                1, ?)
                 """,
                 ("a" * 64, baseline_sha256, baseline_tier, timestamp),
             )
@@ -763,7 +778,8 @@ def _seed_classified_verdict(connection: sqlite3.Connection) -> None:
         INSERT INTO verdicts(
             sha256, decision, score, policy_version, analyzer_version,
             baseline_sha256, is_current, created_at, baseline_tier
-        ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?, 'same_tag')
+        ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, 1, ?,
+        'same_tag')
         """,
         ("a" * 64, "b" * 64, timestamp),
     )
@@ -845,7 +861,8 @@ def test_schema_rejects_nontext_baseline_tier(
                 INSERT INTO verdicts(
                     sha256, decision, score, policy_version, analyzer_version,
                     baseline_sha256, baseline_tier, is_current, created_at
-                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?, 1, ?)
+                ) VALUES (?, 'REVIEW', 1.0, 'policy-1', 'analyzer-1', ?, ?,
+                1, ?)
                 """,
                 ("a" * 64, "b" * 64, baseline_tier, timestamp),
             )

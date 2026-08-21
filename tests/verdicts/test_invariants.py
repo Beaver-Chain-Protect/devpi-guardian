@@ -109,8 +109,13 @@ def test_writer_canonical_utc_timestamps_are_valid(timestamp: str) -> None:
     assert context.current_override_id == 1
 
 
-@pytest.mark.parametrize("baseline_tier", ["same_tag", "universal_wheel", "sdist"])
-def test_current_verdict_accepts_classified_baseline(baseline_tier: str) -> None:
+@pytest.mark.parametrize(
+    "baseline_tier",
+    ["same_tag", "universal_wheel", "sdist"],
+)
+def test_current_verdict_accepts_classified_baseline(
+    baseline_tier: str,
+) -> None:
     artifact, verdict, override = persisted_rows()
     verdict.update(baseline_sha256="b" * 64, baseline_tier=baseline_tier)
 

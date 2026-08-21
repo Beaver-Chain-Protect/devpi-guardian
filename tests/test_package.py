@@ -200,8 +200,10 @@ def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
 def test_readme_documents_verdict_baseline_tier_contract() -> None:
     readme = Path(__file__).parents[1].joinpath("README.md").read_text()
     f10_marker = "F10 supplies the exact current DTO fields"
-    f10_section = readme.split(f10_marker, 1)[1]
-    f10_section = f10_section.split("Manual transitions", 1)[0]
+    _, opening, remainder = readme.partition(f10_marker)
+    assert opening
+    f10_section, closing, _ = remainder.partition("Manual transitions")
+    assert closing
     f10_section = " ".join(f10_section.split())
 
     for phrase in (
