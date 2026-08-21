@@ -36,6 +36,15 @@ RULES: dict[str, Rule] = {
     "native_or_executable": Rule(
         "REVIEW", "네이티브 바이너리 또는 실행 권한 파일이 포함되어 있습니다."
     ),
+    "wheel_install_script": Rule(
+        "REVIEW", "wheel이 설치 시 scripts 디렉터리의 실행 파일을 설치합니다."
+    ),
+    "wheel_install_script_risky": Rule(
+        "REVIEW", "wheel 설치 스크립트에 외부 프로세스·통신·동적 실행·파일 쓰기가 있습니다."
+    ),
+    "wheel_install_script_credential_network": Rule(
+        "DENY", "wheel 설치 스크립트가 credential을 읽어 외부 통신 함수로 전달합니다."
+    ),
     "archive_unsafe_member": Rule("DENY", "아카이브에 경로 이탈·링크·특수 파일 멤버가 있습니다."),
     "archive_bomb": Rule("DENY", "아카이브가 크기·압축률·파일 수 안전 한도를 초과합니다."),
     "wheel_record_missing": Rule("DENY", "wheel에 정확히 하나의 dist-info/RECORD가 없습니다."),

