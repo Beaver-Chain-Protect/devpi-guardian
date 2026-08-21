@@ -195,3 +195,19 @@ def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
     )
     for phrase in required_contract:
         assert phrase in f6_section
+
+
+def test_readme_documents_verdict_baseline_tier_contract() -> None:
+    readme = Path(__file__).parents[1].joinpath("README.md").read_text()
+    f10_marker = "F10 supplies the exact current DTO fields"
+    f10_section = readme.split(f10_marker, 1)[1]
+    f10_section = f10_section.split("Manual transitions", 1)[0]
+    f10_section = " ".join(f10_section.split())
+
+    for phrase in (
+        'Literal["same_tag", "universal_wheel", "sdist"]',
+        "baseline_sha256 and baseline_tier must both be set or both be None",
+        "baseline_tier=None",
+        "sdist comparisons have lower confidence",
+    ):
+        assert phrase in f10_section
