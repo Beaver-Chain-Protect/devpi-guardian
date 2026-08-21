@@ -409,6 +409,98 @@ client = httpx.Client()
     assert [call for call in calls if call.category == "network"] == []
 
 
+def test_import_aliases_are_sequential_and_lexically_scoped() -> None:
+    source = """
+import httpx
+httpx.get("https://before.example")
+httpx = Fake()
+httpx.get("not-network")
+import httpx
+httpx.get("https://after.example")
+
+def parameter(httpx):
+    httpx.get("not-network")
+
+def local_import():
+    httpx.get("not-network")
+    import httpx
+    httpx.get("https://local.example")
+
+def captured():
+    return httpx.get("https://captured.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call.line for call in calls if call.category == "network"] == [3, 7, 15, 18]
+
+
+def test_module_call_before_import_is_not_network() -> None:
+    source = """
+httpx.get("not-network")
+import httpx
+httpx.get("https://after.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.line, call.category) for call in calls] == [(2, None), (4, "network")]
+
+
+def test_class_method_local_aliases_do_not_use_constructor_parameter_shadow() -> None:
+    source = """
+import httpx
+
+class Api:
+    def __init__(self, httpx):
+        self.client = httpx.Client()
+
+    def fetch(self):
+        return self.client.get("not-network")
+
+    def send(self):
+        import httpx
+        self.client = httpx.Client()
+        return self.client.get("https://local.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.line, call.qualified_name) for call in calls if call.category == "network"] == [
+        (14, "httpx.Client.get")
+    ]
+
+
+def test_lambda_walrus_and_importlib_parameter_shadows_are_local() -> None:
+    source = """
+import httpx
+import importlib
+captured = lambda: httpx.get("https://captured.example")
+shadowed = lambda: (httpx.get("not-network"), (httpx := Fake()))
+
+def dynamic(importlib):
+    importlib.import_module("requests")
+"""
+    calls, imports = scan_calls(ast.parse(source), source)
+    assert [call.line for call in calls if call.category == "network"] == [4]
+    assert imports == []
+
+
+def test_comprehension_alias_scope_restores_method_import_and_tuple_targets() -> None:
+    source = """
+import httpx
+client = httpx.Client()
+values = [(client, value) for (client, value) in items]
+client.get("https://example.test")
+
+class Api:
+    def send(self):
+        import httpx
+        [value for httpx in items]
+        self.client = httpx.Client()
+        return self.client.get("https://example.test")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.line, call.qualified_name) for call in calls if call.category == "network"] == [
+        (5, "httpx.Client.get"),
+        (12, "httpx.Client.get"),
+    ]
+
+
 def test_module_binding_deletion_is_not_carried_into_class_summaries() -> None:
     source = """
 import httpx
