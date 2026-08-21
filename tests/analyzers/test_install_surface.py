@@ -4,6 +4,8 @@ import io
 import tarfile
 from pathlib import Path
 
+import pytest
+
 from devpi_guardian.analyzers import scan_install_surface
 
 
@@ -94,6 +96,29 @@ def test_init_credential_to_network_flow_is_denied(make_wheel) -> None:
     assert flow[0].sink == "requests.post"
 
 
+def test_safe_wrapper_does_not_hide_init_credential_network_flow(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo/__init__.py": (
+                "import os\n"
+                "import requests\n"
+                "import typing\n"
+                "typing.cast(str, requests.post(\n"
+                "    'http://127.0.0.1:1/', data=os.getenv('GITHUB_TOKEN')\n"
+                "))\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flow = [
+        item
+        for item in findings
+        if item.rule == "init_top_level_side_effect" and item.action == "DENY"
+    ]
+    assert flow
+    assert flow[0].sink == "requests.post"
+
+
 def test_init_one_helper_credential_flow_is_denied(make_wheel) -> None:
     artifact = make_wheel(
         {
@@ -157,6 +182,64 @@ def test_sitecustomize_is_denied(make_wheel) -> None:
     findings = scan_install_surface(str(artifact))
     assert "customize_module" in _rules(findings)
     assert _deny(findings)
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    ["demo-1.0.0.data/purelib/sitecustomize.py", "demo-1.0.0.data/platlib/usercustomize.py"],
+)
+def test_wheel_relocation_root_customize_is_denied(make_wheel, relpath: str) -> None:
+    artifact = make_wheel({relpath: "VALUE = 1\n"})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_wheel_nested_customize_data_is_not_denied(make_wheel) -> None:
+    artifact = make_wheel({"pdm/pep582/sitecustomize.py": "VALUE = 1\n"})
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_sdist_common_root_customize_is_denied(make_sdist) -> None:
+    artifact = make_sdist({"sitecustomize.py": "VALUE = 1\n", "demo/__init__.py": ""})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_sdist_src_layout_customize_is_denied(make_sdist) -> None:
+    artifact = make_sdist({"src/usercustomize.py": "VALUE = 1\n", "src/demo/__init__.py": ""})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_zip_sdist_common_root_src_customize_is_denied(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0/src/sitecustomize.py": "VALUE = 1\n",
+            "demo-1.0.0/demo/__init__.py": "",
+        },
+        name="demo-1.0.0.zip",
+    )
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_sdist_nested_customize_data_is_not_denied(make_sdist) -> None:
+    artifact = make_sdist({"pdm/pep582/sitecustomize.py": "VALUE = 1\n"})
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_sdist_without_single_common_root_does_not_treat_nested_file_as_root(
+    make_sdist,
+) -> None:
+    artifact = make_sdist(
+        {"demo/sitecustomize.py": "VALUE = 1\n", "other/data.txt": "VALUE = 1\n"},
+        prefix=None,
+    )
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
 
 
 def test_plain_pure_python_package_has_no_deny(make_sdist) -> None:

@@ -8,6 +8,7 @@ import tempfile
 import tokenize
 import tomllib
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from .archive import ExtractedArtifact, extract_artifact
 from .astutil import (
@@ -25,6 +26,7 @@ from .types import Action, Finding, make_finding, sort_findings
 
 _NATIVE_SUFFIXES = (".so", ".dll", ".dylib", ".exe")
 _CMDCLASS_KEYS = frozenset({"install", "develop", "build_py"})
+_ArtifactKind = Literal["wheel", "sdist"]
 
 
 def _rule_finding(
@@ -457,7 +459,44 @@ def _init_findings(internal_path: str, source: str, tree: ast.Module) -> list[Fi
     return findings
 
 
-def _scan_extracted(extracted: ExtractedArtifact) -> list[Finding]:
+def _is_customize_module(
+    internal_path: str,
+    *,
+    artifact_kind: _ArtifactKind,
+    all_files: tuple[str, ...],
+) -> bool:
+    path = PurePosixPath(internal_path)
+    if path.name.lower() not in {"sitecustomize.py", "usercustomize.py"}:
+        return False
+
+    if artifact_kind == "wheel":
+        parts = path.parts
+        return len(parts) == 1 or (
+            len(parts) == 3
+            and parts[0].lower().endswith(".data")
+            and parts[1].lower() in {"purelib", "platlib"}
+        )
+
+    file_parts = [PurePosixPath(candidate).parts for candidate in all_files]
+    common_root = None
+    if file_parts and all(len(parts) > 1 for parts in file_parts):
+        first = file_parts[0][0]
+        if all(parts[0] == first for parts in file_parts):
+            common_root = first
+    relative_parts = path.parts[1:] if common_root is not None else path.parts
+    return relative_parts in {
+        ("sitecustomize.py",),
+        ("usercustomize.py",),
+        ("src", "sitecustomize.py"),
+        ("src", "usercustomize.py"),
+    }
+
+
+def _scan_extracted(
+    extracted: ExtractedArtifact,
+    *,
+    artifact_kind: _ArtifactKind,
+) -> list[Finding]:
     findings: list[Finding] = list(extracted.findings)
     if not extracted.usable:
         return findings
@@ -486,7 +525,11 @@ def _scan_extracted(extracted: ExtractedArtifact) -> list[Finding]:
 
         if name.endswith(".pth"):
             findings.extend(_pth_findings(path, internal_path))
-        if name in {"sitecustomize.py", "usercustomize.py"}:
+        if _is_customize_module(
+            internal_path,
+            artifact_kind=artifact_kind,
+            all_files=extracted.files,
+        ):
             findings.append(
                 _rule_finding(
                     "customize_module",
@@ -514,6 +557,15 @@ def _scan_extracted(extracted: ExtractedArtifact) -> list[Finding]:
     return findings
 
 
+def _artifact_kind(path: Path) -> _ArtifactKind:
+    name = path.name.lower()
+    if name.endswith(".whl"):
+        return "wheel"
+    if name.endswith((".zip", ".tar.gz", ".tgz", ".tar")):
+        return "sdist"
+    raise ValueError("지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar 입니다")
+
+
 def scan_install_surface(artifact_path: str) -> list[Finding]:
     """F8. Inspect one artifact and return evidence, never a final verdict.
 
@@ -522,9 +574,10 @@ def scan_install_surface(artifact_path: str) -> list[Finding]:
     """
 
     try:
+        artifact_kind = _artifact_kind(Path(artifact_path))
         with tempfile.TemporaryDirectory(prefix="devpi-guardian-f8-") as temp_dir:
             extracted = extract_artifact(artifact_path, Path(temp_dir) / "artifact")
-            return sort_findings(_scan_extracted(extracted))
+            return sort_findings(_scan_extracted(extracted, artifact_kind=artifact_kind))
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise

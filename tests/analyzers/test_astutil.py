@@ -278,6 +278,44 @@ T = TypeVar("T")
     assert top_level_calls(ast.parse(source)) == []
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from typing import cast\ncast(str, 'value')\n",
+        "import typing as t\nt.cast(str, 'value')\n",
+        "from importlib.metadata import version\nversion('demo')\n",
+        "import importlib.metadata as metadata\nmetadata.version('demo')\n",
+        "from pkgutil import extend_path\nextend_path([], 'demo')\n",
+        "import pkgutil as p\np.extend_path([], 'demo')\n",
+    ],
+)
+def test_exact_imported_safe_top_level_calls_are_whitelisted(source: str) -> None:
+    assert top_level_calls(ast.parse(source)) == []
+
+
+@pytest.mark.parametrize("name", ["cast", "version", "extend_path"])
+def test_local_functions_with_safe_names_are_not_whitelisted(name: str) -> None:
+    source = f"def {name}(*args):\n    return args\n{name}('value')\n"
+    calls = top_level_calls(ast.parse(source))
+    assert [call.func.id for call in calls if isinstance(call.func, ast.Name)] == [name]
+
+
+def test_local_redefinition_shadows_imported_safe_name() -> None:
+    source = "from typing import cast\ndef cast(value):\n    return value\ncast('value')\n"
+    calls = top_level_calls(ast.parse(source))
+    assert len(calls) == 1
+    assert isinstance(calls[0].func, ast.Name)
+    assert calls[0].func.id == "cast"
+
+
+def test_safe_wrapper_does_not_hide_nested_network_call() -> None:
+    source = (
+        "import typing\nimport requests\ntyping.cast(str, requests.get('https://example.test'))\n"
+    )
+    calls = top_level_calls(ast.parse(source))
+    assert [call.func.attr for call in calls if isinstance(call.func, ast.Attribute)] == ["get"]
+
+
 def test_risky_calls_inside_if_and_try_are_top_level_side_effects() -> None:
     source = """
 import os

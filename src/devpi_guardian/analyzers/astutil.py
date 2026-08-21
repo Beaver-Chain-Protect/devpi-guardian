@@ -966,11 +966,58 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
     return [unique[key] for key in sorted(unique)]
 
 
-def _is_whitelisted_top_level_call(call: ast.Call, aliases: dict[str, str]) -> bool:
+class _TopLevelBindingVisitor(ast.NodeVisitor):
+    """Collect module-scope names that can shadow imported safe helpers."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Import(self, node: ast.Import) -> None:
+        return
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        return
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.names.add(node.id)
+
+
+def _top_level_binding_names(tree: ast.Module) -> set[str]:
+    visitor = _TopLevelBindingVisitor()
+    for statement in tree.body:
+        visitor.visit(statement)
+    return visitor.names
+
+
+def _is_whitelisted_top_level_call(
+    call: ast.Call,
+    aliases: dict[str, str],
+    shadowed_names: set[str],
+) -> bool:
     qualified = resolve_qualified_name(call.func, aliases) or ""
+    if isinstance(call.func, ast.Name) and call.func.id in shadowed_names:
+        return False
+    if (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in shadowed_names
+    ):
+        return False
     return qualified in {
         "logging.getLogger",
         "warnings.filterwarnings",
+        "typing.cast",
+        "importlib.metadata.version",
+        "pkgutil.extend_path",
         "typing.TypeVar",
         "typing.NamedTuple",
         "typing.NewType",
@@ -981,8 +1028,9 @@ def _is_whitelisted_top_level_call(call: ast.Call, aliases: dict[str, str]) -> b
 
 
 class _TopLevelCallVisitor(ast.NodeVisitor):
-    def __init__(self, aliases: dict[str, str]) -> None:
+    def __init__(self, aliases: dict[str, str], shadowed_names: set[str]) -> None:
         self.aliases = aliases
+        self.shadowed_names = shadowed_names
         self.calls: list[ast.Call] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -998,14 +1046,14 @@ class _TopLevelCallVisitor(ast.NodeVisitor):
         return
 
     def visit_Call(self, node: ast.Call) -> None:
-        if not _is_whitelisted_top_level_call(node, self.aliases):
+        if not _is_whitelisted_top_level_call(node, self.aliases, self.shadowed_names):
             self.calls.append(node)
         self.generic_visit(node)
 
 
 def top_level_calls(tree: ast.Module) -> list[ast.Call]:
     aliases = build_alias_table(tree)
-    visitor = _TopLevelCallVisitor(aliases)
+    visitor = _TopLevelCallVisitor(aliases, _top_level_binding_names(tree))
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
