@@ -174,8 +174,8 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     ]
     assert (tmp_path / "guardian.db").exists()
     with sqlite3.connect(tmp_path / "guardian.db") as connection:
-        migration_query = "SELECT version FROM schema_migrations"
-        assert connection.execute(migration_query).fetchone() == (1,)
+        migration_query = "SELECT MAX(version) FROM schema_migrations"
+        assert connection.execute(migration_query).fetchone() == (2,)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)
@@ -305,3 +305,21 @@ def test_readme_documents_f6_allowed_release_lookup_contract() -> None:
     )
     for phrase in required_contract:
         assert phrase in f6_section
+
+
+def test_readme_documents_verdict_baseline_tier_contract() -> None:
+    readme = Path(__file__).parents[1].joinpath("README.md").read_text()
+    f10_marker = "F10 supplies the exact current DTO fields"
+    _, opening, remainder = readme.partition(f10_marker)
+    assert opening
+    f10_section, closing, _ = remainder.partition("Manual transitions")
+    assert closing
+    f10_section = " ".join(f10_section.split())
+
+    for phrase in (
+        'Literal["same_tag", "universal_wheel", "sdist"]',
+        "baseline_sha256 and baseline_tier must both be set or both be None",
+        "baseline_tier=None",
+        "sdist comparisons have lower confidence",
+    ):
+        assert phrase in f10_section
