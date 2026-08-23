@@ -13,8 +13,10 @@ from devpi_guardian.analyzers import (
 from devpi_guardian.baseline import (
     ArtifactBytesSource,
     BaselineComparison,
+    HttpArtifactBytesSource,
     ReleaseLookup,
     ReleaseRecord,
+    VerdictReaderReleaseLookup,
     artifact_kind,
     compare_release_to_baseline,
 )
@@ -31,6 +33,32 @@ BaselineAnalyzer = Callable[..., BaselineComparison]
 InstallSurfaceAnalyzer = Callable[..., list[Finding]]
 SdistWheelAnalyzer = Callable[..., list[Finding]]
 _DEFAULT_LIMITS = AnalysisLimits()
+
+
+def build_analysis_engine(
+    *,
+    reader,
+    session,
+    analyzer_version: str,
+    limits: AnalysisLimits = _DEFAULT_LIMITS,
+    timeout: float = 30.0,
+    max_bytes: int = 1_000_000_000,
+) -> GuardianAnalysisEngine:
+    """Wire F6/F7 with one lookup used as the HTTP origin resolver."""
+
+    lookup = VerdictReaderReleaseLookup(reader)
+    bytes_source = HttpArtifactBytesSource(
+        session,
+        lookup,
+        timeout=timeout,
+        max_bytes=max_bytes,
+    )
+    return GuardianAnalysisEngine(
+        lookup=lookup,
+        bytes_source=bytes_source,
+        analyzer_version=analyzer_version,
+        limits=limits,
+    )
 
 
 def _status(findings: Sequence[Finding]) -> AnalysisStatus:
@@ -119,6 +147,7 @@ class GuardianAnalysisEngine:
             analyzer_version=self._analyzer_version,
             has_baseline=comparison.has_baseline,
             baseline_sha256=comparison.baseline_sha256,
+            baseline_tier=tier,
             evidence=tuple(evidence),
             steps=tuple(steps),
         )

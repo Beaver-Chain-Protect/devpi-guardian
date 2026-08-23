@@ -94,6 +94,7 @@ class AnalysisReport:
     analyzer_version: str
     has_baseline: bool
     baseline_sha256: str | None
+    baseline_tier: str | None
     evidence: tuple[AnalysisEvidence, ...]
     steps: tuple[AnalysisStep, ...]
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -63,18 +63,22 @@ class QuarantineWorker:
         policy_engine: PolicyEngine,
         worker_id: str,
         lease_duration: timedelta = timedelta(minutes=5),
+        cooldown_duration: timedelta = timedelta(hours=24),
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
+        if cooldown_duration <= timedelta(0):
+            raise ValueError("cooldown_duration must be positive")
         self._store = store
         self._preparer = preparer
         self._analysis_engine = analysis_engine
         self._policy_engine = policy_engine
         self._worker_id = worker_id
         self._lease_duration = lease_duration
+        self._cooldown_duration = cooldown_duration
         self._now = now if now is not None else lambda: datetime.now(UTC)
 
     def recover_expired_claims(self) -> int:
@@ -102,6 +106,15 @@ class QuarantineWorker:
                 raise ValueError("policy verdict does not match analyzed baseline")
             if verdict.analyzer_version != report.analyzer_version:
                 raise ValueError("policy verdict does not match analyzer version")
+            if verdict.baseline_tier != report.baseline_tier:
+                raise ValueError("policy verdict does not match analyzed baseline tier")
+            if verdict.decision is Decision.ALLOW:
+                completed_at = self._now()
+                verdict = replace(
+                    verdict,
+                    created_at=completed_at,
+                    cooldown_until=completed_at + self._cooldown_duration,
+                )
             evidence = tuple(_evidence_input(item) for item in report.evidence)
             self._store.record_verdict(claim, verdict, evidence)
         except Exception as exc:

@@ -81,6 +81,20 @@ class Policy:
             policy_version="policy-1",
             analyzer_version=report.analyzer_version,
             baseline_sha256=report.baseline_sha256,
+            baseline_tier=report.baseline_tier,
+        )
+
+
+class AllowPolicy:
+    def evaluate(self, target, report):
+        return VerdictInput(
+            sha256=target.sha256,
+            decision=Decision.ALLOW,
+            score=0,
+            policy_version="policy-1",
+            analyzer_version=report.analyzer_version,
+            baseline_sha256=report.baseline_sha256,
+            baseline_tier=report.baseline_tier,
         )
 
 
@@ -112,6 +126,7 @@ def test_worker_runs_one_analysis_and_records_attributed_evidence(tmp_path) -> N
         analyzer_version="analyzers-1",
         has_baseline=True,
         baseline_sha256="c" * 64,
+        baseline_tier="same_tag",
         evidence=(
             AnalysisEvidence(
                 analyzer="F7",
@@ -215,3 +230,31 @@ def test_worker_recovers_expired_claims() -> None:
 
     assert worker.recover_expired_claims() == 2
     assert store.recovered_at == now
+
+
+def test_worker_adds_configured_cooldown_to_automatic_allow(tmp_path) -> None:
+    now = datetime(2026, 8, 23, tzinfo=UTC)
+    target = artifact(tmp_path)
+    report = AnalysisReport(
+        analyzer_version="analyzers-1",
+        has_baseline=False,
+        baseline_sha256=None,
+        baseline_tier=None,
+        evidence=(),
+        steps=(AnalysisStep("F7", "skipped", "no approved baseline"),),
+    )
+    store = Store(make_claim(now))
+    worker = QuarantineWorker(
+        store=store,
+        preparer=Preparer(AnalysisBundle(target=target)),
+        analysis_engine=Engine(report),
+        policy_engine=AllowPolicy(),
+        worker_id="worker-1",
+        cooldown_duration=timedelta(hours=6),
+        now=lambda: now,
+    )
+
+    assert worker.run_once().status is WorkerCycleStatus.COMPLETED
+    verdict = store.recorded[0][1]
+    assert verdict.created_at == now
+    assert verdict.cooldown_until == now + timedelta(hours=6)

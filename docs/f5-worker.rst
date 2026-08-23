@@ -52,10 +52,23 @@ filename, advertised SHA-256, canonical devpi origin URL, and an optional
 advertised size.  Analysis receives only ``VerifiedArtifact`` local paths.
 F9 receives both the sdist and wheel path for one project and version.
 
-The current F4 claim contains only SHA-256, size, and lease data.  A concrete
-``ArtifactPreparer`` therefore still requires a public F4 release lookup (or
-an enriched claim) that supplies stage, project, version, filename, and
-origin URL.  F5 does not read Guardian SQLite tables directly.
+The F4 claim contains only SHA-256, size, and lease data.  F5 resolves the
+remaining fields through the shared reader's ``get_artifact_releases`` and
+``list_release_artifacts`` methods.  ``VerdictReaderCandidateSource`` adapts
+those records into ``ArtifactCandidate`` values, and
+``HttpArtifactPreparer`` downloads and verifies the target plus one matching
+sdist/wheel counterpart.  F5 never reads Guardian SQLite tables directly.
+
+The metadata contract supplied for each file is:
+
+* stage, normalized project, version, and filename;
+* advertised SHA-256 and size;
+* canonical HTTP(S) origin URL.
+
+F5 passes only verified local paths to the analysis engine.  The same
+``VerdictReaderReleaseLookup`` instance is passed both as the F6 lookup and
+as ``HttpArtifactBytesSource``'s origin resolver.  This is enforced by the
+``build_analysis_engine`` wiring function.
 
 Discovery boundary
 ------------------
@@ -65,12 +78,13 @@ discovery should pass raw candidate metadata to an F5 discovery sink and do
 no download or analysis in the devpi request thread.  A poller may replay
 configured base Simple pages to recover missed notifications.
 
-The discovery adapter and F4 API must settle two details before concrete
-wiring:
+Request-driven registration still requires F1/F2 and F4 to settle two details:
 
 * whether the discovery message may omit size until F5 verifies the bytes;
-* how F5 resolves a claimed SHA-256 to its release metadata and same-release
-  sdist/wheel candidates.
+* which non-blocking discovery sink F1/F2 calls from the Simple request path.
+
+Claim-time metadata lookup and same-release pairing are implemented.  Unknown
+links remain hidden while request-driven registration is being connected.
 
 Lease and retry boundary
 ------------------------
@@ -105,11 +119,16 @@ The preferred enforcement contract is::
 This keeps clock handling out of the Simple filter and direct-download tween.
 An ``ALLOW`` verdict may therefore exist while the artifact is still hidden.
 
-The default proposal is to start cooldown when automated analysis completes,
-apply it once per SHA-256 identity, preserve it across ordinary manual ALLOW,
-and permit bypass only through a separate explicit administrative exception.
-Duration, manual bypass, and rescan behavior require team approval before the
-SQLite contract is changed.
+Cooldown starts when an automated ``ALLOW`` analysis completes.  The worker
+uses a configurable duration with a provisional 24-hour default.  F4 stores
+the first cooldown window for each SHA-256 and keeps it across rescans and
+manual verdict changes.  ``SQLiteVerdictReader`` returns ``allowed=False``
+until the deadline, so F2 and F3 enforce the same clock decision without
+duplicating time logic.  Releases in active cooldown are also excluded from
+F6 baseline candidates.
+
+An explicit cooldown bypass is not part of F5.  If the team adds one, it must
+be an audited F11 operation distinct from an ordinary manual ``ALLOW``.
 
 F10 boundary
 ------------
@@ -124,7 +143,8 @@ Current verification
 
 Focused tests cover one-call orchestration, finding attribution, fail-closed
 error recording, expired-claim recovery, streaming SHA-256 verification,
-size verification, and partial-file cleanup::
+size verification, partial-file cleanup, F4 metadata adaptation, same-release
+pair download, and cooldown enforcement::
 
    uv run pytest tests/worker -q
    uv run ruff format --check src/devpi_guardian/worker tests/worker

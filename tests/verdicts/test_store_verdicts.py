@@ -26,6 +26,7 @@ from devpi_guardian.verdicts.models import (
     EvidenceInput,
     VerdictInput,
 )
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from tests.verdicts.test_store_claims import SHA as SHA256
 from tests.verdicts.test_store_claims import (
@@ -73,6 +74,38 @@ def evidence(**changes: Any) -> EvidenceInput:
     return EvidenceInput(**values)
 
 
+def test_allow_verdict_persists_cooldown_used_by_shared_reader(
+    tmp_path,
+    audit_writer,
+) -> None:
+    cooldown_until = NOW + timedelta(hours=24)
+    store = make_store(tmp_path, audit_writer)
+    store.discover_artifact(artifact(), release())
+    claim = store.claim_next("worker", NOW + timedelta(minutes=5))
+    assert claim is not None
+
+    store.record_verdict(
+        claim,
+        verdict(
+            decision=Decision.ALLOW,
+            score=0,
+            cooldown_until=cooldown_until,
+        ),
+        (),
+    )
+
+    during = SQLiteVerdictReader(
+        store.connection_factory,
+        now=lambda: cooldown_until - timedelta(seconds=1),
+    )
+    after = SQLiteVerdictReader(
+        store.connection_factory,
+        now=lambda: cooldown_until,
+    )
+    assert during.get_effective_decision(SHA256).allowed is False
+    assert after.get_effective_decision(SHA256).allowed is True
+
+
 def unchecked_verdict(**changes: Any) -> VerdictInput:
     valid = verdict()
     values = {
@@ -84,6 +117,7 @@ def unchecked_verdict(**changes: Any) -> VerdictInput:
         "baseline_sha256": valid.baseline_sha256,
         "baseline_tier": valid.baseline_tier,
         "created_at": valid.created_at,
+        "cooldown_until": valid.cooldown_until,
     }
     values.update(changes)
     value = object.__new__(VerdictInput)

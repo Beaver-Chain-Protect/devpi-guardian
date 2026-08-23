@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from devpi_guardian.analyzers import Finding
-from devpi_guardian.worker.analysis import GuardianAnalysisEngine
+from devpi_guardian.worker.analysis import GuardianAnalysisEngine, build_analysis_engine
 from devpi_guardian.worker.models import AnalysisBundle, VerifiedArtifact
 
 
@@ -109,3 +109,17 @@ def test_engine_skips_f7_without_baseline_and_f9_without_pair(tmp_path) -> None:
         ("F8", "completed"),
         ("F9", "skipped"),
     ]
+
+
+def test_build_analysis_engine_reuses_lookup_as_http_origin_resolver() -> None:
+    class Reader:
+        def list_allowed_releases(self, project):
+            return ()
+
+    engine = build_analysis_engine(
+        reader=Reader(),
+        session=object(),
+        analyzer_version="analyzers-1",
+    )
+
+    assert engine._bytes_source._resolver is engine._lookup

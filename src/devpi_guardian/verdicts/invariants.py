@@ -45,6 +45,8 @@ class PersistedStateContext:
     analyzer_version: str | None
     current_verdict_id: int | None
     current_override_id: int | None
+    cooldown_until: datetime | None
+    cooldown_finished: bool
 
 
 def _field(row: Mapping[str, object], name: str) -> object:
@@ -52,6 +54,17 @@ def _field(row: Mapping[str, object], name: str) -> object:
         return row[name]
     except (IndexError, KeyError, TypeError) as exc:
         raise PersistedStateCorruption(f"missing persisted {name}") from exc
+
+
+def _optional_field(
+    row: Mapping[str, object],
+    name: str,
+    default: object = None,
+) -> object:
+    try:
+        return row[name]
+    except (IndexError, KeyError, TypeError):
+        return default
 
 
 def _sqlite_id(value: object, field_name: str) -> int:
@@ -164,7 +177,7 @@ def validate_persisted_release_mapping(
 
 def _artifact_context(
     artifact: Mapping[str, object],
-) -> tuple[str, ArtifactState]:
+) -> tuple[str, ArtifactState, datetime | None]:
     sha256 = _canonical_sha256(_field(artifact, "sha256"), "artifact sha256")
     size_bytes = _field(artifact, "size_bytes")
     size_is_integer = type(size_bytes) is int
@@ -209,7 +222,20 @@ def _artifact_context(
         _stored_text(last_error, "last_error", nonblank=False)
     elif last_error is not None:
         raise PersistedStateCorruption("invalid persisted last_error")
-    return sha256, state
+    cooldown_started_raw = _optional_field(artifact, "cooldown_started_at")
+    cooldown_until_raw = _optional_field(artifact, "cooldown_until")
+    if (cooldown_started_raw is None) != (cooldown_until_raw is None):
+        raise PersistedStateCorruption("invalid persisted cooldown tuple")
+    cooldown_until = None
+    if cooldown_started_raw is not None:
+        cooldown_started = _stored_timestamp(
+            cooldown_started_raw,
+            "cooldown_started_at",
+        )
+        cooldown_until = _stored_timestamp(cooldown_until_raw, "cooldown_until")
+        if cooldown_until <= cooldown_started:
+            raise PersistedStateCorruption("invalid persisted cooldown window")
+    return sha256, state, cooldown_until
 
 
 def _current_verdict(
@@ -339,7 +365,7 @@ def validate_persisted_state(
     except (OverflowError, ValueError) as exc:
         raise PersistedStateCorruption("invalid evaluation timestamp") from exc
 
-    sha256, state = _artifact_context(artifact)
+    sha256, state, cooldown_until = _artifact_context(artifact)
     verdict_id, automated, policy_version, analyzer_version = _current_verdict(
         current_verdict,
         sha256,
@@ -361,6 +387,7 @@ def validate_persisted_state(
     source = DecisionSource.AUTOMATED
     if manual_is_active:
         source = DecisionSource.MANUAL_OVERRIDE
+    cooldown_finished = cooldown_until is None or cooldown_until <= evaluated_at
     return PersistedStateContext(
         artifact_state=state,
         effective_decision=effective,
@@ -370,4 +397,6 @@ def validate_persisted_state(
         analyzer_version=analyzer_version,
         current_verdict_id=verdict_id,
         current_override_id=override_id,
+        cooldown_until=cooldown_until,
+        cooldown_finished=cooldown_finished,
     )

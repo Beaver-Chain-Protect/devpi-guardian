@@ -1,6 +1,7 @@
 """F5 quarantine worker contracts and orchestration."""
 
-from .analysis import GuardianAnalysisEngine
+from .adapters import VerdictReaderCandidateSource
+from .analysis import GuardianAnalysisEngine, build_analysis_engine
 from .models import (
     AnalysisBundle,
     AnalysisEvidence,
@@ -10,6 +11,7 @@ from .models import (
     VerifiedArtifact,
 )
 from .pipeline import QuarantineWorker, WorkerCycle, WorkerCycleStatus
+from .preparer import CandidateSource, HttpArtifactPreparer
 from .quarantine import QuarantineStore
 
 __all__ = [
@@ -18,10 +20,14 @@ __all__ = [
     "AnalysisReport",
     "AnalysisStep",
     "ArtifactCandidate",
+    "CandidateSource",
     "GuardianAnalysisEngine",
+    "HttpArtifactPreparer",
     "QuarantineStore",
     "QuarantineWorker",
+    "VerdictReaderCandidateSource",
     "VerifiedArtifact",
     "WorkerCycle",
     "WorkerCycleStatus",
+    "build_analysis_engine",
 ]

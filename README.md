@@ -24,6 +24,9 @@ The [approved F3/F4 design][approved-design] is in the repository.
   transitions; and deterministic read-time override expiry.
 - F6 project lookup of effective `ALLOW` releases through the public
   `VerdictReader.list_allowed_releases()` API and exported `AllowedRelease` model.
+- F5 verified quarantine downloads, one F7--F9 analysis entry point, release metadata
+  adapters, and a configurable post-analysis cooldown. Automated `ALLOW` artifacts stay
+  hidden from both Simple and direct-download paths until their persisted deadline.
 - A devpi plugin with sanitized structured block logs and bounded in-process metrics.
 - The real devpi subprocess suite covers pip/uv, restarts, concurrency, direct URLs, and
   hashless mirror identity-unavailable fail-closed behavior. Identity failure remains

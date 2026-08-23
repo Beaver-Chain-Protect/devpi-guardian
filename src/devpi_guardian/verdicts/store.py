@@ -663,7 +663,12 @@ class SQLiteArtifactStore:
             )
             baseline_sha256 = verdict.baseline_sha256
             baseline_tier = verdict.baseline_tier
-            created_at = _iso(verdict.created_at, "created_at")
+            created_at_value = require_utc(
+                _require_datetime(verdict.created_at, "created_at"),
+                "created_at",
+            )
+            created_at = created_at_value.isoformat()
+            cooldown_until_value = verdict.cooldown_until
         except AttributeError:
             message = "VerdictInput missing required fields"
             raise ValueError(message) from None
@@ -676,6 +681,17 @@ class SQLiteArtifactStore:
             raise ValueError(message)
         if baseline_tier is not None:
             baseline_tier = validate_baseline_tier(baseline_tier)
+        cooldown_until = None
+        if cooldown_until_value is not None:
+            cooldown_until_at = require_utc(
+                _require_datetime(cooldown_until_value, "cooldown_until"),
+                "cooldown_until",
+            )
+            if decision is not Decision.ALLOW:
+                raise ValueError("cooldown requires an ALLOW verdict")
+            if cooldown_until_at <= created_at_value:
+                raise ValueError("cooldown_until must be later than created_at")
+            cooldown_until = cooldown_until_at.isoformat()
         if sha256 != claim_sha256:
             raise TransitionConflict(sha256)
 
@@ -692,12 +708,13 @@ class SQLiteArtifactStore:
             artifact_row = connection.execute(
                 """
                 SELECT sha256, size_bytes, state, lease_owner,
-                       lease_expires_at, lease_token
+                       lease_expires_at, lease_token, cooldown_started_at,
+                       cooldown_until
                 FROM artifacts WHERE sha256 = ?
                 """,
                 (claim_sha256,),
             ).fetchone()
-            if artifact_row is None or tuple(artifact_row) != (
+            if artifact_row is None or tuple(artifact_row)[:6] != (
                 claim_sha256,
                 claim_size_bytes,
                 "SCANNING",
@@ -706,6 +723,18 @@ class SQLiteArtifactStore:
                 claim_token,
             ):
                 raise TransitionConflict(claim_sha256)
+            stored_cooldown_started_at = artifact_row["cooldown_started_at"]
+            stored_cooldown_until = artifact_row["cooldown_until"]
+            expected_cooldown_started_at = (
+                stored_cooldown_started_at
+                if stored_cooldown_started_at is not None
+                else created_at
+                if cooldown_until is not None
+                else None
+            )
+            expected_cooldown_until = (
+                stored_cooldown_until if stored_cooldown_until is not None else cooldown_until
+            )
 
             if baseline_sha256 is not None:
                 baseline = connection.execute(
@@ -772,7 +801,9 @@ class SQLiteArtifactStore:
                 """
                 UPDATE artifacts
                 SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
-                    lease_token = NULL, last_error = NULL, updated_at = ?
+                    lease_token = NULL, last_error = NULL, updated_at = ?,
+                    cooldown_started_at = COALESCE(cooldown_started_at, ?),
+                    cooldown_until = COALESCE(cooldown_until, ?)
                 WHERE sha256 = ? AND size_bytes = ?
                   AND state = 'SCANNING' AND lease_owner = ?
                   AND lease_expires_at = ? AND lease_token = ?
@@ -781,6 +812,8 @@ class SQLiteArtifactStore:
                 (
                     decision.value,
                     updated_at,
+                    created_at if cooldown_until is not None else None,
+                    cooldown_until,
                     claim_sha256,
                     claim_size_bytes,
                     claim_worker_id,
@@ -795,7 +828,8 @@ class SQLiteArtifactStore:
             final_artifact = connection.execute(
                 """
                 SELECT state, lease_owner, lease_expires_at, lease_token,
-                       last_error, updated_at
+                       last_error, updated_at, cooldown_started_at,
+                       cooldown_until
                 FROM artifacts WHERE sha256 = ?
                 """,
                 (claim_sha256,),
@@ -807,6 +841,8 @@ class SQLiteArtifactStore:
                 None,
                 None,
                 updated_at,
+                expected_cooldown_started_at,
+                expected_cooldown_until,
             ):
                 raise TransitionConflict("artifact terminal state mismatch")
 
@@ -1330,6 +1366,8 @@ class SQLiteArtifactStore:
                 None,
                 None,
                 None,
+                artifact_row["cooldown_started_at"],
+                artifact_row["cooldown_until"],
             )
             verification = {
                 "sha256": sha256,

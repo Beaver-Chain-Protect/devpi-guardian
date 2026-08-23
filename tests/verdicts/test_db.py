@@ -69,6 +69,8 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     expected_triggers = {
         "artifacts_identity_immutable",
         "artifacts_identity_delete_guard",
+        "artifacts_cooldown_pair_insert_guard",
+        "artifacts_cooldown_update_guard",
         "release_mappings_history_insert_guard",
         "release_mappings_history_update_guard",
         "release_mappings_history_delete_guard",
@@ -85,7 +87,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     }
     assert expected_tables <= tables
     assert triggers == expected_triggers
-    assert version == 2
+    assert version == 3
 
 
 def test_connection_enables_required_pragmas(tmp_path) -> None:
@@ -592,7 +594,7 @@ def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -643,7 +645,7 @@ def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -708,7 +710,7 @@ def test_migrate_upgrades_v1_and_preserves_unclassified_legacy_baseline(
             "SELECT baseline_sha256, baseline_tier FROM verdicts",
         ).fetchone()
 
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == ("b" * 64, None)
 
 

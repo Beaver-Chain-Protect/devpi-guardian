@@ -5,6 +5,7 @@ from .models import (
     ArtifactState,
     Decision,
     EnforcementDecision,
+    ReleaseArtifact,
 )
 from .reader import SQLiteVerdictReader
 from .store import SQLiteArtifactStore
@@ -17,6 +18,7 @@ __all__ = [
     "ConnectionFactory",
     "Decision",
     "EnforcementDecision",
+    "ReleaseArtifact",
     "SQLiteArtifactStore",
     "SQLiteVerdictReader",
     "VerdictReader",

@@ -19,6 +19,7 @@ from .models import (
     Decision,
     DecisionSource,
     EnforcementDecision,
+    ReleaseArtifact,
     require_utc,
     validate_sha256,
 )
@@ -207,6 +208,67 @@ class SQLiteVerdictReader:
         )
         return tuple(results)
 
+    def get_artifact_releases(self, sha256: str) -> tuple[ReleaseArtifact, ...]:
+        canonical_sha256 = validate_sha256(sha256)
+        return self._release_artifacts(
+            "WHERE r.sha256 = ?",
+            (canonical_sha256,),
+        )
+
+    def list_release_artifacts(
+        self,
+        project: str,
+        version: str,
+    ) -> tuple[ReleaseArtifact, ...]:
+        canonical_project = normalize_requested_project(project)
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError("version must not be blank")
+        return self._release_artifacts(
+            "WHERE r.project = ? AND r.version = ?",
+            (canonical_project, version),
+        )
+
+    def _release_artifacts(
+        self,
+        where_clause: str,
+        parameters: tuple[str, ...],
+    ) -> tuple[ReleaseArtifact, ...]:
+        try:
+            with self._read_transaction() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT r.id, r.stage, r.project, r.version, r.filename,
+                           r.sha256, r.origin_url, r.discovered_at,
+                           a.size_bytes
+                    FROM release_mappings AS r
+                    JOIN artifacts AS a ON a.sha256 = r.sha256
+                    {where_clause}
+                    ORDER BY r.stage, r.project, r.version, r.filename,
+                             r.sha256, r.origin_url
+                    """,
+                    parameters,
+                ).fetchall()
+                results = []
+                for row in rows:
+                    release = validate_persisted_release_mapping(row)
+                    size_bytes = row["size_bytes"]
+                    if type(size_bytes) is not int or size_bytes < 0:
+                        raise PersistedStateCorruption("invalid persisted artifact size")
+                    results.append(
+                        ReleaseArtifact(
+                            stage=release.stage,
+                            project=release.project,
+                            version=release.version,
+                            filename=release.filename,
+                            sha256=release.sha256,
+                            origin_url=release.origin_url,
+                            size_bytes=size_bytes,
+                        )
+                    )
+                return tuple(results)
+        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+            raise StoreUnavailable(str(self._factory.path)) from exc
+
     @contextmanager
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:
         connection: sqlite3.Connection | None = None
@@ -264,7 +326,7 @@ class SQLiteVerdictReader:
         sha256: str,
         context: PersistedStateContext,
     ) -> EnforcementDecision:
-        allowed = context.effective_decision is Decision.ALLOW
+        allowed = context.effective_decision is Decision.ALLOW and context.cooldown_finished
         return EnforcementDecision(
             sha256=sha256,
             allowed=allowed,
@@ -272,4 +334,6 @@ class SQLiteVerdictReader:
             source=context.source,
             artifact_state=context.artifact_state,
             policy_version=context.policy_version,
+            cooldown_until=context.cooldown_until,
+            cooldown_finished=context.cooldown_finished,
         )

@@ -13,6 +13,7 @@ from .models import (
     EnforcementDecision,
     EvidenceInput,
     ManualOverrideInput,
+    ReleaseArtifact,
     ReleaseInput,
     VerdictInput,
 )
@@ -29,6 +30,14 @@ class VerdictReader(Protocol):
         self,
         project: str,
     ) -> tuple[AllowedRelease, ...]: ...
+
+    def get_artifact_releases(self, sha256: str) -> tuple[ReleaseArtifact, ...]: ...
+
+    def list_release_artifacts(
+        self,
+        project: str,
+        version: str,
+    ) -> tuple[ReleaseArtifact, ...]: ...
 
 
 class AuditWriter(Protocol):

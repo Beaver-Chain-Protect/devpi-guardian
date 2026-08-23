@@ -10,7 +10,11 @@ from pathlib import Path
 from .errors import MigrationError, StoreUnavailable
 
 _MAX_BUSY_TIMEOUT_MS = 2_147_483_647
-_MIGRATION_FILES = ("001_initial.sql", "002_baseline_tier.sql")
+_MIGRATION_FILES = (
+    "001_initial.sql",
+    "002_baseline_tier.sql",
+    "003_artifact_cooldown.sql",
+)
 _SUPPORTED_SCHEMA_VERSION = len(_MIGRATION_FILES)
 _CATALOG_QUERY = """
     SELECT type, name, tbl_name, sql
