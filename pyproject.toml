@@ -31,6 +31,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "devpi_guardian.verdicts.sql" = ["*.sql"]
+"devpi_guardian.analyzers" = ["schemas/*.json"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

