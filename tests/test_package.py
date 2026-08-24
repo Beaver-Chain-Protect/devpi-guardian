@@ -2,6 +2,7 @@
 # Keep devpi's no-section, from-first style in this integration-facing test.
 # ruff: noqa: I001
 from devpi_guardian import plugin
+from devpi_guardian.admin.views import ADMIN_SERVICE_REGISTRY_KEY
 from devpi_guardian.enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from devpi_guardian.enforcement.metrics import InMemoryBlockMetricRecorder
 from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
@@ -33,9 +34,17 @@ class FakePyramidConfig:
         self.xom = SimpleNamespace()
         self.registry = {"xom": self.xom}
         self.tweens = []
+        self.routes = []
+        self.views = []
 
     def add_tween(self, name, **kwargs):
         self.tweens.append((name, kwargs))
+
+    def add_route(self, name, path):
+        self.routes.append((name, path))
+
+    def add_view(self, view, **kwargs):
+        self.views.append((view, kwargs))
 
 
 def test_package_exposes_devpi_server_entry_point() -> None:
@@ -163,6 +172,14 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     metrics = pyramid.registry[BLOCK_METRIC_REGISTRY_KEY]
     assert isinstance(metrics, InMemoryBlockMetricRecorder)
     assert metrics.snapshot() == {}
+    assert pyramid.registry[ADMIN_SERVICE_REGISTRY_KEY].health() == {
+        "database": "ok",
+        "schema_version": 3,
+        "mutations_ready": False,
+    }
+    assert len(pyramid.routes) == 7
+    assert len(pyramid.views) == 7
+    assert all(options["permission"] == "user_modify" for _, options in pyramid.views)
     tween_prefix = "devpi_guardian.enforcement.tween."
     tween_suffix = "guardian_enforcement_tween_factory"
     tween_name = tween_prefix + tween_suffix

@@ -297,6 +297,49 @@ class EnforcementDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactAdminSummary:
+    sha256: str
+    size_bytes: int
+    state: ArtifactState
+    discovered_at: datetime
+    updated_at: datetime
+    cooldown_until: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRecord:
+    rule_id: str
+    action: Decision
+    file_path: str | None
+    line: int | None
+    message: str
+    details: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAdminDetails:
+    summary: ArtifactAdminSummary
+    allowed: bool
+    effective_decision: Decision
+    decision_source: DecisionSource
+    policy_version: str | None
+    analyzer_version: str | None
+    baseline_sha256: str | None
+    baseline_tier: BaselineTier | None
+    releases: tuple[ReleaseArtifact, ...]
+    evidence: tuple[EvidenceRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantinePage:
+    items: tuple[ArtifactAdminSummary, ...]
+    total: int
+    limit: int
+    offset: int
+
+
+@dataclass(frozen=True, slots=True)
 class AuditEventInput:
     actor: str
     action: str
