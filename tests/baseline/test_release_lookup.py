@@ -85,6 +85,7 @@ def test_allowed_releases_converts_to_f6_release_records(tmp_path):
             version="1.0.0",
             filename="demo_package-1.0.0-py3-none-any.whl",
             sha256=SHA_OLD,
+            size_bytes=1,
         )
     ]
 
@@ -152,12 +153,15 @@ def test_the_origin_url_of_a_returned_release_is_resolvable(tmp_path):
     assert lookup.origin_url(SHA_OLD) == (
         "https://devpi.example/root/dev/+f/aa/demo_package-1.0.0-py3-none-any.whl"
     )
+    assert lookup.expected_size(SHA_OLD) == 1
 
 
 def test_an_unseen_digest_has_no_origin_url(tmp_path):
     lookup = build_lookup(build_store(tmp_path))
     with pytest.raises(UnknownArtifactOrigin):
         lookup.origin_url(SHA_NEW)
+    with pytest.raises(UnknownArtifactOrigin):
+        lookup.expected_size(SHA_NEW)
 
 
 def test_the_adapter_satisfies_the_origin_url_resolver_protocol(tmp_path):
@@ -186,6 +190,7 @@ def test_a_broken_store_becomes_an_analyzer_error_not_a_skipped_diff(tmp_path):
         version="2.0.0",
         filename="demo_package-2.0.0-py3-none-any.whl",
         sha256=SHA_NEW,
+        size_bytes=0,
     )
 
     result = compare_release_to_baseline(
@@ -224,6 +229,7 @@ def test_select_baseline_picks_the_newest_allowed_release_from_the_store(tmp_pat
         version="2.0.0",
         filename="demo_package-2.0.0-py3-none-any.whl",
         sha256=SHA_NEW,
+        size_bytes=0,
     )
     selection = select_baseline(target, build_lookup(factory))
     assert selection is not None
@@ -241,6 +247,7 @@ def test_the_sdist_tier_is_reachable_from_real_store_data(tmp_path):
         version="2.0.0",
         filename="demo_package-2.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
         sha256=SHA_NEW,
+        size_bytes=0,
     )
     selection = select_baseline(target, build_lookup(factory))
     assert selection is not None

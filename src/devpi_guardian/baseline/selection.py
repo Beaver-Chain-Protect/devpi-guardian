@@ -86,10 +86,13 @@ class ReleaseRecord:
     version: str
     filename: str
     sha256: str
+    size_bytes: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.sha256, str) or _SHA256_PATTERN.fullmatch(self.sha256) is None:
             raise ValueError("sha256 must be a lowercase 64-character SHA-256")
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise ValueError("size_bytes must be a nonnegative integer")
         for name in ("project", "version", "filename"):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"{name} must not be blank")
@@ -261,7 +264,7 @@ def _best_in_tier(
     # that the selection is reproducible across lookup orderings.
     chosen = min(
         (candidate for version, candidate in matching if version == highest),
-        key=lambda candidate: candidate.filename,
+        key=lambda candidate: (candidate.filename, candidate.sha256),
     )
     return BaselineSelection(release=chosen, tier=tier, version=highest)
 

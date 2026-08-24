@@ -53,6 +53,8 @@ class OriginUrlResolver(Protocol):
 
     def origin_url(self, sha256: str) -> str: ...
 
+    def expected_size(self, sha256: str) -> int: ...
+
 
 class HttpResponse(Protocol):
     """The slice of an HTTP response this module uses."""
@@ -71,7 +73,14 @@ class HttpSession(Protocol):
     `requests.Session` with any authentication already configured on it.
     """
 
-    def get(self, url: str, *, stream: bool, timeout: float) -> HttpResponse: ...
+    def get(
+        self,
+        url: str,
+        *,
+        stream: bool,
+        timeout: float,
+        allow_redirects: bool,
+    ) -> HttpResponse: ...
 
 
 class HttpArtifactBytesSource:
@@ -139,9 +148,10 @@ class HttpArtifactBytesSource:
             return cached
 
         url = self._url_for(digest)
+        expected_size = self._expected_size_for(digest)
         target = self._directory() / _local_name(digest, url)
         try:
-            actual = self._download(url, target)
+            actual = self._download(url, target, expected_size)
         except ArtifactDownloadError:
             target.unlink(missing_ok=True)
             raise
@@ -182,8 +192,19 @@ class HttpArtifactBytesSource:
             raise ArtifactDownloadError(f"지원하지 않는 origin_url 스킴: {url}")
         return url
 
-    def _download(self, url: str, target: Path) -> str:
-        response = self._session.get(url, stream=True, timeout=self._timeout)
+    def _expected_size_for(self, digest: str) -> int:
+        size = self._resolver.expected_size(digest)
+        if type(size) is not int or size < 0:
+            raise ArtifactDownloadError(f"저장된 artifact 크기가 유효하지 않음: {size!r}")
+        return size
+
+    def _download(self, url: str, target: Path, expected_size: int) -> str:
+        response = self._session.get(
+            url,
+            stream=True,
+            timeout=self._timeout,
+            allow_redirects=False,
+        )
         try:
             status = getattr(response, "status_code", None)
             if status != 200:
@@ -201,6 +222,10 @@ class HttpArtifactBytesSource:
                         )
                     digest.update(chunk)
                     handle.write(chunk)
+            if written != expected_size:
+                raise ArtifactDownloadError(
+                    f"{url} 크기가 저장값과 다름: 저장={expected_size}, 실제={written}"
+                )
         finally:
             close = getattr(response, "close", None)
             if callable(close):

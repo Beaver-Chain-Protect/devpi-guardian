@@ -57,7 +57,25 @@ def test_artifact_bytes_source_round_trip(tmp_path):
 
 def test_release_record_requires_a_valid_sha256():
     with pytest.raises(ValueError):
-        ReleaseRecord(project="acme", version="1.0", filename=SDIST, sha256="nope")
+        ReleaseRecord(
+            project="acme",
+            version="1.0",
+            filename=SDIST,
+            sha256="nope",
+            size_bytes=0,
+        )
+
+
+@pytest.mark.parametrize("size_bytes", [-1, True, 1.5])
+def test_release_record_requires_a_nonnegative_integer_size(size_bytes):
+    with pytest.raises(ValueError):
+        ReleaseRecord(
+            project="acme",
+            version="1.0",
+            filename=SDIST,
+            sha256=digest("size"),
+            size_bytes=size_bytes,
+        )
 
 
 @pytest.mark.parametrize("blank_field", ["project", "version", "filename"])
@@ -67,6 +85,7 @@ def test_release_record_rejects_blank_identity(blank_field):
         "version": "1.0",
         "filename": SDIST,
         "sha256": digest("x"),
+        "size_bytes": 0,
         blank_field: "  ",
     }
     with pytest.raises(ValueError):
@@ -173,7 +192,13 @@ def test_an_unparsable_target_version_selects_nothing(caplog):
 
 def test_the_target_itself_is_never_its_own_baseline():
     target = release("acme", "2.0.0", PURE)
-    same = ReleaseRecord(project="acme", version="2.0.0", filename=PURE, sha256=target.sha256)
+    same = ReleaseRecord(
+        project="acme",
+        version="2.0.0",
+        filename=PURE,
+        sha256=target.sha256,
+        size_bytes=0,
+    )
     assert eligible_candidates(target, [same]) == []
 
 
@@ -191,6 +216,29 @@ def test_project_names_are_compared_after_normalization():
     selection = choose(target, older)
     assert selection is not None
     assert selection.release == older
+
+
+def test_same_version_and_filename_ties_choose_the_same_digest_regardless_of_order():
+    target = release("acme", "2.0.0", PLATFORM)
+    first = release(
+        "acme",
+        "1.0.0",
+        "acme-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+        sha256=digest("first"),
+    )
+    second = release(
+        "acme",
+        "1.0.0",
+        "acme-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+        sha256=digest("second"),
+    )
+
+    left = choose(target, first, second)
+    right = choose(target, second, first)
+
+    assert left is not None
+    assert right is not None
+    assert left.release.sha256 == right.release.sha256 == min(first.sha256, second.sha256)
 
 
 def test_lookup_is_queried_with_the_target_project_name():

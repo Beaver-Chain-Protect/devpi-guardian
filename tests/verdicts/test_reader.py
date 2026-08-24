@@ -294,10 +294,25 @@ def test_list_allowed_releases_normalizes_project_and_returns_immutable_result(
             filename="demo_package-1.0.0-py3-none-any.whl",
             sha256=SHA_ALLOW,
             origin_url=expected_origin,
+            size_bytes=1,
         ),
     )
     assert isinstance(result, tuple)
     assert reader.list_allowed_releases("missing-project") == ()
+
+
+@pytest.mark.parametrize("size_bytes", [-1, True, 1.5])
+def test_allowed_release_rejects_invalid_size(size_bytes) -> None:
+    with pytest.raises(ValueError):
+        AllowedRelease(
+            stage="root/dev",
+            project="demo-package",
+            version="1.0.0",
+            filename="demo.whl",
+            sha256=SHA_ALLOW,
+            origin_url="https://devpi.example/demo.whl",
+            size_bytes=size_bytes,
+        )
 
 
 def test_reader_exposes_release_and_health_admin_apis(tmp_path) -> None:

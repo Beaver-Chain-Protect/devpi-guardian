@@ -336,11 +336,12 @@ class SQLiteVerdictReader:
             with self._read_transaction() as connection:
                 mapping_cursor = connection.execute(
                     """
-                    SELECT id, stage, project, version, filename, sha256,
-                           origin_url, discovered_at
-                    FROM release_mappings
+                    SELECT r.id, r.stage, r.project, r.version, r.filename, r.sha256,
+                           r.origin_url, r.discovered_at, a.size_bytes
+                    FROM release_mappings AS r
+                    LEFT JOIN artifacts AS a ON a.sha256 = r.sha256
                     WHERE project = ?
-                    ORDER BY id
+                    ORDER BY r.id
                     """,
                     (canonical_project,),
                 )

@@ -61,6 +61,7 @@ from ..analyzers.types import Finding, make_finding, sort_findings
 from .selection import (
     ArtifactBytesSource,
     BaselineSelection,
+    BaselineTier,
     ReleaseLookup,
     ReleaseRecord,
     artifact_kind,
@@ -70,6 +71,25 @@ from .selection import (
 #: Why a finding exists in a baseline diff. Every finding F7 returns carries
 #: one of these, because `Finding` is frozen and must not grow a field.
 Origin = Literal["diff_new", "diff_changed", "diff_artifact"]
+
+
+@dataclass(frozen=True, slots=True)
+class FindingAttribution:
+    """A finding paired with its diff origin and baseline confidence tier."""
+
+    finding: Finding
+    origin: Origin
+    tier: BaselineTier | None
+
+    def __iter__(self):
+        """Keep the pre-F10 two-value iteration API source-compatible."""
+
+        yield self.finding
+        yield self.origin
+
+    def __getitem__(self, index: int):
+        return (self.finding, self.origin, self.tier)[index]
+
 
 #: Rules that only baseline diffing can raise. F8's RULES has no baseline
 #: vocabulary, and reusing a `wheel_only_*` rule would show operators a message
@@ -161,12 +181,13 @@ class CarriedEvidence:
 class BaselineDiff:
     """Everything F7 learned about one artifact/baseline pair."""
 
-    findings: tuple[tuple[Finding, Origin], ...]
+    findings: tuple[FindingAttribution, ...]
     files: FileDiff
     surface: tuple[NewSurface, ...]
     carried_flows: tuple[CarriedFlow, ...]
     carried_evidence: tuple[CarriedEvidence, ...]
     usable: bool
+    tier: BaselineTier | None = None
 
 
 _EMPTY_FILES = FileDiff((), (), (), ())
@@ -212,7 +233,9 @@ def _error(file: str, exc: BaseException) -> Finding:
 
 def _ordered(
     pairs: Iterable[tuple[Finding, Origin]],
-) -> tuple[tuple[Finding, Origin], ...]:
+    *,
+    tier: BaselineTier | None = None,
+) -> tuple[FindingAttribution, ...]:
     """De-duplicate by evidence identity and reuse F8's public ordering."""
 
     grouped: dict[str, tuple[Finding, set[Origin]]] = {}
@@ -221,10 +244,10 @@ def _ordered(
         entry = grouped.setdefault(fingerprint, (finding, set()))
         entry[1].add(origin)
 
-    ordered: list[tuple[Finding, Origin]] = []
+    ordered: list[FindingAttribution] = []
     for finding in sort_findings([representative for representative, _ in grouped.values()]):
         origins = grouped[finding_fingerprint(finding)][1]
-        ordered.extend((finding, origin) for origin in sorted(origins))
+        ordered.extend(FindingAttribution(finding, origin, tier) for origin in sorted(origins))
     return tuple(ordered)
 
 
@@ -604,12 +627,13 @@ def _compare(
     baseline_filename: str,
     artifact: ExtractedArtifact,
     artifact_filename: str,
+    tier: BaselineTier | None,
 ) -> BaselineDiff:
     findings: list[tuple[Finding, Origin]] = [
         (finding, "diff_artifact") for finding in (*baseline.findings, *artifact.findings)
     ]
     if not baseline.usable or not artifact.usable:
-        return BaselineDiff(_ordered(findings), _EMPTY_FILES, (), (), (), False)
+        return BaselineDiff(_ordered(findings, tier=tier), _EMPTY_FILES, (), (), (), False, tier)
 
     # The full maps still contain `.dist-info`; only the file comparison
     # below drops it. Entry point parsing needs what is inside it.
@@ -684,18 +708,21 @@ def _compare(
         )
     )
     return BaselineDiff(
-        _ordered(findings),
+        _ordered(findings, tier=tier),
         files,
         tuple(surfaces),
         ordered_flows,
         ordered_carried,
         True,
+        tier,
     )
 
 
 def diff_against_baseline(
     baseline_path: str | os.PathLike[str],
     artifact_path: str | os.PathLike[str],
+    *,
+    tier: BaselineTier | None = None,
 ) -> BaselineDiff:
     """Diff one artifact against its baseline. No exception reaches the caller."""
 
@@ -706,12 +733,12 @@ def diff_against_baseline(
             root = Path(temp_dir)
             baseline = extract_artifact(baseline_path, root / "baseline")
             artifact = extract_artifact(artifact_path, root / "artifact")
-            return _compare(baseline, baseline_name, artifact, artifact_name)
+            return _compare(baseline, baseline_name, artifact, artifact_name, tier)
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         return BaselineDiff(
-            _ordered([(_error(artifact_name, exc), "diff_artifact")]),
+            _ordered([(_error(artifact_name, exc), "diff_artifact")], tier=tier),
             _EMPTY_FILES,
             (),
             (),
@@ -723,20 +750,22 @@ def diff_against_baseline(
 def compare_to_baseline(
     baseline_path: str | os.PathLike[str],
     artifact_path: str | os.PathLike[str],
-) -> list[tuple[Finding, Origin]]:
+    *,
+    tier: BaselineTier | None = None,
+) -> list[FindingAttribution]:
     """F7's judgement surface: findings new relative to the baseline.
 
     Each finding is paired with its origin because `Finding` is frozen and
     deliberately not extended with a diff-specific field.
     """
 
-    return list(diff_against_baseline(baseline_path, artifact_path).findings)
+    return list(diff_against_baseline(baseline_path, artifact_path, tier=tier).findings)
 
 
-def findings_only(pairs: Sequence[tuple[Finding, Origin]]) -> list[Finding]:
-    """Drop origins, for callers that only consume F8-shaped findings."""
+def findings_only(pairs: Sequence[FindingAttribution]) -> list[Finding]:
+    """Drop baseline attribution for callers that only consume F8 findings."""
 
-    return [finding for finding, _ in pairs]
+    return [pair.finding for pair in pairs]
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,7 +801,7 @@ class BaselineComparison:
     #: `findings` to `EvidenceInput`.
     selection: BaselineSelection | None
     diff: BaselineDiff | None
-    findings: tuple[tuple[Finding, Origin], ...]
+    findings: tuple[FindingAttribution, ...]
 
 
 _NO_BASELINE = BaselineComparison(
@@ -832,10 +861,13 @@ def compare_release_to_baseline(
             baseline_sha256=selection.release.sha256,
             selection=selection,
             diff=None,
-            findings=_ordered([(_error(selection.release.filename, exc), "diff_artifact")]),
+            findings=_ordered(
+                [(_error(selection.release.filename, exc), "diff_artifact")],
+                tier=selection.tier,
+            ),
         )
 
-    diff = diff_against_baseline(baseline_path, artifact_path)
+    diff = diff_against_baseline(baseline_path, artifact_path, tier=selection.tier)
     return BaselineComparison(
         has_baseline=True,
         baseline_sha256=selection.release.sha256,

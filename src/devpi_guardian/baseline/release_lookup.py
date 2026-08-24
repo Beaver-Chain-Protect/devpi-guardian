@@ -57,7 +57,7 @@ class VerdictReaderReleaseLookup:
 
     def __init__(self, reader: AllowedReleaseSource) -> None:
         self._reader = reader
-        self._origin_urls: dict[str, str] = {}
+        self._origin_urls: dict[str, tuple[str, int]] = {}
 
     def allowed_releases(self, project: str) -> list[ReleaseRecord]:
         """Return the project's approved releases as F6 release records.
@@ -80,9 +80,13 @@ class VerdictReaderReleaseLookup:
                     version=release.version,
                     filename=release.filename,
                     sha256=release.sha256,
+                    size_bytes=release.size_bytes,
                 )
             )
-            self._origin_urls.setdefault(release.sha256, release.origin_url)
+            self._origin_urls.setdefault(
+                release.sha256,
+                (release.origin_url, release.size_bytes),
+            )
         return records
 
     def origin_url(self, sha256: str) -> str:
@@ -94,6 +98,14 @@ class VerdictReaderReleaseLookup:
         """
 
         try:
-            return self._origin_urls[sha256]
+            return self._origin_urls[sha256][0]
+        except KeyError:
+            raise UnknownArtifactOrigin(sha256) from None
+
+    def expected_size(self, sha256: str) -> int:
+        """Resolve the stored byte count for a release already returned."""
+
+        try:
+            return self._origin_urls[sha256][1]
         except KeyError:
             raise UnknownArtifactOrigin(sha256) from None

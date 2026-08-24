@@ -99,6 +99,7 @@ def target_record(sha256: str) -> ReleaseRecord:
         version="2.0.0",
         filename=TARGET_NAME,
         sha256=sha256,
+        size_bytes=0,
     )
 
 
@@ -115,6 +116,7 @@ def test_the_real_adapters_find_a_smuggled_flow_end_to_end(tmp_path, wheels):
             baseline_sha,
             version="1.0.0",
             filename=BASELINE_NAME,
+            size_bytes=baseline.stat().st_size,
             origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
         )
         # An older approved release exists too; F6 must not pick it.
@@ -165,6 +167,7 @@ def test_downloaded_baseline_files_are_gone_after_the_comparison(tmp_path, wheel
             baseline_sha,
             version="1.0.0",
             filename=BASELINE_NAME,
+            size_bytes=baseline.stat().st_size,
             origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
         )
         with requests.Session() as session:
@@ -180,6 +183,37 @@ def test_downloaded_baseline_files_are_gone_after_the_comparison(tmp_path, wheel
                 assert downloaded.exists()
 
     assert not downloaded.exists()
+
+
+def test_a_stored_baseline_size_mismatch_is_an_analyzer_error(tmp_path, wheels):
+    requests = pytest.importorskip("requests")
+    baseline, _stale, target = wheels
+    baseline_sha = digest_of(baseline)
+
+    with _Server({f"/+f/{BASELINE_NAME}": baseline.read_bytes()}) as server:
+        factory = build_store(tmp_path)
+        seed_allowed(
+            factory,
+            baseline_sha,
+            version="1.0.0",
+            filename=BASELINE_NAME,
+            size_bytes=baseline.stat().st_size + 1,
+            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+        )
+        with requests.Session() as session:
+            lookup, source = wire(factory, session)
+            with source:
+                result = compare_release_to_baseline(
+                    target_record(digest_of(target)),
+                    target,
+                    lookup=lookup,
+                    bytes_source=source,
+                )
+
+    assert result.has_baseline is True
+    assert result.diff is None
+    assert [finding.rule for finding, _ in result.findings] == ["analyzer_error"]
+    assert "저장" in result.findings[0][0].snippet
 
 
 def test_a_project_with_no_approved_release_skips_the_diff(tmp_path, wheels):
@@ -215,6 +249,7 @@ def test_an_undownloadable_baseline_is_an_analyzer_error_not_a_first_release(tmp
             baseline_sha,
             version="1.0.0",
             filename=BASELINE_NAME,
+            size_bytes=len(b"not the approved wheel"),
             origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
         )
         with requests.Session() as session:
@@ -248,6 +283,7 @@ def test_a_tampered_baseline_body_is_an_analyzer_error(tmp_path, wheels):
             baseline_sha,
             version="1.0.0",
             filename=BASELINE_NAME,
+            size_bytes=len(b"not the approved wheel"),
             origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
         )
         with requests.Session() as session:

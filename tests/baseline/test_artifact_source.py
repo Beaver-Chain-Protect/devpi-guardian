@@ -30,11 +30,19 @@ URL = "https://devpi.example/root/dev/+f/aa/demo-1.0.0-py3-none-any.whl"
 
 
 class DictResolver:
-    def __init__(self, urls: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        urls: dict[str, str] | None = None,
+        sizes: dict[str, int] | None = None,
+    ) -> None:
         self.urls = urls if urls is not None else {DIGEST: URL}
+        self.sizes = sizes if sizes is not None else {DIGEST: len(PAYLOAD)}
 
     def origin_url(self, sha256: str) -> str:
         return self.urls[sha256]
+
+    def expected_size(self, sha256: str) -> int:
+        return self.sizes[sha256]
 
 
 class FakeResponse:
@@ -154,7 +162,8 @@ def test_a_downloaded_file_is_extractable_by_the_analyzer(tmp_path):
     body = wheel.read_bytes()
     digest = hashlib.sha256(body).hexdigest()
     resolver = DictResolver(
-        {digest: "https://devpi.example/root/dev/+f/aa/demo-1.0.0-py3-none-any.whl"}
+        {digest: "https://devpi.example/root/dev/+f/aa/demo-1.0.0-py3-none-any.whl"},
+        {digest: len(body)},
     )
     with make_source(FakeSession(body=body), resolver) as source:
         extracted = extract_artifact(source.open(digest), tmp_path / "out")
@@ -229,7 +238,15 @@ def test_the_source_passes_only_url_stream_and_timeout():
         source.open(DIGEST)
     (url, kwargs) = session.calls[0]
     assert url == URL
-    assert kwargs == {"stream": True, "timeout": 12.5}
+    assert kwargs == {"stream": True, "timeout": 12.5, "allow_redirects": False}
+
+
+def test_a_stored_size_mismatch_is_rejected_and_not_cached():
+    resolver = DictResolver(sizes={DIGEST: len(PAYLOAD) + 1})
+    with make_source(resolver=resolver) as source, pytest.raises(ArtifactDownloadError):
+        source.open(DIGEST)
+    assert source._downloaded == {}
+    assert list(source._directory().iterdir()) == []
 
 
 def test_a_session_object_with_nothing_but_get_is_enough():
@@ -246,7 +263,8 @@ def test_a_session_object_with_nothing_but_get_is_enough():
 
 def test_a_digest_mismatch_raises_and_leaves_no_file():
     session = FakeSession(body=b"tampered payload")
-    with make_source(session) as source:
+    resolver = DictResolver(sizes={DIGEST: len(b"tampered payload")})
+    with make_source(session, resolver) as source:
         with pytest.raises(ArtifactDigestMismatch) as raised:
             source.open(DIGEST)
         assert DIGEST in str(raised.value)
@@ -258,7 +276,11 @@ def test_a_digest_mismatch_is_a_download_error_subclass():
 
 
 def test_an_empty_response_body_still_fails_verification():
-    with make_source(FakeSession(body=b"")) as source, pytest.raises(ArtifactDigestMismatch):
+    resolver = DictResolver(sizes={DIGEST: 0})
+    with (
+        make_source(FakeSession(body=b""), resolver) as source,
+        pytest.raises(ArtifactDigestMismatch),
+    ):
         source.open(DIGEST)
 
 
@@ -425,13 +447,58 @@ def test_a_real_requests_session_reports_a_404_as_a_download_error(local_server)
 
 def test_a_real_requests_session_rejects_a_tampered_body(local_server):
     requests = pytest.importorskip("requests")
-    resolver = DictResolver({OTHER_DIGEST: f"{local_server}/artifact.whl"})
+    resolver = DictResolver(
+        {OTHER_DIGEST: f"{local_server}/artifact.whl"},
+        {OTHER_DIGEST: len(PAYLOAD)},
+    )
     with (
         requests.Session() as session,
         make_source(session, resolver) as source,
         pytest.raises(ArtifactDigestMismatch),
     ):
         source.open(OTHER_DIGEST)
+
+
+def test_a_real_requests_session_rejects_redirects_without_caching_the_target():
+    requests = pytest.importorskip("requests")
+    requested: list[str] = []
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            if self.path == "/redirect.whl":
+                self.send_response(302)
+                self.send_header("Location", "/artifact.whl")
+                self.end_headers()
+                return
+            if self.path == "/artifact.whl":
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(PAYLOAD)))
+                self.end_headers()
+                self.wfile.write(PAYLOAD)
+                return
+            self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        resolver = DictResolver(
+            {DIGEST: f"http://127.0.0.1:{server.server_address[1]}/redirect.whl"}
+        )
+        with requests.Session() as session, make_source(session, resolver) as source:
+            with pytest.raises(ArtifactDownloadError):
+                source.open(DIGEST)
+            assert source._downloaded == {}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert requested == ["/redirect.whl"]
 
 
 def test_an_authenticated_real_session_behaves_identically(local_server):

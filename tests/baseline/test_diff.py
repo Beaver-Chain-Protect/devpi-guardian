@@ -13,6 +13,7 @@ from devpi_guardian.analyzers.types import Finding
 from devpi_guardian.baseline.diff import (
     DIFF_RULES,
     BaselineDiff,
+    FindingAttribution,
     compare_release_to_baseline,
     compare_to_baseline,
     diff_against_baseline,
@@ -83,6 +84,67 @@ def test_findings_only_drops_origins(tmp_path):
     result = pair(tmp_path, {"pkg/a.py": CLEAN}, {"pkg/a.py": CLEAN, "pkg/b.py": EXFILTRATE})
     assert findings_only(result.findings) == [finding for finding, _ in result.findings]
     assert all(isinstance(finding, Finding) for finding in findings_only(result.findings))
+
+
+@pytest.mark.parametrize(
+    ("tier", "baseline_name", "target_name", "builder"),
+    [
+        (
+            "same_tag",
+            "demo-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+            "demo-2.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+            build_wheel,
+        ),
+        (
+            "universal_wheel",
+            "demo-1.0.0-py3-none-any.whl",
+            "demo-2.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+            build_wheel,
+        ),
+        ("sdist", "demo-1.0.0.tar.gz", "demo-2.0.0.tar.gz", build_sdist),
+    ],
+)
+def test_every_finding_carries_origin_and_selected_tier(
+    tmp_path,
+    tier,
+    baseline_name,
+    target_name,
+    builder,
+):
+    baseline = builder(tmp_path / baseline_name, {"pkg/a.py": CLEAN})
+    target = builder(tmp_path / target_name, {"pkg/a.py": EXFILTRATE})
+    baseline_record = make_release(
+        "demo",
+        "1.0.0",
+        baseline_name,
+        sha256="a" * 64,
+        size_bytes=baseline.stat().st_size,
+    )
+    target_record = make_release(
+        "demo",
+        "2.0.0",
+        target_name,
+        sha256="b" * 64,
+        size_bytes=target.stat().st_size,
+    )
+    source = FakeArtifactBytesSource(tmp_path / "store")
+    source.add(baseline_record.sha256, baseline.read_bytes(), filename=baseline_name)
+
+    result = compare_release_to_baseline(
+        target_record,
+        target,
+        lookup=FakeReleaseLookup([baseline_record]),
+        bytes_source=source,
+    )
+
+    assert result.selection is not None
+    assert result.selection.tier == tier
+    assert result.diff is not None
+    assert result.diff.tier == tier
+    assert result.findings
+    assert all(entry.origin == "diff_changed" for entry in result.findings)
+    assert all(entry.tier == tier for entry in result.findings)
+    assert all(entry.tier == tier for entry in result.diff.findings)
 
 
 # --- step 1: file comparison ----------------------------------------------
@@ -502,13 +564,8 @@ def test_compare_to_baseline_returns_the_specified_shape(tmp_path):
     )
     pairs = compare_to_baseline(baseline, artifact)
     assert isinstance(pairs, list)
-    assert all(
-        isinstance(item, tuple)
-        and len(item) == 2
-        and isinstance(item[0], Finding)
-        and isinstance(item[1], str)
-        for item in pairs
-    )
+    assert all(isinstance(item, FindingAttribution) for item in pairs)
+    assert all(isinstance(item.finding, Finding) and isinstance(item.origin, str) for item in pairs)
     assert pairs == list(diff_against_baseline(baseline, artifact).findings)
 
 

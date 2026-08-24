@@ -22,13 +22,19 @@ def digest(seed: str) -> str:
 
 
 def release(
-    project: str, version: str, filename: str, *, sha256: str | None = None
+    project: str,
+    version: str,
+    filename: str,
+    *,
+    sha256: str | None = None,
+    size_bytes: int = 0,
 ) -> ReleaseRecord:
     return ReleaseRecord(
         project=project,
         version=version,
         filename=filename,
         sha256=sha256 or digest(f"{project}-{version}-{filename}"),
+        size_bytes=size_bytes,
     )
 
 

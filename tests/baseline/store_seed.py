@@ -28,6 +28,7 @@ def seed_artifact(
     sha256: str,
     state: ArtifactState,
     automated: tuple[Decision, str] | None = None,
+    size_bytes: int = 1,
 ) -> None:
     timestamp = NOW.isoformat()
     lease = (
@@ -41,9 +42,9 @@ def seed_artifact(
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
                 lease_owner, lease_expires_at, lease_token, last_error
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
-            (sha256, state.value, timestamp, timestamp, *lease),
+            (sha256, size_bytes, state.value, timestamp, timestamp, *lease),
         )
         if automated is not None:
             decision, policy_version = automated
@@ -92,5 +93,12 @@ def seed_release(
 def seed_allowed(factory: ConnectionFactory, sha256: str, **release_kwargs) -> None:
     """Seed one artifact whose current automated verdict is ALLOW."""
 
-    seed_artifact(factory, sha256, ArtifactState.ALLOW, automated=(Decision.ALLOW, "policy-1"))
+    size_bytes = release_kwargs.pop("size_bytes", 1)
+    seed_artifact(
+        factory,
+        sha256,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        size_bytes=size_bytes,
+    )
     seed_release(factory, sha256, **release_kwargs)
