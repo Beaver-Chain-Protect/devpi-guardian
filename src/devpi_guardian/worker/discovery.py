@@ -28,6 +28,9 @@ _REQUIRED_DISCOVERY_COLUMNS = frozenset(
         "lease_owner",
         "lease_expires_at",
         "lease_token",
+        "last_error",
+        "created_at",
+        "updated_at",
     }
 )
 

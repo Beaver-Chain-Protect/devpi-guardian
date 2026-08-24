@@ -75,14 +75,15 @@ class VerifiedArtifact:
                 validation_error.add_note(
                     f"stream cleanup lookup failed: {type(cleanup_error).__name__}: {cleanup_error}"
                 )
-                raise
-            if callable(close):
-                try:
-                    close()
-                except BaseException as cleanup_error:
-                    validation_error.add_note(
-                        f"stream cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
-                    )
+            else:
+                if callable(close):
+                    try:
+                        close()
+                    except BaseException as cleanup_error:
+                        validation_error.add_note(
+                            "stream cleanup failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
             raise
 
     def open_for_analysis(self) -> AbstractContextManager[BinaryIO]:

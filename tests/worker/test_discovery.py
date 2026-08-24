@@ -216,3 +216,29 @@ def test_incompatible_preexisting_discovery_schema_fails_closed(tmp_path) -> Non
 
     with pytest.raises(DiscoveryUnavailable, match=r"incompatible.*lease_token"):
         FileDiscoverySink(tmp_path)
+
+
+@pytest.mark.parametrize("missing", ["last_error", "created_at", "updated_at"])
+def test_discovery_rejects_any_incomplete_preexisting_schema(tmp_path, missing) -> None:
+    columns = {
+        "job_id": "TEXT PRIMARY KEY",
+        "candidate_json": "TEXT NOT NULL",
+        "state": "TEXT NOT NULL",
+        "attempt_count": "INTEGER NOT NULL",
+        "available_at": "TEXT NOT NULL",
+        "lease_owner": "TEXT",
+        "lease_expires_at": "TEXT",
+        "lease_token": "TEXT",
+        "last_error": "TEXT",
+        "created_at": "TEXT NOT NULL",
+        "updated_at": "TEXT NOT NULL",
+    }
+    columns.pop(missing)
+    definition = ", ".join(f"{name} {spec}" for name, spec in columns.items())
+    path = tmp_path / "discovery.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(f"CREATE TABLE discovery_jobs ({definition})")
+        connection.commit()
+
+    with pytest.raises(DiscoveryUnavailable, match=rf"incompatible.*{missing}"):
+        FileDiscoverySink(tmp_path)
