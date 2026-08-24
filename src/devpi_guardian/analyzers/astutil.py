@@ -397,12 +397,14 @@ def categorize_call(
     aliases: dict[str, str],
     instance_bindings: dict[str, str] | None = None,
     constructor_bindings: dict[str, str] | None = None,
+    callable_aliases: dict[str, str] | None = None,
 ) -> tuple[str | None, str]:
     qualified = _qualified_call_name(
         call,
         aliases,
         instance_bindings or {},
         constructor_bindings,
+        callable_aliases or {},
     )
     if qualified in PROCESS_CALLS or qualified.startswith(("os.spawn", "os.exec")):
         return "process", qualified
@@ -447,7 +449,18 @@ def _qualified_call_name(
     aliases: dict[str, str],
     instance_bindings: dict[str, str],
     constructor_bindings: dict[str, str] | None = None,
+    callable_aliases: dict[str, str] | None = None,
 ) -> str:
+    callable_aliases = callable_aliases or {}
+    callable_identity = _callable_identity(
+        call.func,
+        aliases,
+        instance_bindings,
+        constructor_bindings,
+        callable_aliases,
+    )
+    if callable_identity is not None:
+        return callable_identity
     if isinstance(call.func, ast.Attribute):
         reference = _reference_path(call.func.value)
         kind = instance_bindings.get(reference) if reference is not None else None
@@ -463,6 +476,36 @@ def _qualified_call_name(
     if kind is not None:
         return f"{kind}.{call.func.attr}"
     return "<dynamic-call>"
+
+
+def _callable_identity(
+    node: ast.AST,
+    aliases: dict[str, str],
+    instance_bindings: dict[str, str],
+    constructor_bindings: dict[str, str] | None,
+    callable_aliases: dict[str, str],
+) -> str | None:
+    """Resolve a callable assignment RHS without treating arbitrary names as known."""
+
+    if isinstance(node, ast.Name):
+        identity = callable_aliases.get(node.id)
+        if identity is not None:
+            return identity
+    if isinstance(node, ast.Attribute):
+        reference = _reference_path(node.value)
+        kind = instance_bindings.get(reference) if reference is not None else None
+        if kind is not None:
+            return f"{kind}.{node.attr}"
+        kind = _constructor_kind(node.value, aliases, constructor_bindings)
+        if kind is not None:
+            return f"{kind}.{node.attr}"
+    reference = _reference_path(node)
+    if reference is None:
+        return None
+    root = reference.split(".", 1)[0]
+    if root not in aliases:
+        return None
+    return _scoped_resolve_qualified_name(node, aliases)
 
 
 def _target_reference_paths(target: ast.AST) -> list[str]:
@@ -844,10 +887,12 @@ class _CallVisitor(ast.NodeVisitor):
         self._instance_scopes: list[dict[str, str]] = [{}]
         self._constructor_scopes: list[dict[str, str]] = [{}]
         self._alias_scopes: list[dict[str, str]] = [{}]
+        self._callable_scopes: list[dict[str, str]] = [{}]
         self._class_summaries: dict[ast.ClassDef, dict[str, str]] = {}
         self._class_summary_writers: dict[ast.ClassDef, dict[str, frozenset[int]]] = {}
         self._class_stack: list[ast.ClassDef] = []
         self._class_alias_bases: list[dict[str, str]] = []
+        self._class_callable_bases: list[dict[str, str]] = []
         self._class_function_depths: list[int] = []
         self._function_depth = 0
 
@@ -858,12 +903,14 @@ class _CallVisitor(ast.NodeVisitor):
     def _invalidate_alias_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
             self.active_aliases.pop(name, None)
+            self.callable_aliases.pop(name, None)
 
     def _bind_import(self, node: ast.Import) -> None:
         for imported in node.names:
             visible = imported.asname or imported.name.split(".", 1)[0]
             _clear_reference_path(self.instance_bindings, visible)
             _clear_reference_path(self.constructor_bindings, visible)
+            _clear_reference_path(self.callable_aliases, visible)
             self.active_aliases[visible] = imported.name if imported.asname else visible
 
     def _bind_import_from(self, node: ast.ImportFrom) -> None:
@@ -873,6 +920,7 @@ class _CallVisitor(ast.NodeVisitor):
                     visible = imported.asname or imported.name
                     _clear_reference_path(self.instance_bindings, visible)
                     _clear_reference_path(self.constructor_bindings, visible)
+                    _clear_reference_path(self.callable_aliases, visible)
                     self.active_aliases[visible] = f".{imported.name}"
             return
         for imported in node.names:
@@ -880,6 +928,7 @@ class _CallVisitor(ast.NodeVisitor):
                 visible = imported.asname or imported.name
                 _clear_reference_path(self.instance_bindings, visible)
                 _clear_reference_path(self.constructor_bindings, visible)
+                _clear_reference_path(self.callable_aliases, visible)
                 self.active_aliases[visible] = f"{node.module}.{imported.name}"
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -895,6 +944,10 @@ class _CallVisitor(ast.NodeVisitor):
     @property
     def constructor_bindings(self) -> dict[str, str]:
         return self._constructor_scopes[-1]
+
+    @property
+    def callable_aliases(self) -> dict[str, str]:
+        return self._callable_scopes[-1]
 
     def _bind_target(
         self,
@@ -935,6 +988,26 @@ class _CallVisitor(ast.NodeVisitor):
         for target in targets:
             self._bind_target(target, kind, constructor)
 
+    def _bind_callable_assignment(
+        self,
+        value: ast.AST,
+        targets: list[ast.AST],
+        identity: str | None = None,
+    ) -> None:
+        if identity is None:
+            identity = _callable_identity(
+                value,
+                self.active_aliases,
+                self.instance_bindings,
+                self.constructor_bindings,
+                self.callable_aliases,
+            )
+        if identity is None:
+            return
+        for target in targets:
+            if isinstance(target, ast.Name):
+                self.callable_aliases[target.id] = identity
+
     def _visit_scope_body(
         self,
         body: list[ast.stmt],
@@ -942,6 +1015,7 @@ class _CallVisitor(ast.NodeVisitor):
         clear_names: Iterable[str] = (),
         instance_seed: dict[str, str] | None = None,
         alias_seed: dict[str, str] | None = None,
+        callable_seed: dict[str, str] | None = None,
     ) -> None:
         instances = dict(self.instance_bindings)
         constructors = dict(self.constructor_bindings)
@@ -956,8 +1030,13 @@ class _CallVisitor(ast.NodeVisitor):
         self._instance_scopes.append(instances)
         self._constructor_scopes.append(constructors)
         self._alias_scopes.append(aliases)
+        callable_aliases = dict(self.callable_aliases if callable_seed is None else callable_seed)
+        for name in clear_names:
+            _clear_reference_path(callable_aliases, name)
+        self._callable_scopes.append(callable_aliases)
         for statement in body:
             self.visit(statement)
+        self._callable_scopes.pop()
         self._alias_scopes.pop()
         self._instance_scopes.pop()
         self._constructor_scopes.pop()
@@ -974,7 +1053,12 @@ class _CallVisitor(ast.NodeVisitor):
         for name in clear_names:
             aliases.pop(name, None)
         self._alias_scopes.append(aliases)
+        callable_aliases = dict(self.callable_aliases)
+        for name in clear_names:
+            _clear_reference_path(callable_aliases, name)
+        self._callable_scopes.append(callable_aliases)
         self.visit(expression)
+        self._callable_scopes.pop()
         self._alias_scopes.pop()
         self._instance_scopes.pop()
         self._constructor_scopes.pop()
@@ -999,6 +1083,7 @@ class _CallVisitor(ast.NodeVisitor):
         if node.returns is not None:
             self.visit(node.returns)
         self.active_aliases.pop(node.name, None)
+        self.callable_aliases.pop(node.name, None)
         parameter_names = {
             argument.arg
             for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
@@ -1023,13 +1108,16 @@ class _CallVisitor(ast.NodeVisitor):
                 }
         self._function_depth += 1
         alias_seed = None
+        callable_seed = None
         if self._class_stack and self._function_depth - 1 == self._class_function_depths[-1]:
             alias_seed = self._class_alias_bases[-1]
+            callable_seed = self._class_callable_bases[-1]
         self._visit_scope_body(
             node.body,
             clear_names=local_names,
             instance_seed=instance_seed,
             alias_seed=alias_seed,
+            callable_seed=callable_seed,
         )
         self._function_depth -= 1
 
@@ -1058,6 +1146,7 @@ class _CallVisitor(ast.NodeVisitor):
         for keyword in node.keywords:
             self.visit(keyword.value)
         outer_aliases = dict(self.active_aliases)
+        outer_callable_aliases = dict(self.callable_aliases)
         summary, writers = _class_attribute_summary(
             node,
             outer_aliases,
@@ -1068,20 +1157,31 @@ class _CallVisitor(ast.NodeVisitor):
         self._class_summary_writers[node] = writers
         self._class_stack.append(node)
         self._class_alias_bases.append(outer_aliases)
+        self._class_callable_bases.append(outer_callable_aliases)
         self._class_function_depths.append(self._function_depth)
         self._visit_scope_body(node.body)
         self._class_function_depths.pop()
+        self._class_callable_bases.pop()
         self._class_alias_bases.pop()
         self._class_stack.pop()
         self.active_aliases.pop(node.name, None)
+        self.callable_aliases.pop(node.name, None)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:
             self.visit(target)
+        callable_identity = _callable_identity(
+            node.value,
+            self.active_aliases,
+            self.instance_bindings,
+            self.constructor_bindings,
+            self.callable_aliases,
+        )
         self._bind_assignment(node.value, list(node.targets))
         for target in node.targets:
             self._invalidate_alias_target(target)
+        self._bind_callable_assignment(node.value, list(node.targets), callable_identity)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.annotation is not None:
@@ -1089,16 +1189,37 @@ class _CallVisitor(ast.NodeVisitor):
         self.visit(node.target)
         if node.value is not None:
             self.visit(node.value)
+        callable_identity = (
+            _callable_identity(
+                node.value,
+                self.active_aliases,
+                self.instance_bindings,
+                self.constructor_bindings,
+                self.callable_aliases,
+            )
+            if node.value is not None
+            else None
+        )
         self._bind_assignment(
             node.value, [node.target]
         ) if node.value is not None else self._bind_target(node.target, None)
         self._invalidate_alias_target(node.target)
+        if node.value is not None:
+            self._bind_callable_assignment(node.value, [node.target], callable_identity)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.target)
         self.visit(node.value)
+        callable_identity = _callable_identity(
+            node.value,
+            self.active_aliases,
+            self.instance_bindings,
+            self.constructor_bindings,
+            self.callable_aliases,
+        )
         self._bind_assignment(node.value, [node.target])
         self._invalidate_alias_target(node.target)
+        self._bind_callable_assignment(node.value, [node.target], callable_identity)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.target)
@@ -1118,6 +1239,7 @@ class _CallVisitor(ast.NodeVisitor):
         if node.name is not None:
             _clear_reference_path(self.instance_bindings, node.name)
             _clear_reference_path(self.constructor_bindings, node.name)
+            _clear_reference_path(self.callable_aliases, node.name)
             self.active_aliases.pop(node.name, None)
         for statement in node.body:
             self.visit(statement)
@@ -1125,6 +1247,7 @@ class _CallVisitor(ast.NodeVisitor):
         if node.name is not None:
             _clear_reference_path(self.instance_bindings, node.name)
             _clear_reference_path(self.constructor_bindings, node.name)
+            _clear_reference_path(self.callable_aliases, node.name)
             self.active_aliases.pop(node.name, None)
 
     def visit_With(self, node: ast.With) -> None:
@@ -1152,6 +1275,7 @@ class _CallVisitor(ast.NodeVisitor):
         ]
         self._instance_scopes.append(dict(self.instance_bindings))
         self._constructor_scopes.append(dict(self.constructor_bindings))
+        self._callable_scopes.append(dict(self.callable_aliases))
         for generator in generators:
             self.visit(generator.iter)
             self._alias_scopes.append(dict(self.active_aliases))
@@ -1164,6 +1288,7 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(expression)
         for _ in generators:
             self._alias_scopes.pop()
+        self._callable_scopes.pop()
         self._instance_scopes.pop()
         self._constructor_scopes.pop()
         for path in attribute_targets:
@@ -1199,6 +1324,7 @@ class _CallVisitor(ast.NodeVisitor):
             self.active_aliases,
             self.instance_bindings,
             self.constructor_bindings,
+            self.callable_aliases,
         )
         snippet = source_snippet(self.source, node)
         self.calls.append(

