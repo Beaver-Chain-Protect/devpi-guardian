@@ -14,6 +14,8 @@ from .verdicts.errors import InvalidSha256
 from .verdicts.errors import StoreUnavailable
 from .verdicts.models import validate_sha256
 from .verdicts.reader import SQLiteVerdictReader
+from .worker.discovery import FileDiscoverySink
+from .worker.discovery import set_discovery_sink
 from pathlib import Path
 from pluggy import HookimplMarker
 from pyramid.httpexceptions import HTTPServiceUnavailable
@@ -91,12 +93,14 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
     factory = ConnectionFactory(db_path)
     migrate(factory)
     reader = SQLiteVerdictReader(factory)
+    discovery_sink = FileDiscoverySink(db_path.parent / "discovery")
     block_metrics = InMemoryBlockMetricRecorder()
     setattr(
         pyramid_config.registry["xom"],
         _VERDICT_READER_XOM_ATTRIBUTE,
         reader,
     )
+    set_discovery_sink(pyramid_config.registry["xom"], discovery_sink)
     pyramid_config.registry[VERDICT_READER_REGISTRY_KEY] = reader
     pyramid_config.registry[BLOCK_METRIC_REGISTRY_KEY] = block_metrics
     pyramid_config.registry[ADMIN_SERVICE_REGISTRY_KEY] = GuardianAdminService(
