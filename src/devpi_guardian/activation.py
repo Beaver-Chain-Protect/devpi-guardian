@@ -60,7 +60,10 @@ def _serialize_clock(now: Callable[[], datetime]) -> str:
     try:
         if value.tzinfo is None or offset != timedelta(0):
             raise _InvalidActivationClock("invalid activation clock")
-        return value.isoformat()
+        serialized = value.isoformat()
+        if not _valid_canonical_timestamp(serialized):
+            raise _InvalidActivationClock("invalid activation clock")
+        return serialized
     except _InvalidActivationClock:
         raise
     except Exception:

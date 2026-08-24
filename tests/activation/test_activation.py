@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -213,6 +213,41 @@ def test_invalid_missing_row_clock_preserves_value_error(tmp_path) -> None:
         )
     assert "clock secret" not in str(error.value)
     assert calls == {"clock": 1, "inventory": 0}
+    assert _count(factory) == 0
+
+
+class _StatefulZone(tzinfo):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def utcoffset(self, value):
+        self.calls += 1
+        if self.calls == 1:
+            return timedelta(0)
+        return timedelta(hours=1)
+
+
+def test_stateful_clock_timezone_is_rejected_after_serialization(
+    tmp_path,
+) -> None:
+    factory = _factory(tmp_path)
+    zone = _StatefulZone()
+    calls = 0
+
+    def inventory() -> None:
+        nonlocal calls
+        calls += 1
+
+    with pytest.raises(ValueError, match="invalid activation clock") as error:
+        ensure_guardian_activation(
+            factory,
+            DEVPI_UUID,
+            inventory,
+            now=lambda: datetime(2026, 8, 24, tzinfo=zone),
+        )
+    assert "01:00" not in str(error.value)
+    assert calls == 0
+    assert zone.calls >= 2
     assert _count(factory) == 0
 
 
