@@ -563,6 +563,53 @@ def test_worker_closes_bundle_when_policy_raises(tmp_path) -> None:
     assert store.errors[0][1] == "RuntimeError: policy failed"
 
 
+@pytest.mark.parametrize("phase", ["prepare", "analyze", "policy"])
+def test_worker_reraises_process_control_exceptions_without_marking_error(tmp_path, phase) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = artifact(tmp_path)
+    bundle = AnalysisBundle(target=target)
+    store = Store(make_claim(now))
+    report = AnalysisReport(
+        analyzer_version="analyzers-1",
+        has_baseline=False,
+        baseline_sha256=None,
+        baseline_tier=None,
+        evidence=(),
+        steps=(AnalysisStep("F7", "skipped"),),
+    )
+
+    class BrokenPreparer(Preparer):
+        def prepare(self, claim):
+            raise KeyboardInterrupt("stop")
+
+    class BrokenEngine(Engine):
+        def analyze(self, bundle):
+            raise KeyboardInterrupt("stop")
+
+    class BrokenPolicy(Policy):
+        def evaluate(self, target, report):
+            raise KeyboardInterrupt("stop")
+
+    preparer = BrokenPreparer(bundle) if phase == "prepare" else Preparer(bundle)
+    engine = BrokenEngine(report) if phase == "analyze" else Engine(report)
+    policy = BrokenPolicy() if phase == "policy" else Policy()
+    worker = QuarantineWorker(
+        store=store,
+        preparer=preparer,
+        analysis_engine=engine,
+        policy_engine=policy,
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="stop"):
+        worker.run_once()
+    assert store.recorded == []
+    assert store.errors == []
+    if phase != "prepare":
+        assert target._stream.closed
+
+
 def test_worker_closes_bundle_when_verdict_recording_raises(tmp_path) -> None:
     now = datetime(2026, 8, 21, tzinfo=UTC)
     target = artifact(tmp_path)

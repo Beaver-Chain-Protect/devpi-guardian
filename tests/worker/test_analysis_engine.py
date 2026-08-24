@@ -254,6 +254,69 @@ class ClosePropertyRaises:
         raise RuntimeError("close lookup")
 
 
+class EntryClosedLookupRaises:
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self._position = 0
+
+    @property
+    def closed(self):
+        raise RuntimeError("closed lookup")
+
+    def read(self, size=-1):
+        return b"artifact"
+
+    def seek(self, position):
+        self._position = position
+
+    def tell(self):
+        return self._position
+
+    def close(self):
+        self.close_calls += 1
+        raise RuntimeError("entry cleanup")
+
+
+class EntrySeekRaises:
+    def __init__(self) -> None:
+        self.seek_calls = 0
+        self.close_calls = 0
+        self.closed = False
+
+    def read(self, size=-1):
+        return b"artifact"
+
+    def seek(self, position):
+        self.seek_calls += 1
+        if self.seek_calls > 1:
+            raise RuntimeError("entry seek")
+
+    def tell(self):
+        return 0
+
+    def close(self):
+        self.close_calls += 1
+
+
+@pytest.mark.parametrize("stream", [EntryClosedLookupRaises(), EntrySeekRaises()])
+def test_analysis_entry_failure_closes_stream_and_preserves_primary(stream) -> None:
+    artifact = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0.tar.gz",
+        sha256=hashlib.sha256(b"artifact").hexdigest(),
+        size_bytes=8,
+        _stream=stream,
+    )
+
+    with pytest.raises(RuntimeError) as raised, artifact.open_for_analysis():
+        pass
+    assert stream.close_calls == 1
+    if isinstance(stream, EntryClosedLookupRaises):
+        assert any("cleanup" in note for note in raised.value.__notes__)
+
+
 def test_verified_artifact_preserves_validation_error_when_close_lookup_fails() -> None:
     stream = ClosePropertyRaises()
     with pytest.raises(ValueError) as raised:
@@ -400,6 +463,61 @@ class TrackingBytesSource:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class FailingBytesSource(TrackingBytesSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.fail:
+            raise RuntimeError("source close")
+
+
+def test_owned_engine_close_retries_after_failure_and_is_idempotent() -> None:
+    source = FailingBytesSource()
+    engine = GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=source,
+        analyzer_version="analyzers-1",
+        owns_bytes_source=True,
+    )
+
+    with pytest.raises(RuntimeError, match="source close"):
+        engine.close()
+    source.fail = False
+    engine.close()
+    engine.close()
+    assert source.close_calls == 2
+
+
+def test_engine_context_preserves_body_error_when_source_close_fails() -> None:
+    source = FailingBytesSource()
+    engine = GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=source,
+        analyzer_version="analyzers-1",
+        owns_bytes_source=True,
+    )
+
+    with pytest.raises(ValueError, match="body") as raised, engine:
+        raise ValueError("body")
+    assert any("source cleanup" in note for note in raised.value.__notes__)
+
+
+def test_engine_context_propagates_source_cleanup_without_body_error() -> None:
+    source = FailingBytesSource()
+    engine = GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=source,
+        analyzer_version="analyzers-1",
+        owns_bytes_source=True,
+    )
+
+    with pytest.raises(RuntimeError, match="source close"), engine:
+        pass
 
 
 def test_owned_bytes_source_closes_after_each_analysis_and_explicit_close() -> None:

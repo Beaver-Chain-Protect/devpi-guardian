@@ -207,6 +207,66 @@ def test_discovery_lease_rejects_forged_worker_and_token(tmp_path) -> None:
     sink.complete(claim)
 
 
+def test_expired_claim_operations_are_fenced_until_recovery(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(seconds=5))
+    assert claim is not None
+    clock[0] = claim.lease_expires_at
+
+    for operation in (
+        lambda: sink.complete(claim),
+        lambda: sink.fail(claim, "late"),
+        lambda: sink.retry(claim, "late"),
+    ):
+        with pytest.raises(DiscoveryUnavailable):
+            operation()
+    assert sink.count("PROCESSING") == 1
+
+
+def test_claim_expiry_identity_is_fenced_even_before_stored_expiry(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+    assert claim is not None
+    forged = replace(claim, lease_expires_at=claim.lease_expires_at + timedelta(microseconds=1))
+
+    with pytest.raises(DiscoveryUnavailable):
+        sink.complete(forged)
+    sink.complete(claim)
+
+
+@pytest.mark.parametrize(
+    "column", ["job_id", "candidate_json", "lease_expires_at", "lease_owner", "lease_token"]
+)
+def test_recovery_quarantines_corrupt_processing_rows(tmp_path, column) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(seconds=5))
+    assert claim is not None
+    values = {
+        "job_id": None,
+        "candidate_json": "not-json",
+        "lease_expires_at": "not-a-time",
+        "lease_owner": "",
+        "lease_token": "bad-token",
+    }
+    with sqlite3.connect(sink.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE discovery_jobs SET {column} = ? WHERE job_id = ?",
+            (values[column], claim.job_id),
+        )
+        connection.commit()
+    clock[0] = NOW + timedelta(minutes=1)
+
+    assert sink.recover_expired_claims() == 1
+    assert sink.count("FAILED") == 1
+    assert sink.count("PROCESSING") == 0
+
+
 def test_incompatible_preexisting_discovery_schema_fails_closed(tmp_path) -> None:
     path = tmp_path / "discovery.db"
     with sqlite3.connect(path) as connection:
@@ -300,6 +360,24 @@ def test_corrupt_head_is_failed_and_valid_job_can_be_claimed(tmp_path, column, v
     assert claim is not None
     assert claim.candidate.project == "valid"
     assert sink.count("FAILED") == 1
+
+
+def test_claim_query_is_bounded_to_eligible_rows(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    sink.discover(candidate())
+    traces: list[str] = []
+    original_connect = sink._connect
+
+    def tracked_connect():
+        connection = original_connect()
+        connection.set_trace_callback(traces.append)
+        return connection
+
+    sink._connect = tracked_connect
+    assert sink.claim_next("worker-1", NOW + timedelta(minutes=5)) is not None
+    claim_sql = "\n".join(traces)
+    assert "available_at <=" in claim_sql
+    assert "LIMIT 64" in claim_sql
 
 
 def _job_id_for_test(item: DiscoveryCandidate) -> str:

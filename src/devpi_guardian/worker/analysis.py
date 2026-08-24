@@ -102,15 +102,24 @@ class GuardianAnalysisEngine:
     def close(self) -> None:
         if self._source_closed:
             return
-        self._source_closed = True
         if self._owns_bytes_source:
             self._bytes_source.close()
+        self._source_closed = True
 
     def __enter__(self) -> GuardianAnalysisEngine:
         return self
 
-    def __exit__(self, *exc_info: object) -> bool:
-        self.close()
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc_value is not None:
+                exc_value.add_note(
+                    f"baseline source cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                return False
+            raise
         return False
 
     def analyze(self, bundle: AnalysisBundle) -> AnalysisReport:

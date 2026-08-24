@@ -96,10 +96,19 @@ class _RewoundOwnedStream(AbstractContextManager[BinaryIO]):
         self._stream = stream
 
     def __enter__(self) -> BinaryIO:
-        if self._stream.closed:
-            raise ValueError("verified artifact stream is already closed")
-        self._stream.seek(0)
-        return self._stream
+        try:
+            if self._stream.closed:
+                raise ValueError("verified artifact stream is already closed")
+            self._stream.seek(0)
+            return self._stream
+        except BaseException as primary:
+            try:
+                self._stream.close()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    f"stream cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         try:

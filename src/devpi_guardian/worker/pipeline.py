@@ -137,7 +137,7 @@ class QuarantineWorker:
             bundle.close()
             bundle = None
             self._store.record_verdict(claim, verdict, evidence)
-        except BaseException as primary:
+        except Exception as primary:
             if bundle is not None:
                 try:
                     bundle.close()
@@ -155,5 +155,14 @@ class QuarantineWorker:
                 )
                 raise primary from mark_error
             return WorkerCycle(WorkerCycleStatus.ERROR, claim.sha256)
+        except BaseException as primary:
+            if bundle is not None:
+                try:
+                    bundle.close()
+                except BaseException as cleanup_error:
+                    primary.add_note(
+                        f"bundle cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise
 
         return WorkerCycle(WorkerCycleStatus.COMPLETED, claim.sha256)
