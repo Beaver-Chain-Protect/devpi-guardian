@@ -29,6 +29,51 @@ class ReadonlySequence(Sequence[object]):
         return len(self._values)
 
 
+class OversizedSequence(Sequence[object]):
+    def __init__(self) -> None:
+        self.indexed = 0
+
+    def __getitem__(self, index: int | slice) -> object:
+        self.indexed += 1
+        raise AssertionError("oversized sequence must not be indexed")
+
+    def __len__(self) -> int:
+        return 4097
+
+
+class MemoryErrorSequence(Sequence[object]):
+    def __getitem__(self, index: int | slice) -> object:
+        raise MemoryError("simulated allocation failure")
+
+    def __len__(self) -> int:
+        return 1
+
+
+class IndexedOnlySequence(Sequence[object]):
+    def __init__(self, values: tuple[object, ...]) -> None:
+        self.values = values
+
+    def __getitem__(self, index: int | slice) -> object:
+        return self.values[index]
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __iter__(self) -> Iterator[object]:
+        raise AssertionError("scanner must use bounded indexing")
+
+
+class HostileScalar:
+    def __contains__(self, value: object) -> bool:
+        raise AssertionError("hostile scalar was inspected")
+
+    def __len__(self) -> int:
+        raise AssertionError("hostile scalar was inspected")
+
+    def encode(self, encoding: str) -> bytes:
+        raise AssertionError("hostile scalar was inspected")
+
+
 class FakeKey:
     def __init__(self, keyname: str) -> None:
         self.keyname = keyname
@@ -42,9 +87,11 @@ class FakeTransaction:
         rows: Mapping[str, Sequence[object]],
         *,
         error: Exception | None = None,
+        raise_after_first_file: bool = False,
     ) -> None:
         self.rows = rows
         self.error = error
+        self.raise_after_first_file = raise_after_first_file
         self.iter_calls: list[tuple[tuple[str, ...], int]] = []
 
     def iter_relpaths_at(
@@ -57,7 +104,11 @@ class FakeTransaction:
         if self.error is not None:
             raise self.error
         for name in names:
-            yield from self.rows.get(name, ())
+            for row in self.rows.get(name, ()):
+                yield row
+                file_group = ("STAGEFILE", "PYPIFILE_NOMD5")
+                if self.raise_after_first_file and names == file_group:
+                    raise RuntimeError("later file row must not be consumed")
 
 
 class FakeReadTransaction:
@@ -83,13 +134,18 @@ class FakeKeyFS:
         key_error: Exception | None = None,
         iterator_error: Exception | None = None,
         context_error: Exception | None = None,
+        raise_after_first_file: bool = False,
     ) -> None:
         self.rows = rows
         self.key_error = key_error
         self.context_error = context_error
         self.read_transactions = 0
         self.requested_keys: list[str] = []
-        self.transaction = FakeTransaction(rows, error=iterator_error)
+        self.transaction = FakeTransaction(
+            rows,
+            error=iterator_error,
+            raise_after_first_file=raise_after_first_file,
+        )
 
     def get_key(self, keyname: str) -> FakeKey:
         self.requested_keys.append(keyname)
@@ -215,6 +271,118 @@ def test_cached_mirror_file_is_candidate() -> None:
                 )
             ]
         },
+    )
+
+    assert find_existing_artifact_candidate(xom) == "file_entry"
+
+
+def test_oversized_sequence_is_rejected_before_indexing() -> None:
+    sequence = OversizedSequence()
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"+elinks": sequence},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert sequence.indexed == 0
+
+
+def test_sequence_memory_error_is_unclassified() -> None:
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"+elinks": MemoryErrorSequence()},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
+def test_sequence_is_materialized_by_index_without_iteration() -> None:
+    elink = {"rel": "releasefile", "entrypath": "root/dev/+f/a.whl"}
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"+elinks": IndexedOnlySequence((elink,))},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "release_link"
+
+
+def test_hostile_non_string_scalar_is_rejected_without_inspection() -> None:
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {
+                        "+elinks": (
+                            {
+                                "rel": HostileScalar(),
+                                "entrypath": "root/dev/+f/a.whl",
+                            },
+                        )
+                    },
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
+def test_hostile_simple_link_filename_is_rejected_without_inspection() -> None:
+    xom = FakeXom(
+        {
+            "PROJSIMPLELINKS": [
+                info(
+                    "PROJSIMPLELINKS",
+                    "root/pypi/demo",
+                    {"links": ((HostileScalar(), "root/pypi/+e/demo.whl"),)},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
+def test_outer_memory_error_is_unclassified() -> None:
+    class MemoryErrorXom:
+        @property
+        def keyfs(self) -> object:
+            raise MemoryError("simulated xom allocation failure")
+
+    assert find_existing_artifact_candidate(MemoryErrorXom()) == "unclassified"
+
+
+def test_live_file_candidate_returns_before_later_iterator_failure() -> None:
+    xom = FakeXom(
+        {
+            "STAGEFILE": [
+                info("STAGEFILE", "root/dev/+f/a.whl", {"size": 1}),
+            ]
+        },
+        raise_after_first_file=True,
     )
 
     assert find_existing_artifact_candidate(xom) == "file_entry"

@@ -26,6 +26,8 @@ _TOXRESULT = "toxresult"
 _DOCZIP = "doczip"
 _RELEASEFILE = "releasefile"
 _MISSING = object()
+# Keep persisted relation collections bounded during startup inventory.
+_MAX_SEQUENCE_ITEMS = 4096
 
 
 class _MalformedInventory(Exception):
@@ -55,9 +57,9 @@ def _safe_relpath(value: object) -> bool:
 
 
 def _safe_scalar(value: object) -> bool:
-    invalid_type = type(value) is not str
-    invalid_shape = not value or len(value) > 4096 or "\x00" in value
-    if invalid_type or invalid_shape:
+    if type(value) is not str:
+        return False
+    if not value or len(value) > 4096 or "\x00" in value:
         return False
     try:
         value.encode("utf-8")
@@ -88,7 +90,17 @@ def _as_sequence(value: object) -> list[object]:
     if is_string or not isinstance(value, Sequence):
         raise _MalformedInventory
     try:
-        return list(value)
+        length = len(value)
+    except MemoryError as exc:
+        raise _MalformedInventory from exc
+    except Exception as exc:
+        raise _MalformedInventory from exc
+    if type(length) is not int or length < 0 or length > _MAX_SEQUENCE_ITEMS:
+        raise _MalformedInventory
+    try:
+        return [value[index] for index in range(length)]
+    except MemoryError as exc:
+        raise _MalformedInventory from exc
     except Exception as exc:
         raise _MalformedInventory from exc
 
@@ -211,7 +223,6 @@ def _scan_snapshot(
         [key_map[_STAGEFILE], key_map[_PYPIFILE_NOMD5]],
         serial,
     )
-    file_candidate = False
     for info in file_infos:
         keyname, relpath, value = _info_fields(info)
         if keyname not in {_STAGEFILE, _PYPIFILE_NOMD5}:
@@ -219,9 +230,7 @@ def _scan_snapshot(
         if value is None:
             continue
         if keyname == _PYPIFILE_NOMD5 or relpath not in known_non_artifacts:
-            file_candidate = True
-    if file_candidate:
-        return _candidate(ExistingArtifactCandidate.FILE_ENTRY)
+            return _candidate(ExistingArtifactCandidate.FILE_ENTRY)
     return None
 
 
@@ -247,5 +256,7 @@ def find_existing_artifact_candidate(xom: object) -> str | None:
             }
             serial = tx.at_serial
             return _scan_snapshot(tx, key_map, serial)
+    except MemoryError:
+        return _candidate(ExistingArtifactCandidate.UNCLASSIFIED)
     except Exception:
         return _candidate(ExistingArtifactCandidate.UNCLASSIFIED)
