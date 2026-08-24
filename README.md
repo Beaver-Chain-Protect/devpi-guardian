@@ -22,6 +22,11 @@ The [approved F3/F4 design][approved-design] is in the repository.
   handling.
 - Automated verdict completion; audited manual `ALLOW`/`DENY`, revoke, and rescan
   transitions; and deterministic read-time override expiry.
+- F10's immutable `PolicyConfig`/`PolicyEngine` with secure coverage defaults,
+  deterministic `DENY`/`REVIEW`/`ALLOW` precedence, bounded triage scores, and
+  content-addressed policy versions.
+- F12's persistent append-only SQLite audit hash chain, startup verification,
+  transaction-bound administrator mutations, and readiness gating.
 - F6 project lookup of effective `ALLOW` releases through the public
   `VerdictReader.list_allowed_releases()` API and exported `AllowedRelease` model.
 - F5 verified quarantine downloads, one F7--F9 analysis entry point, release metadata
@@ -54,6 +59,8 @@ metadata in this layout:
 │   └── devpi_guardian/
 │       ├── enforcement/       # Resolve identities, enforce, and record metrics.
 │       ├── verdicts/           # SQLite schema, reader, models, and store.
+│       ├── policy/             # Immutable F10 policy configuration and engine.
+│       ├── audit/              # F12 transactional writer and chain verifier.
 │       ├── analyzers/          # Deterministic F8/F9 artifact analysis and schemas.
 │       └── plugin.py           # Register the devpi-server plugin and wire startup.
 ├── tests/
@@ -215,10 +222,15 @@ from pathlib import Path
 
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from devpi_guardian.verdicts.db import ConnectionFactory
+from devpi_guardian.audit import SQLiteAuditWriter, verify_audit_chain
+from devpi_guardian.verdicts.errors import StoreUnavailable
 
 # Run this only after the devpi process using --guardian-db is ready.
 f5_factory = ConnectionFactory(Path(os.environ["GUARDIAN_DB"]).resolve())
-# audit_writer is an injected F12 implementation of AuditWriter.
+verification = verify_audit_chain(f5_factory)
+if not verification.valid:
+    raise StoreUnavailable("audit chain verification failed")
+audit_writer = SQLiteAuditWriter()
 store = SQLiteArtifactStore(f5_factory, audit_writer)
 claim = store.claim_next(worker_id, lease_until)
 if claim is not None:
@@ -235,34 +247,26 @@ store.recover_expired_claims(now)
 required for `record_verdict` and `mark_analysis_error`; an expired or changed
 claim returns `TransitionConflict` rather than recording a result.
 
-F10 supplies the exact current DTO fields when completing a claim:
+F10 supplies the exact current DTO fields when completing a claim. Construct one
+immutable policy engine per worker process and use its assessment to produce the
+existing `VerdictInput` DTO:
 
 ```python
-from datetime import UTC, datetime
+from devpi_guardian.policy import PolicyConfig, PolicyEngine
 
-from devpi_guardian.verdicts.models import Decision, EvidenceInput, VerdictInput
-
-verdict = VerdictInput(
-    sha256=claim.sha256,
-    decision=Decision.ALLOW,
-    score=0.98,
-    policy_version="policy-1",
-    analyzer_version="analyzer-1",
-    baseline_sha256=None,
-    baseline_tier=None,
-    created_at=datetime.now(UTC),
-)
-evidence = [
-    EvidenceInput(
-        rule_id="rule-example",
-        action=Decision.ALLOW,
-        file_path="src/example.py",
-        line=1,
-        message="analysis completed",
-        details={"example": "value"},
+policy = PolicyEngine(
+    PolicyConfig(
+        name="release-policy",
+        revision="2026-08",
+        require_baseline=True,
+        require_f9_pair=True,
     )
-]
-store.record_verdict(claim, verdict, evidence)
+)
+assessment = policy.assess(report)
+verdict = policy.evaluate(target, report)  # target is F5's VerifiedArtifact
+assert assessment.policy_version == policy.policy_version
+# QuarantineWorker converts report.evidence to EvidenceInput and stores it with
+# the verdict; F10 does not create EvidenceInput or invent ALLOW evidence.
 ```
 
 `baseline_tier` is typed as `Literal["same_tag", "universal_wheel", "sdist"]`.
@@ -271,6 +275,21 @@ F6 passes `selection.tier` unchanged through F10, so `baseline_tier=None` is
 used when no baseline is selected. `sdist comparisons have lower confidence`
 than same-tag or universal-wheel comparisons and remain distinguishable in F4's
 immutable verdict history.
+
+The secure default requires a trusted baseline and an sdist/wheel pair; a first
+release or unpaired release is therefore held for `REVIEW`. Precedence is
+deterministic and independent of evidence order: any effective `DENY` finding
+wins, then analyzer errors, coverage gaps, or `REVIEW` findings produce
+`REVIEW`, and only clean covered reports produce `ALLOW`. The `PolicyConfig`
+defaults are clean `ALLOW` 0, ordinary `REVIEW` 50, missing F9 pairing 60,
+missing baseline 70, analyzer error 90, and `DENY` 100; F7 tier defaults are
+same-tag 50, universal-wheel 60, and sdist 70. Custom scores may raise the
+review, coverage, and analyzer-error floors while preserving precedence and
+tier ordering; `ALLOW=0` and `DENY=100` remain anchored. Conditions take the
+maximum rather than summing. `policy_version` is
+`<name>/<revision>+sha256:<64 lowercase hex characters>`, derived from the
+canonical policy configuration, so a changed policy creates a new verdict on
+rescan without rewriting prior history.
 
 Manual transitions are also transaction-bound and audited:
 
@@ -288,11 +307,38 @@ fallback. `request_rescan` deactivates the current override in the same
 transaction and returns the Artifact to `DISCOVERED`, so it remains blocked
 through discovery and scanning until a new verdict is recorded.
 
-F12 implements `AuditWriter.append_in_transaction(connection, event)` using
-the exact `sqlite3.Connection` supplied by F4. The writer records its event in
-that transaction; if audit recording fails, the state transition is rolled
-back. Persistent audit-adapter integration is a separate F12 delivery; current
-F4 proof covers the same-transaction rollback behavior with a recording stub.
+F12 implements `SQLiteAuditWriter.append_in_transaction(connection, event)` using
+the exact `sqlite3.Connection` supplied by F4. Startup must run
+`verify_audit_chain(factory)` after `migrate(factory)` and before registering
+the reader, store, routes, views, or tweens; an invalid result keeps the server
+unready. The plugin then constructs one writer, one `SQLiteArtifactStore`, and
+the shared `SQLiteVerdictReader`:
+
+```python
+from devpi_guardian.audit import SQLiteAuditWriter, verify_audit_chain
+from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+from devpi_guardian.verdicts.errors import StoreUnavailable
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
+from devpi_guardian.verdicts.store import SQLiteArtifactStore
+
+migrate(factory)
+verification = verify_audit_chain(factory)
+if not verification.valid:
+    raise StoreUnavailable("audit chain verification failed")
+audit_writer = SQLiteAuditWriter()
+store = SQLiteArtifactStore(factory, audit_writer)
+reader = SQLiteVerdictReader(factory)
+```
+
+Every F4 state transition and its audit event commit or roll back together.
+Audit rows are append-only and form a SHA-256 hash chain over the persisted
+semantic fields. Verification detects modified, missing-middle, and reordered
+events. An optional `expected_head` detects tail deletion; without an external
+signed anchor, an administrator who can replace the database can recompute the
+whole chain, so the expected head must be stored externally when that threat
+matters. F5 workers construct the same `SQLiteAuditWriter` and store only after
+the migration owner has completed startup readiness; they use the exact shared
+database path and never access Guardian tables directly.
 
 ## Running devpi-server
 
@@ -414,8 +460,8 @@ uv build
 
 - SQLite migration is repeatable on an empty or already initialized database,
   and artifacts, mappings, verdict history, evidence, and overrides survive
-  process restart. Persistent F12 audit-adapter integration is separate; F4
-  proves same-transaction rollback when audit recording fails.
+  process restart. F12 audit events survive restart in the append-only hash
+  chain, and F4/F11 prove same-transaction rollback when audit recording fails.
 - All writes and audit events share one transaction; automated verdicts and
   evidence remain immutable, and only one current verdict and override apply to
   an Artifact.
