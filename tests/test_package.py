@@ -13,6 +13,7 @@ from devpi_server.model import InvalidIndexconfig
 from importlib import metadata
 from importlib import resources
 from pathlib import Path
+from packaging.requirements import Requirement
 from types import SimpleNamespace
 import pytest
 from devpi_server.main import Fatal
@@ -61,6 +62,17 @@ def test_package_exposes_devpi_server_entry_point() -> None:
 
     assert len(matches) == 1
     assert matches[0].value == "devpi_guardian.plugin"
+
+
+def test_package_declares_requests_as_direct_runtime_dependency() -> None:
+    requirements = [Requirement(value) for value in metadata.requires("devpi-guardian") or []]
+
+    assert any(
+        requirement.name == "requests"
+        and requirement.marker is None
+        and str(requirement.specifier) == "<3,>=2.32"
+        for requirement in requirements
+    )
 
 
 def test_package_contains_exact_guardian_sql_migrations() -> None:
