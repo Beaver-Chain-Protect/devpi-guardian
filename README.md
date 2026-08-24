@@ -80,6 +80,9 @@ PR1 does not silently delete them.
 
 ## Implemented features
 
+- A read-only `guardian` index type that requires at least one devpi base index.
+- Batched SHA-256 filtering for HTML and PEP 691 Simple responses: only links with
+  an effective `ALLOW` verdict are visible to pip and uv.
 - Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658
   `.metadata` requests.
 - SHA-256 SQLite verdict persistence with migrations, bounded reads, immutable
@@ -96,6 +99,15 @@ PR1 does not silently delete them.
 - A narrower official `pytest-devpi-server` fixture smoke test exercises the installed
   plugin.
 
+## F8/F9 artifact analyzers
+
+The repository also includes deterministic, non-executing F8/F9 analyzers under
+`src/devpi_guardian/analyzers/`. F8 scans installation surfaces and F9 compares matching
+sdist/wheel releases for wheel-only risk signals. Their findings are advisory inputs for
+the policy/evidence layers; they do not change enforcement or verdict behavior. See the
+[F8/F9 handoff](docs/analyzers/f8-f9-handoff.md) for the public API, JSON schema, and demo
+commands.
+
 ## Repository structure
 
 The repository keeps enforcement, verdict storage, integration coverage, and delivery
@@ -107,21 +119,56 @@ metadata in this layout:
 │   └── devpi_guardian/
 │       ├── enforcement/       # Resolve identities, enforce, and record metrics.
 │       ├── verdicts/           # SQLite schema, reader, models, and store.
+│       ├── analyzers/          # Deterministic F8/F9 artifact analysis and schemas.
 │       └── plugin.py           # Register the devpi-server plugin and wire startup.
 ├── tests/
 │   ├── enforcement/           # Direct-download enforcement and metrics tests.
 │   ├── verdicts/               # Persistence, reader, claim, and transition tests.
+│   ├── analyzers/              # F8/F9 analyzer, contract, and integration tests.
 │   └── integration/            # Real devpi-server and resolver integration tests.
 ├── docs/
+│   ├── analyzers/               # F8/F9 public API and integration handoff.
 │   └── superpowers/
 │       ├── specs/              # Approved designs and supporting specifications.
 │       └── plans/              # Implementation plans.
+├── tools/                      # Offline F8/F9 corpus and demo utilities.
 ├── news/                       # Release-note fragments.
 ├── pyproject.toml              # Packaging, dependencies, and tool configuration.
 └── uv.lock                     # Locked development and runtime dependencies.
 ```
 
-## F3/F4 handoff and connection boundaries
+## Guardian index and Simple filtering (F1/F2)
+
+Create a Guardian index over an existing devpi stage or mirror:
+
+```console
+devpi index -c root/guardian type=guardian bases=root/pypi
+```
+
+The stage is read-only and rejects configuration without an explicit `bases`
+value. Configure installers to use its standard devpi Simple endpoint:
+
+```console
+pip install --index-url https://devpi.example.com/root/guardian/+simple/ PACKAGE
+uv pip install --index-url https://devpi.example.com/root/guardian/+simple/ PACKAGE
+```
+
+Only canonical SHA-256 links with an effective `ALLOW` verdict are returned.
+Verdict-store failures during a required lookup return `503 Service Unavailable`
+with `Retry-After: 5`.
+
+F1/F2 do not periodically download or discover new PyPI Artifacts, run security
+analysis, or implement a time-based cooldown. F5 must discover and persist an
+Artifact and its release mapping before F4 can return a verdict. Until that
+pipeline exists, an unknown Artifact remains hidden. F3 separately protects
+direct `+f`/`+e` URLs across all indexes, so bypassing the Guardian Simple page
+does not bypass enforcement.
+
+The batching, failure, metadata-preservation, and completion contracts are
+defined once in the
+[F1/F2 specification](docs/superpowers/specs/2026-08-20-f1-f2-guardian-index-simple-filter.md).
+
+## Shared verdict reader and connection boundaries
 
 The plugin creates one persistent `ConnectionFactory`, runs `migrate` once
 before readiness, and constructs the shared `SQLiteVerdictReader` during
@@ -138,8 +185,8 @@ migrate(factory)  # one startup process, before devpi is ready
 reader = SQLiteVerdictReader(factory)
 ```
 
-F2 should receive that reader through dependency injection. In the installed
-plugin, the Pyramid registry key is
+The installed plugin puts that same eagerly created reader in both the Pyramid
+registry and the devpi XOM object. F3 and later request-layer consumers use
 `VERDICT_READER_REGISTRY_KEY` (`devpi_guardian.verdict_reader`):
 
 ```python
@@ -150,6 +197,20 @@ reader: VerdictReader = pyramid_config.registry[VERDICT_READER_REGISTRY_KEY]
 decision = reader.get_effective_decision(sha256)
 decisions = reader.get_effective_decisions(sha256s)
 ```
+
+F2 runs in the stage/model layer, where a Pyramid request is not guaranteed.
+It obtains the already initialized object through `get_verdict_reader(stage.xom)`:
+
+```python
+from devpi_guardian.plugin import get_verdict_reader
+
+reader = get_verdict_reader(stage.xom)
+decisions = reader.get_effective_decisions(sha256s)
+```
+
+The accessor never creates or migrates a database. Startup migration and reader
+construction remain exclusively in `devpiserver_pyramid_configure`; accessing
+F2 before successful initialization fails closed.
 
 `SQLiteVerdictReader` returns an `EnforcementDecision` with `sha256`,
 `allowed`, `effective_decision`, `source`, `artifact_state`, and
@@ -398,6 +459,20 @@ Reproduce with:
 
 ```console
 uv run pytest -m performance -s -v
+```
+
+## Development verification
+
+Bootstrap the locked test environment, then run the complete checks:
+
+```console
+uv sync --extra test
+uv run pytest -q
+uv run ruff format --check .
+uv run ruff check .
+uv run flake8 src tests
+uv lock --check
+uv build
 ```
 
 ## F3/F4 completion criteria

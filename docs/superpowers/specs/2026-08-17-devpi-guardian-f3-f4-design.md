@@ -328,24 +328,17 @@ URL fragment, 사용자 header, filename에 포함된 값은 SHA-256 근거로 �
 
 ### 9.1 1번 — GuardianStage와 F2
 
-- `SQLiteArtifactStore`가 노출하는 `VerdictReader`를 주입받는다.
-- Simple 링크를 먼저 materialize하고 각 링크에서 SHA-256을 추출한다.
-- `get_effective_decisions()`를 한 번 호출해 N+1 조회를 피한다.
-- `decision.allowed`가 참인 링크만 yield한다.
-- SHA-256이 없거나 형식이 잘못된 링크는 판정 조회 전에 제거한다.
-- SQL, override 만료, 상태 우선순위를 `GuardianStage`에 복제하지 않는다.
+- F1/F2의 규범 계약과 완료 기준은
+  `2026-08-20-f1-f2-guardian-index-simple-filter.md`를 단일 원천으로 사용한다.
+- F2와 F3는 `devpiserver_pyramid_configure`가 migration 후 한 번 생성한 같은
+  `SQLiteVerdictReader` 객체를 사용한다. F2는 `get_verdict_reader(stage.xom)`,
+  F3는 Pyramid registry를 통해 접근한다.
+- F2는 SQL, override 만료, 상태 우선순위 또는 F3의 내부 재검증을 복제하지
+  않고 공개 `EnforcementDecision.allowed`만 소비한다.
 - `devpiserver_pyramid_configure`에서 F3 tween을 등록하되 실제 집행 함수는 2번 모듈을 사용한다.
 - tween은 `devpi_server.views.tween_keyfs_transaction` 아래에 등록하여 pre-routing resolver의 XOM model 조회가 일관된 read transaction 안에서 실행되게 한다.
 - `root/pypi` 직접 접근도 F3을 통과하도록 파일 route 전체에 tween을 적용한다.
 - PyPI 원본으로 직접 나가는 client egress는 배포 설정에서 차단한다. F3은 devpi를 거치지 않는 네트워크 요청을 막을 수 없다.
-
-사용 예:
-
-```python
-decisions = verdict_reader.get_effective_decisions(link_sha256s)
-for link, sha256 in links_with_sha256:
-    yield decisions[sha256].allowed
-```
 
 ### 9.2 3번·4번 — 분석기와 탐지 엔진
 
