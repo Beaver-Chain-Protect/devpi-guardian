@@ -1,8 +1,19 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
 
+# Project Ruff and upstream devpi intentionally use conflicting import layouts.
+# Keep devpi's no-section, from-first style in this devpi fixture module.
+# ruff: noqa: I001
+from dataclasses import dataclass
+from dataclasses import field
+from typing import TYPE_CHECKING
 import pytest
 
-from devpi_guardian.verdicts.models import AuditEventInput
+
+if TYPE_CHECKING:
+    from devpi_guardian.verdicts.models import AuditEventInput
+
+
+pytest_plugins = ["test_devpi_server.plugin"]
 
 
 @dataclass
@@ -12,7 +23,7 @@ class RecordingAuditWriter:
 
     def append_in_transaction(
         self,
-        connection,
+        _connection,
         event: AuditEventInput,
     ) -> None:
         if self.fail:
