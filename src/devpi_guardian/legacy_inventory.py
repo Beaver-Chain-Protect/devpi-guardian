@@ -98,7 +98,10 @@ def _as_sequence(value: object) -> list[object]:
     if type(length) is not int or length < 0 or length > _MAX_SEQUENCE_ITEMS:
         raise _MalformedInventory
     try:
-        return [value[index] for index in range(length)]
+        items = [value[index] for index in range(length)]
+        value[length]
+    except IndexError:
+        return items
     except MemoryError as exc:
         raise _MalformedInventory from exc
     except Exception as exc:
@@ -139,18 +142,19 @@ def _simple_link_path(item: object) -> str:
 
 def _check_simple_value(value: object) -> bool:
     mapping = _as_mapping(value)
+    links = _mapping_value(mapping, "links")
+    if links is not _MISSING:
+        items = _as_sequence(links)
+        for item in items:
+            _simple_link_path(item)
+        return bool(items)
     try:
-        if len(mapping) == 0:
+        length = len(mapping)
+        if type(length) is int and length == 0:
             return False
     except Exception as exc:
         raise _MalformedInventory from exc
-    links = _mapping_value(mapping, "links")
-    if links is _MISSING:
-        raise _MalformedInventory
-    items = _as_sequence(links)
-    for item in items:
-        _simple_link_path(item)
-    return bool(items)
+    raise _MalformedInventory
 
 
 def _check_version_value(

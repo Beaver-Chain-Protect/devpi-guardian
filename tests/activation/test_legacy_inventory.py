@@ -63,6 +63,32 @@ class IndexedOnlySequence(Sequence[object]):
         raise AssertionError("scanner must use bounded indexing")
 
 
+class UnderreportedSequence(Sequence[object]):
+    def __init__(self, values: tuple[object, ...]) -> None:
+        self.values = values
+        self.indexes: list[int | slice] = []
+
+    def __getitem__(self, index: int | slice) -> object:
+        self.indexes.append(index)
+        return self.values[index]
+
+    def __len__(self) -> int:
+        return 1
+
+
+class ZeroLengthLinksMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        if key == "links":
+            return (("demo-1.0.whl", "root/pypi/+e/demo-1.0.whl"),)
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+
 class HostileScalar:
     def __contains__(self, value: object) -> bool:
         raise AssertionError("hostile scalar was inspected")
@@ -319,6 +345,43 @@ def test_sequence_is_materialized_by_index_without_iteration() -> None:
                     "PROJVERSION",
                     "root/dev/demo/1.0/.config",
                     {"+elinks": IndexedOnlySequence((elink,))},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "release_link"
+
+
+def test_underreported_sequence_is_unclassified_after_probe() -> None:
+    tox = {"rel": "toxresult", "entrypath": "root/dev/+f/a.whl"}
+    release = {"rel": "releasefile", "entrypath": "root/dev/+f/a.whl"}
+    sequence = UnderreportedSequence((tox, release))
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"+elinks": sequence},
+                )
+            ],
+            "STAGEFILE": [info("STAGEFILE", "root/dev/+f/a.whl", {"size": 1})],
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert sequence.indexes == [0, 1]
+
+
+def test_links_are_checked_before_zero_length_mapping_report() -> None:
+    xom = FakeXom(
+        {
+            "PROJSIMPLELINKS": [
+                info(
+                    "PROJSIMPLELINKS",
+                    "root/pypi/demo",
+                    ZeroLengthLinksMapping(),
                 )
             ]
         }
