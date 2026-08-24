@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devpi-guardian"
+version = "0.1.0.dev0"
+description = "Fail-closed Artifact enforcement for devpi-server"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "devpi-server==6.20.3",
+]
+
+[project.optional-dependencies]
+test = [
+  "build>=1,<2",
+  "devpi-client>=7,<8",
+  "flake8>=7,<9",
+  "pytest>=8,<10",
+  "pytest-devpi-server==1.8.0",
+  "ruff>=0.12,<1",
+  "webtest>=3,<4",
+]
+
+[project.entry-points.devpi_server]
+guardian = "devpi_guardian.plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"devpi_guardian.verdicts.sql" = ["*.sql"]
+"devpi_guardian.analyzers" = ["schemas/*.json"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: starts a real devpi-server process",
+  "performance: verifies the verdict lookup latency budget",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.format]
+exclude = ["docs/superpowers/plans/2026-08-17-f3-f4-enforcement-verdict-store.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
