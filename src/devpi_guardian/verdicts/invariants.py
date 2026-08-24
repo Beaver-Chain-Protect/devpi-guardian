@@ -165,9 +165,6 @@ def validate_persisted_release_mapping(
         _field(mapping, "discovered_at"),
         "release mapping discovered_at",
     )
-    size_bytes = _field(mapping, "size_bytes")
-    if type(size_bytes) is not int or not 0 <= size_bytes <= 2**63 - 1:
-        raise PersistedStateCorruption("invalid persisted artifact size")
     return AllowedRelease(
         stage=stage,
         project=project,
@@ -175,7 +172,6 @@ def validate_persisted_release_mapping(
         filename=filename,
         sha256=sha256,
         origin_url=origin_url,
-        size_bytes=size_bytes,
     )
 
 

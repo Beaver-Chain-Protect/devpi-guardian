@@ -5,9 +5,10 @@ F4 had no project-scoped query. `SQLiteVerdictReader.list_allowed_releases`
 now provides one, so this module is the real implementation.
 
 It also answers the question F6's protocols cannot: `ArtifactBytesSource.open`
-receives a SHA-256 and nothing else, while the download URL lives on
-`AllowedRelease.origin_url`. This adapter remembers the origin URL of every
-release it hands out, so a byte source can resolve one without a second query.
+receives a SHA-256 and nothing else, while the download URL and stored byte
+count live on F4's release mapping. This adapter resolves and remembers both
+for every release it hands out, so a byte source can verify the response
+without reaching into the verdict store itself.
 
 The reader is injected, not constructed. Per the F4 README, a consumer takes
 the same public reader F2 and F3 use out of the Pyramid registry:
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from ..verdicts.models import AllowedRelease
+from ..verdicts.models import AllowedRelease, ReleaseArtifact
 from .selection import ReleaseRecord
 
 
@@ -38,10 +39,14 @@ class AllowedReleaseSource(Protocol):
 
     Narrower than `verdicts.interfaces.VerdictReader` on purpose: baseline
     selection never asks for an enforcement decision, so it should not require
-    an object that can give one. Every `VerdictReader` satisfies this.
+    an object that can give one. It does use the reader's existing release
+    mapping lookup to obtain the stored byte count. Every `VerdictReader`
+    satisfies this.
     """
 
     def list_allowed_releases(self, project: str) -> tuple[AllowedRelease, ...]: ...
+
+    def get_artifact_releases(self, sha256: str) -> tuple[ReleaseArtifact, ...]: ...
 
 
 class VerdictReaderReleaseLookup:
@@ -73,6 +78,7 @@ class VerdictReaderReleaseLookup:
         for release in self._reader.list_allowed_releases(project):
             if release.sha256 in seen:
                 continue
+            origin_url, size_bytes = self._origin_and_size(release)
             seen.add(release.sha256)
             records.append(
                 ReleaseRecord(
@@ -80,14 +86,37 @@ class VerdictReaderReleaseLookup:
                     version=release.version,
                     filename=release.filename,
                     sha256=release.sha256,
-                    size_bytes=release.size_bytes,
+                    size_bytes=size_bytes,
                 )
             )
             self._origin_urls.setdefault(
                 release.sha256,
-                (release.origin_url, release.size_bytes),
+                (origin_url, size_bytes),
             )
         return records
+
+    def _origin_and_size(self, release: AllowedRelease) -> tuple[str, int]:
+        cached = self._origin_urls.get(release.sha256)
+        if cached is not None:
+            return cached
+
+        matches = tuple(
+            mapping
+            for mapping in self._reader.get_artifact_releases(release.sha256)
+            if (
+                mapping.stage == release.stage
+                and mapping.project == release.project
+                and mapping.version == release.version
+                and mapping.filename == release.filename
+                and mapping.origin_url == release.origin_url
+            )
+        )
+        if not matches:
+            raise UnknownArtifactOrigin(f"no matching release mapping for {release.sha256}")
+        sizes = {mapping.size_bytes for mapping in matches}
+        if len(sizes) != 1 or any(type(size) is not int or size < 0 for size in sizes):
+            raise UnknownArtifactOrigin(f"ambiguous release mapping size for {release.sha256}")
+        return release.origin_url, sizes.pop()
 
     def origin_url(self, sha256: str) -> str:
         """Resolve a digest this lookup has already returned to its URL.

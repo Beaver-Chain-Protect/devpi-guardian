@@ -19,7 +19,7 @@ from devpi_guardian.baseline.release_lookup import (
 from devpi_guardian.verdicts.db import ConnectionFactory
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.interfaces import VerdictReader
-from devpi_guardian.verdicts.models import ArtifactState, Decision
+from devpi_guardian.verdicts.models import AllowedRelease, ArtifactState, Decision, ReleaseArtifact
 from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 
 from .fakes import FakeArtifactBytesSource
@@ -54,11 +54,115 @@ def test_the_public_verdict_reader_interface_covers_what_the_adapter_needs():
     # The F4 README points F6 consumers at the registry-provided VerdictReader,
     # so anything satisfying that interface must satisfy this adapter too.
     assert "list_allowed_releases" in VerdictReader.__protocol_attrs__
+    assert "get_artifact_releases" in VerdictReader.__protocol_attrs__
+
+
+def test_the_preexisting_six_field_allowed_release_constructor_remains_valid():
+    release = AllowedRelease(
+        "root/dev",
+        "demo-package",
+        "1.0.0",
+        "demo_package-1.0.0-py3-none-any.whl",
+        SHA_OLD,
+        "https://devpi.example/demo.whl",
+    )
+
+    assert release.sha256 == SHA_OLD
+
+
+def test_missing_matching_release_mapping_fails_closed_for_expected_size():
+    allowed = AllowedRelease(
+        "root/dev",
+        "demo-package",
+        "1.0.0",
+        "demo_package-1.0.0-py3-none-any.whl",
+        SHA_OLD,
+        "https://devpi.example/demo.whl",
+    )
+
+    class Reader:
+        def list_allowed_releases(self, project):
+            return (allowed,)
+
+        def get_artifact_releases(self, sha256):
+            return ()
+
+    with pytest.raises(UnknownArtifactOrigin):
+        VerdictReaderReleaseLookup(Reader()).allowed_releases("demo-package")
+
+
+def test_disagreeing_matching_release_sizes_fail_closed():
+    allowed = AllowedRelease(
+        "root/dev",
+        "demo-package",
+        "1.0.0",
+        "demo_package-1.0.0-py3-none-any.whl",
+        SHA_OLD,
+        "https://devpi.example/demo.whl",
+    )
+
+    def mapping(size_bytes):
+        return ReleaseArtifact(
+            stage=allowed.stage,
+            project=allowed.project,
+            version=allowed.version,
+            filename=allowed.filename,
+            sha256=allowed.sha256,
+            origin_url=allowed.origin_url,
+            size_bytes=size_bytes,
+        )
+
+    class Reader:
+        def list_allowed_releases(self, project):
+            return (allowed,)
+
+        def get_artifact_releases(self, sha256):
+            return (mapping(1), mapping(2))
+
+    with pytest.raises(UnknownArtifactOrigin):
+        VerdictReaderReleaseLookup(Reader()).allowed_releases("demo-package")
+
+
+def test_matching_release_size_lookup_is_cached_per_digest():
+    allowed = AllowedRelease(
+        "root/dev",
+        "demo-package",
+        "1.0.0",
+        "demo_package-1.0.0-py3-none-any.whl",
+        SHA_OLD,
+        "https://devpi.example/demo.whl",
+    )
+    mapping = ReleaseArtifact(
+        stage=allowed.stage,
+        project=allowed.project,
+        version=allowed.version,
+        filename=allowed.filename,
+        sha256=allowed.sha256,
+        origin_url=allowed.origin_url,
+        size_bytes=1,
+    )
+
+    class Reader:
+        calls = 0
+
+        def list_allowed_releases(self, project):
+            return (allowed, allowed)
+
+        def get_artifact_releases(self, sha256):
+            self.calls += 1
+            return (mapping,)
+
+    reader = Reader()
+    assert len(VerdictReaderReleaseLookup(reader).allowed_releases("demo-package")) == 1
+    assert reader.calls == 1
 
 
 def test_any_object_with_list_allowed_releases_is_accepted():
     class MinimalReader:
         def list_allowed_releases(self, project):
+            return ()
+
+        def get_artifact_releases(self, sha256):
             return ()
 
     assert isinstance(MinimalReader(), AllowedReleaseSource)

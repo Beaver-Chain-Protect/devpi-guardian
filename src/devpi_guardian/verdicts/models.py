@@ -188,11 +188,6 @@ class AllowedRelease:
     filename: str
     sha256: str
     origin_url: str
-    size_bytes: int
-
-    def __post_init__(self) -> None:
-        if type(self.size_bytes) is not int or self.size_bytes < 0:
-            raise ValueError("size_bytes must be a nonnegative integer")
 
 
 @dataclass(frozen=True, slots=True)

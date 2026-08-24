@@ -780,19 +780,13 @@ class BaselineComparison:
     `selection.tier` says *how comparable* the baseline was: an exact
     compatibility-tag match is far stronger evidence than an sdist fallback,
     and the same finding deserves different operator weight depending on it.
-    Nothing downstream pulls this field automatically:
-
-    * `VerdictInput` has no tier field, `verdicts` has no tier column, and the
-      DTO is frozen with strict validation, so the tier cannot ride along with
-      `baseline_sha256`.
-    * `Finding` is frozen and deliberately not extended, and the pairs in
-      `findings` carry only `Origin`, so per-finding conversion never sees it.
-
-    An F10 loop that builds one `EvidenceInput` per entry in `findings` will
-    therefore drop the tier silently, because it never has to touch
-    `selection`. Put `selection.tier` (and the pair's `Origin`) into
-    `EvidenceInput.details`, which is free-form JSON and the only field that
-    accepts them without a schema change.
+    The current F10 DTO already carries `baseline_tier` alongside
+    `baseline_sha256`; forward `selection.tier` into that field and keep both
+    as `None` for a first release. `Finding` remains frozen and deliberately
+    unextended, while each `findings` entry is a `FindingAttribution` carrying
+    the finding, its `Origin`, and the selected tier (or `None` for an
+    artifact-level error). Per-finding conversion should read those explicit
+    attributes rather than infer tier from the origin or selection.
     """
 
     has_baseline: bool
