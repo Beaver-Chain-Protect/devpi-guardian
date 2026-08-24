@@ -257,6 +257,30 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     )
 
 
+def test_record_allow_verdict_persists_cooldown_window(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    cooldown_until = NOW + timedelta(hours=24)
+
+    store.record_verdict(
+        claim,
+        verdict(decision=Decision.ALLOW, cooldown_until=cooldown_until),
+        (),
+    )
+
+    row = fetchall(
+        store,
+        "SELECT state, cooldown_started_at, cooldown_until FROM artifacts",
+    )[0]
+    assert tuple(row) == (
+        ArtifactState.ALLOW.value,
+        NOW.isoformat(),
+        cooldown_until.isoformat(),
+    )
+
+
 @pytest.mark.parametrize(
     ("decision", "effective"),
     [

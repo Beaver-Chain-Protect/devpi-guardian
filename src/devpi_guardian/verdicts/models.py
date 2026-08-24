@@ -179,6 +179,17 @@ class AllowedRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseArtifact:
+    stage: str
+    project: str
+    version: str
+    filename: str
+    sha256: str
+    origin_url: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceInput:
     rule_id: str
     action: Decision
@@ -208,6 +219,7 @@ class VerdictInput:
     baseline_sha256: str | None
     baseline_tier: BaselineTier | None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    cooldown_until: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_sha256(self.sha256)
@@ -225,6 +237,13 @@ class VerdictInput:
             message = "policy_version and analyzer_version"
             raise ValueError(f"{message} must not be blank")
         require_utc(self.created_at, "created_at")
+        if self.cooldown_until is not None:
+            cooldown_until = require_utc(self.cooldown_until, "cooldown_until")
+            created_at = require_utc(self.created_at, "created_at")
+            if self.decision is not Decision.ALLOW:
+                raise ValueError("cooldown requires an ALLOW verdict")
+            if cooldown_until <= created_at:
+                raise ValueError("cooldown_until must be later than created_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +292,51 @@ class EnforcementDecision:
     source: DecisionSource
     artifact_state: ArtifactState
     policy_version: str | None
+    cooldown_until: datetime | None = None
+    cooldown_finished: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAdminSummary:
+    sha256: str
+    size_bytes: int
+    state: ArtifactState
+    discovered_at: datetime
+    updated_at: datetime
+    cooldown_until: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRecord:
+    rule_id: str
+    action: Decision
+    file_path: str | None
+    line: int | None
+    message: str
+    details: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAdminDetails:
+    summary: ArtifactAdminSummary
+    allowed: bool
+    effective_decision: Decision
+    decision_source: DecisionSource
+    policy_version: str | None
+    analyzer_version: str | None
+    baseline_sha256: str | None
+    baseline_tier: BaselineTier | None
+    releases: tuple[ReleaseArtifact, ...]
+    evidence: tuple[EvidenceRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantinePage:
+    items: tuple[ArtifactAdminSummary, ...]
+    total: int
+    limit: int
+    offset: int
 
 
 @dataclass(frozen=True, slots=True)

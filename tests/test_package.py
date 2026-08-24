@@ -11,6 +11,7 @@ from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_server.model import BaseStageCustomizer
 from devpi_server.model import InvalidIndexconfig
 from importlib import metadata
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -60,6 +61,22 @@ def test_package_exposes_devpi_server_entry_point() -> None:
 
     assert len(matches) == 1
     assert matches[0].value == "devpi_guardian.plugin"
+
+
+def test_package_contains_exact_guardian_sql_migrations() -> None:
+    migration_names = sorted(
+        resource.name
+        for resource in resources.files("devpi_guardian.verdicts.sql").iterdir()
+        if resource.name.endswith(".sql")
+    )
+    assert migration_names == [
+        "001_initial.sql",
+        "002_baseline_tier.sql",
+        "003_guardian_activation.sql",
+        "004_artifact_cooldown.sql",
+        "005_audit_events.sql",
+        "006_baseline_overrides.sql",
+    ]
 
 
 def test_plugin_hooks_are_marked_for_devpiserver() -> None:
@@ -189,7 +206,7 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert (tmp_path / "guardian.db").exists()
     with sqlite3.connect(tmp_path / "guardian.db") as connection:
         migration_query = "SELECT MAX(version) FROM schema_migrations"
-        assert connection.execute(migration_query).fetchone() == (3,)
+        assert connection.execute(migration_query).fetchone() == (6,)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)

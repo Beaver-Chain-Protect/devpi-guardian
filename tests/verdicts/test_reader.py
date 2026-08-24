@@ -300,6 +300,25 @@ def test_list_allowed_releases_normalizes_project_and_returns_immutable_result(
     assert reader.list_allowed_releases("missing-project") == ()
 
 
+def test_reader_exposes_release_and_health_admin_apis(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    assert reader.get_artifact_releases(SHA_ALLOW)[0].size_bytes == 1
+    assert reader.list_release_artifacts("DEMO_PACKAGE", "1.0.0")
+    assert reader.get_artifact_details(SHA_ALLOW).summary.sha256 == SHA_ALLOW
+    assert reader.health() == {"database": "ok", "schema_version": 6}
+
+
 def test_list_allowed_releases_returns_all_mappings_in_deterministic_order(
     tmp_path,
 ) -> None:
