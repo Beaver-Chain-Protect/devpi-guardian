@@ -178,10 +178,28 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
         "database": "ok",
         "schema_version": 3,
         "mutations_ready": False,
+        "worker": {"status": "unavailable"},
+        "features": {
+            "audit": False,
+            "artifact_diff": False,
+            "baseline": False,
+            "policy": False,
+        },
     }
-    assert len(pyramid.routes) == 7
-    assert len(pyramid.views) == 7
+    assert len(pyramid.routes) == 14
+    assert len(pyramid.views) == 15
+    assert len({path for _, path in pyramid.routes}) == len(pyramid.routes)
     assert all(options["permission"] == "user_modify" for _, options in pyramid.views)
+    baseline_methods = {
+        options["request_method"]
+        for _, options in pyramid.views
+        if options["route_name"] == "guardian_baselines"
+    }
+    assert baseline_methods == {"GET", "POST"}
+    route_names = [name for name, _ in pyramid.routes]
+    assert route_names.index("guardian_baseline_import") < route_names.index(
+        "guardian_baseline_remove"
+    )
     discovery_sink = get_discovery_sink(pyramid.xom)
     assert isinstance(discovery_sink, FileDiscoverySink)
     assert discovery_sink.root == tmp_path / "discovery"
@@ -201,6 +219,40 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("restrict_modify", "allowed_principals"),
+    [
+        (None, {"root"}),
+        (("guardian-admin", "root"), {"guardian-admin", "root"}),
+    ],
+)
+def test_guardian_admin_routes_use_devpi_root_or_restrict_modify_admins(
+    restrict_modify,
+    allowed_principals,
+) -> None:
+    from devpi_server.view_auth import RootFactory
+    from pyramid.authorization import Allow
+
+    hook = SimpleNamespace(devpiserver_auth_denials=lambda **_kwargs: [])
+    xom = SimpleNamespace(
+        config=SimpleNamespace(restrict_modify=restrict_modify, hook=hook),
+        model=SimpleNamespace(),
+    )
+    request = SimpleNamespace(
+        registry={"xom": xom},
+        matchdict={"sha256": "a" * 64},
+    )
+
+    acl = RootFactory(request).__acl__
+    user_modify_principals = {
+        principal
+        for action, principal, permission in acl
+        if action is Allow and permission == "user_modify"
+    }
+
+    assert user_modify_principals == allowed_principals
 
 
 def test_pyramid_hook_uses_deterministic_default_path(tmp_path) -> None:

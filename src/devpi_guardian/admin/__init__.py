@@ -1,5 +1,21 @@
-"""F11 administrator REST API and CLI."""
+"""F11 administrator REST API, CLI, and integration provider contracts."""
 
-from .service import GuardianAdminService
+from .service import (
+    AdminFeatureUnavailable,
+    ArtifactDiffReader,
+    AuditReader,
+    BaselineManager,
+    GuardianAdminService,
+    PolicyManager,
+    WorkerHealthReader,
+)
 
-__all__ = ["GuardianAdminService"]
+__all__ = [
+    "AdminFeatureUnavailable",
+    "ArtifactDiffReader",
+    "AuditReader",
+    "BaselineManager",
+    "GuardianAdminService",
+    "PolicyManager",
+    "WorkerHealthReader",
+]
