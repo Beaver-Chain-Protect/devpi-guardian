@@ -194,9 +194,7 @@ def test_first_empty_activation_persists_marker_once(tmp_path) -> None:
 def test_existing_marker_skips_inventory(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
-    first = ensure_guardian_activation(
-        factory, DEVPI_UUID, lambda: None, now=lambda: NOW
-    )
+    first = ensure_guardian_activation(factory, DEVPI_UUID, lambda: None, now=lambda: NOW)
 
     def unexpected_inventory() -> None:
         raise AssertionError("inventory must not run on restart")
@@ -226,9 +224,7 @@ def test_candidate_refuses_without_persisting_marker(tmp_path) -> None:
 
     assert error.value.category is ActivationFailureCategory.EXISTING_ARTIFACTS
     with closing(factory.connect()) as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM guardian_activation"
-        ).fetchone()[0]
+        count = connection.execute("SELECT COUNT(*) FROM guardian_activation").fetchone()[0]
     assert count == 0
 ```
 
@@ -384,11 +380,7 @@ def test_known_toxresult_entry_is_ignored() -> None:
                 FakeRelpathInfo(
                     keyname="PROJVERSION",
                     relpath="root/dev/demo/1.0/.config",
-                    value={
-                        "+elinks": [
-                            {"rel": "toxresult", "entrypath": entrypath}
-                        ]
-                    },
+                    value={"+elinks": [{"rel": "toxresult", "entrypath": entrypath}]},
                 )
             ],
             "STAGEFILE": [
@@ -617,9 +609,9 @@ must use concrete positive and negative assertions:
 
 ```python
 def test_ci_covers_supported_python_and_quality_gates() -> None:
-    workflow = Path(__file__).parents[1].joinpath(
-        ".github/workflows/ci.yml"
-    ).read_text(encoding="utf-8")
+    workflow = (
+        Path(__file__).parents[1].joinpath(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
 
     for version in ('"3.11"', '"3.12"', '"3.13"', '"3.14"'):
         assert version in workflow
