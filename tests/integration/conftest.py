@@ -243,6 +243,28 @@ class RunningDevpi:
         _terminate(self._server)
         self._server = None
 
+    def reset_guardian_db_and_expect_failure(self) -> str:
+        """Remove this test DB and return the bounded startup diagnostic."""
+        server = self._server
+        log_dir = self._log_dir
+        if server is None or log_dir is None:
+            raise RuntimeError("devpi-server lifecycle is unavailable")
+        _terminate(server)
+        self._server = None
+        _remove_temporary_guardian_db(self.guardian_db)
+        try:
+            _start_server(
+                self.server_dir,
+                self.guardian_db,
+                log_dir,
+                offline=self._offline,
+                preferred_port=server.port,
+                log_label="expected-activation-failure",
+            )
+        except RuntimeError as error:
+            return str(error)
+        raise AssertionError("devpi-server unexpectedly became ready")
+
 
 @dataclass(frozen=True, slots=True)
 class _ServerProcess:
@@ -322,6 +344,24 @@ def _terminate(server: _ServerProcess) -> None:
             message = f"{message} after shutdown\n{diagnostic}"
             raise RuntimeError(message)
         time.sleep(0.05)
+
+
+def _remove_temporary_guardian_db(path: Path) -> None:
+    """Delete the explicitly allocated temporary Guardian DB and sidecars."""
+    resolved = path.resolve()
+    is_guardian_db = resolved.name == "guardian.db"
+    is_guardian_directory = resolved.parent.name in {
+        "guardian",
+        "mirror-guardian",
+    }
+    if not is_guardian_db or not is_guardian_directory:
+        raise ValueError("refusing to remove a non-test Guardian DB")
+    sidecars = (
+        resolved.with_name(resolved.name + "-wal"),
+        resolved.with_name(resolved.name + "-shm"),
+    )
+    for target in (resolved, *sidecars):
+        target.unlink(missing_ok=True)
 
 
 def _start_server(

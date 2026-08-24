@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from devpi_server.main import Fatal
 
 from devpi_guardian.enforcement.metrics import (
     BLOCK_METRIC_REGISTRY_KEY,
@@ -25,12 +26,25 @@ class FakeParser:
 
 
 class FakePyramidConfig:
-    def __init__(self):
-        self.registry = {}
+    def __init__(self, xom=None):
+        self.xom = object() if xom is None else xom
+        self.registry = {"xom": self.xom}
         self.tweens = []
 
     def add_tween(self, name, **kwargs):
         self.tweens.append((name, kwargs))
+
+
+def _config(tmp_path, *, guardian_db=None):
+    if guardian_db is None:
+        guardian_db = tmp_path / "guardian.db"
+    return SimpleNamespace(
+        args=SimpleNamespace(
+            guardian_db=str(guardian_db),
+        ),
+        nodeinfo={"uuid": "devpi-test-uuid"},
+        server_path=Path(tmp_path / "server"),
+    )
 
 
 def test_package_exposes_devpi_server_entry_point() -> None:
@@ -72,11 +86,13 @@ def test_parser_exposes_guardian_db_option() -> None:
 
 def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     tmp_path,
+    monkeypatch,
 ) -> None:
     pyramid = FakePyramidConfig()
-    config = SimpleNamespace(
-        args=SimpleNamespace(guardian_db=str(tmp_path / "guardian.db")),
-        server_path=Path(tmp_path / "server"),
+    config = _config(tmp_path)
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.find_existing_artifact_candidate",
+        lambda xom: None,
     )
 
     devpiserver_pyramid_configure(config, pyramid)
@@ -103,13 +119,23 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
         ).fetchone() == (1,)
 
 
-def test_pyramid_hook_uses_deterministic_default_path(tmp_path) -> None:
+def test_pyramid_hook_uses_deterministic_default_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
     pyramid = FakePyramidConfig()
     config = SimpleNamespace(
         args=SimpleNamespace(guardian_db=None),
+        nodeinfo={"uuid": "devpi-test-uuid"},
         server_path=tmp_path / "server",
     )
 
+    # The default-path test only exercises path selection; no persisted XOM
+    # data is present in this unit boundary.
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.find_existing_artifact_candidate",
+        lambda xom: None,
+    )
     devpiserver_pyramid_configure(config, pyramid)
 
     assert (tmp_path / "server" / "guardian" / "guardian.db").exists()
@@ -120,10 +146,7 @@ def test_migration_failure_has_no_registry_or_tween_side_effects(
     monkeypatch,
 ) -> None:
     pyramid = FakePyramidConfig()
-    config = SimpleNamespace(
-        args=SimpleNamespace(guardian_db=str(tmp_path / "guardian.db")),
-        server_path=tmp_path / "server",
-    )
+    config = _config(tmp_path)
 
     def fail_migration(factory):
         raise RuntimeError("migration failed")
@@ -133,7 +156,120 @@ def test_migration_failure_has_no_registry_or_tween_side_effects(
     with pytest.raises(RuntimeError, match="migration failed"):
         devpiserver_pyramid_configure(config, pyramid)
 
-    assert pyramid.registry == {}
+    assert pyramid.registry == {"xom": pyramid.xom}
+    assert pyramid.tweens == []
+
+
+def test_pyramid_hook_runs_activation_before_registry_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    events = []
+    pyramid = FakePyramidConfig()
+    config = _config(tmp_path)
+
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.migrate",
+        lambda factory: events.append("migrate"),
+    )
+
+    def activate(factory, devpi_uuid, find_candidate, *, now):
+        assert devpi_uuid == "devpi-test-uuid"
+        events.append("activation")
+        assert find_candidate() is None
+        return True
+
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.ensure_guardian_activation",
+        activate,
+    )
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.find_existing_artifact_candidate",
+        lambda xom: events.append("inventory") or None,
+    )
+
+    class Reader:
+        def __init__(self, factory):
+            events.append("reader")
+
+    class Metrics:
+        def __init__(self):
+            events.append("metrics")
+
+    monkeypatch.setattr("devpi_guardian.plugin.SQLiteVerdictReader", Reader)
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.InMemoryBlockMetricRecorder",
+        Metrics,
+    )
+
+    original_add_tween = pyramid.add_tween
+
+    def add_tween(name, **kwargs):
+        events.append("tween")
+        original_add_tween(name, **kwargs)
+
+    pyramid.add_tween = add_tween
+
+    class Registry(dict):
+        def __setitem__(self, key, value):
+            if key == VERDICT_READER_REGISTRY_KEY:
+                registry_event = "registry-reader"
+            else:
+                registry_event = "registry-metrics"
+            events.append(registry_event)
+            super().__setitem__(key, value)
+
+    pyramid.registry = Registry(pyramid.registry)
+
+    devpiserver_pyramid_configure(config, pyramid)
+
+    assert events == [
+        "migrate",
+        "activation",
+        "inventory",
+        "reader",
+        "metrics",
+        "registry-reader",
+        "registry-metrics",
+        "tween",
+    ]
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "existing_artifacts",
+        "uuid_mismatch",
+        "store_unavailable",
+    ],
+)
+def test_activation_failures_are_fatal_before_registry_mutation(
+    tmp_path,
+    monkeypatch,
+    category,
+) -> None:
+    from devpi_guardian.activation import (
+        ActivationFailureCategory,
+        GuardianActivationError,
+    )
+
+    pyramid = FakePyramidConfig()
+    config = _config(tmp_path)
+    monkeypatch.setattr("devpi_guardian.plugin.migrate", lambda factory: None)
+
+    def activate(factory, devpi_uuid, find_candidate, *, now):
+        raise GuardianActivationError(ActivationFailureCategory(category))
+
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.ensure_guardian_activation",
+        activate,
+    )
+
+    with pytest.raises(Fatal) as error:
+        devpiserver_pyramid_configure(config, pyramid)
+
+    assert str(error.value) == f"guardian activation failed: {category}"
+    assert pyramid.registry == {"xom": pyramid.xom}
     assert pyramid.tweens == []
 
 
