@@ -7,6 +7,8 @@ from devpi_guardian.enforcement.metrics import InMemoryBlockMetricRecorder
 from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
 from devpi_guardian.plugin import devpiserver_add_parser_options
 from devpi_guardian.plugin import devpiserver_pyramid_configure
+from devpi_guardian.worker.discovery import FileDiscoverySink
+from devpi_guardian.worker.discovery import get_discovery_sink
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_server.model import BaseStageCustomizer
 from devpi_server.model import InvalidIndexconfig
@@ -163,6 +165,9 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     metrics = pyramid.registry[BLOCK_METRIC_REGISTRY_KEY]
     assert isinstance(metrics, InMemoryBlockMetricRecorder)
     assert metrics.snapshot() == {}
+    discovery_sink = get_discovery_sink(pyramid.xom)
+    assert isinstance(discovery_sink, FileDiscoverySink)
+    assert discovery_sink.root == tmp_path / "discovery"
     tween_prefix = "devpi_guardian.enforcement.tween."
     tween_suffix = "guardian_enforcement_tween_factory"
     tween_name = tween_prefix + tween_suffix
@@ -213,6 +218,7 @@ def test_migration_failure_has_no_registry_or_tween_side_effects(
 
     assert pyramid.registry == {"xom": pyramid.xom}
     assert not hasattr(pyramid.xom, "_devpi_guardian_verdict_reader")
+    assert not hasattr(pyramid.xom, "_devpi_guardian_discovery_sink")
     assert pyramid.tweens == []
 
 
