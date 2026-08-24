@@ -49,6 +49,7 @@ _DISCOVERY_COLUMN_TYPES = {
 }
 _MAX_CLAIM_CORRUPT_ROWS = 32
 _CLAIM_BATCH_SIZE = 64
+_SCRUB_BATCH_SIZE = 32
 
 
 def _validate_claim(claim: DiscoveryClaim) -> None:
@@ -187,6 +188,11 @@ def _validate_catalog(connection: sqlite3.Connection) -> None:
         "lease_token"
     ] or "WHERE LEASE_TOKEN IS NOT NULL" not in lease_sql.upper():
         raise DiscoveryUnavailable("incompatible discovery schema: lease index mismatch")
+    integrity_columns = connection.execute(
+        "PRAGMA index_info(discovery_jobs_integrity_idx)"
+    ).fetchall()
+    if [row[2] for row in integrity_columns] != ["state", "job_id"]:
+        raise DiscoveryUnavailable("incompatible discovery schema: integrity index mismatch")
     probe_candidate = DiscoveryCandidate(
         stage="schema-probe",
         project="probe",
@@ -390,6 +396,7 @@ class FileDiscoverySink:
         self.path = self.root / "discovery.db"
         self._max_active_jobs = max_active_jobs
         self._now = now if now is not None else lambda: datetime.now(UTC)
+        self._scrub_cursor: tuple[str | None, int] | None = None
         self._initialize()
 
     def _initialize(self) -> None:
@@ -437,6 +444,8 @@ class FileDiscoverySink:
                     ON discovery_jobs(state, available_at, created_at, job_id);
                     CREATE UNIQUE INDEX IF NOT EXISTS discovery_jobs_processing_lease_idx
                     ON discovery_jobs(lease_token) WHERE lease_token IS NOT NULL;
+                    CREATE INDEX IF NOT EXISTS discovery_jobs_integrity_idx
+                    ON discovery_jobs(state, job_id);
                     """
                 )
                 columns = {
@@ -508,10 +517,58 @@ class FileDiscoverySink:
                 )
                 active += 1
 
+    def _scrub_pending_rows(self, connection: sqlite3.Connection, now: str) -> None:
+        cursor = self._scrub_cursor
+        if cursor is None:
+            rows = connection.execute(
+                """
+                SELECT rowid AS _rowid, * FROM discovery_jobs
+                WHERE state = 'PENDING'
+                ORDER BY job_id, rowid
+                LIMIT ?
+                """,
+                (_SCRUB_BATCH_SIZE,),
+            ).fetchall()
+        else:
+            last_job_id, last_rowid = cursor
+            rows = connection.execute(
+                """
+                SELECT rowid AS _rowid, * FROM discovery_jobs
+                WHERE state = 'PENDING'
+                  AND (
+                      job_id > ?
+                      OR (job_id = ? AND rowid > ?)
+                      OR (job_id IS NULL AND ? IS NULL AND rowid > ?)
+                  )
+                ORDER BY job_id, rowid
+                LIMIT ?
+                """,
+                (last_job_id, last_job_id, last_rowid, last_job_id, last_rowid, _SCRUB_BATCH_SIZE),
+            ).fetchall()
+        for row in rows:
+            try:
+                _validate_pending_row(row)
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                diagnostic = f"discovery row invalid: {type(error).__name__}: {error}"[:4096]
+                connection.execute(
+                    """
+                    UPDATE discovery_jobs
+                    SET state = 'FAILED', lease_owner = NULL,
+                        lease_expires_at = NULL, lease_token = NULL,
+                        last_error = ?, updated_at = ?
+                    WHERE rowid = ? AND state = 'PENDING'
+                    """,
+                    (diagnostic, now, row["_rowid"]),
+                )
+        if len(rows) < _SCRUB_BATCH_SIZE:
+            self._scrub_cursor = None
+        else:
+            self._scrub_cursor = (rows[-1]["job_id"], rows[-1]["_rowid"])
+
     def recover_expired_claims(self) -> int:
-        now_value = require_utc(self._now(), "now")
-        now = now_value.isoformat()
         with self._write() as connection:
+            now_value = require_utc(self._now(), "now")
+            now = now_value.isoformat()
             rows = connection.execute(
                 """
                 SELECT rowid AS _rowid, * FROM discovery_jobs
@@ -556,24 +613,20 @@ class FileDiscoverySink:
         if not isinstance(worker_id, str) or not worker_id.strip() or "\x00" in worker_id:
             raise ValueError("worker_id must be a nonblank safe string")
         worker_id = str(worker_id)
-        now_value = require_utc(self._now(), "now")
-        lease_value = require_utc(lease_until, "lease_until")
-        if lease_value <= now_value:
-            raise ValueError("lease_until must be in the future")
-        now = now_value.isoformat()
-        lease = lease_value.isoformat()
-        lease_token = secrets.token_hex(32)
         with self._write() as connection:
+            now_value = require_utc(self._now(), "now")
+            lease_value = require_utc(lease_until, "lease_until")
+            if lease_value <= now_value:
+                raise ValueError("lease_until must be in the future")
+            now = now_value.isoformat()
+            lease = lease_value.isoformat()
+            lease_token = secrets.token_hex(32)
+            self._scrub_pending_rows(connection, now)
             rows = connection.execute(
                 """
                 SELECT rowid AS _rowid, *
                 FROM discovery_jobs
-                WHERE state = 'PENDING'
-                  AND (
-                      available_at <= ?
-                      OR typeof(available_at) != 'text'
-                      OR available_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*'
-                  )
+                WHERE state = 'PENDING' AND available_at <= ?
                 ORDER BY available_at, created_at, job_id
                 LIMIT ?
                 """,
@@ -635,12 +688,12 @@ class FileDiscoverySink:
     def _finish(self, claim: DiscoveryClaim, *, state: str, error: str | None) -> None:
         if state not in ("COMPLETED", "FAILED"):
             raise ValueError("invalid terminal discovery state")
-        now_value = require_utc(self._now(), "now")
-        now = now_value.isoformat()
-        _validate_claim(claim)
-        if now_value >= claim.lease_expires_at:
-            raise DiscoveryUnavailable("discovery claim has expired")
         with self._write() as connection:
+            now_value = require_utc(self._now(), "now")
+            now = now_value.isoformat()
+            _validate_claim(claim)
+            if now_value >= claim.lease_expires_at:
+                raise DiscoveryUnavailable("discovery claim has expired")
             cursor = connection.execute(
                 """
                 UPDATE discovery_jobs
@@ -677,14 +730,14 @@ class FileDiscoverySink:
             raise ValueError("retry delay must not be negative")
         if type(max_attempts) is not int or max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
-        now_value = require_utc(self._now(), "now")
-        _validate_claim(claim)
-        if now_value >= claim.lease_expires_at:
-            raise DiscoveryUnavailable("discovery claim has expired")
-        terminal = claim.attempt_count >= max_attempts
-        state = "FAILED" if terminal else "PENDING"
-        available_at = (now_value + delay).isoformat()
         with self._write() as connection:
+            now_value = require_utc(self._now(), "now")
+            _validate_claim(claim)
+            if now_value >= claim.lease_expires_at:
+                raise DiscoveryUnavailable("discovery claim has expired")
+            terminal = claim.attempt_count >= max_attempts
+            state = "FAILED" if terminal else "PENDING"
+            available_at = (now_value + delay).isoformat()
             cursor = connection.execute(
                 """
                 UPDATE discovery_jobs

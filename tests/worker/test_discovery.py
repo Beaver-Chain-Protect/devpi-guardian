@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -237,6 +238,80 @@ def test_claim_expiry_identity_is_fenced_even_before_stored_expiry(tmp_path) -> 
     sink.complete(claim)
 
 
+def test_complete_samples_clock_after_write_lock(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+    assert claim is not None
+    original_write = sink._write
+
+    @contextmanager
+    def advancing_write():
+        with original_write() as connection:
+            clock[0] = claim.lease_expires_at
+            yield connection
+
+    sink._write = advancing_write
+    with pytest.raises(DiscoveryUnavailable):
+        sink.complete(claim)
+
+
+def test_retry_samples_clock_after_write_lock(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+    assert claim is not None
+    original_write = sink._write
+
+    @contextmanager
+    def advancing_write():
+        with original_write() as connection:
+            clock[0] = claim.lease_expires_at
+            yield connection
+
+    sink._write = advancing_write
+    with pytest.raises(DiscoveryUnavailable):
+        sink.retry(claim, "late")
+
+
+def test_claim_next_samples_clock_after_write_lock(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    original_write = sink._write
+    lease_until = NOW + timedelta(minutes=5)
+
+    @contextmanager
+    def advancing_write():
+        with original_write() as connection:
+            clock[0] = lease_until
+            yield connection
+
+    sink._write = advancing_write
+    with pytest.raises(ValueError, match="future"):
+        sink.claim_next("worker-1", lease_until)
+
+
+def test_recovery_samples_clock_after_write_lock(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(seconds=5))
+    assert claim is not None
+    original_write = sink._write
+
+    @contextmanager
+    def advancing_write():
+        with original_write() as connection:
+            clock[0] = claim.lease_expires_at
+            yield connection
+
+    sink._write = advancing_write
+    assert sink.recover_expired_claims() == 1
+
+
 @pytest.mark.parametrize(
     "column", ["job_id", "candidate_json", "lease_expires_at", "lease_owner", "lease_token"]
 )
@@ -378,6 +453,41 @@ def test_claim_query_is_bounded_to_eligible_rows(tmp_path) -> None:
     claim_sql = "\n".join(traces)
     assert "available_at <=" in claim_sql
     assert "LIMIT 64" in claim_sql
+
+
+def test_corrupt_future_pending_row_is_scrubbed(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    sink.discover(candidate())
+    with sqlite3.connect(sink.path) as connection:
+        connection.execute(
+            "UPDATE discovery_jobs SET available_at = ?",
+            ("9999-99-99T99:99:99+00:00",),
+        )
+        connection.commit()
+
+    assert sink.claim_next("worker-1", NOW + timedelta(minutes=5)) is None
+    assert sink.count("FAILED") == 1
+
+
+def test_future_pending_scrub_progresses_across_bounded_calls(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, max_active_jobs=100, now=lambda: NOW)
+    items = tuple(candidate(project=f"future-{index}") for index in range(70))
+    sink.discover_many(items)
+    corrupt = items[-1]
+    with sqlite3.connect(sink.path) as connection:
+        connection.execute(
+            "UPDATE discovery_jobs SET available_at = ?, candidate_json = ? WHERE job_id = ?",
+            ("9999-99-99T99:99:99+00:00", "not-json", _job_id_for_test(corrupt)),
+        )
+        connection.execute(
+            "UPDATE discovery_jobs SET available_at = ? WHERE job_id != ?",
+            ("2027-01-01T00:00:00+00:00", _job_id_for_test(corrupt)),
+        )
+        connection.commit()
+
+    for _ in range(4):
+        assert sink.claim_next("worker-1", NOW + timedelta(minutes=5)) is None
+    assert sink.count("FAILED") == 1
 
 
 def _job_id_for_test(item: DiscoveryCandidate) -> str:
