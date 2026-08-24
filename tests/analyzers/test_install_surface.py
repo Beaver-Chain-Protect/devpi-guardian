@@ -414,6 +414,26 @@ def test_init_credential_to_network_flow_is_denied(make_wheel) -> None:
     assert flow[0].sink == "requests.post"
 
 
+def test_init_safe_credential_overwrite_is_not_reviewed_as_network_flow(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo/__init__.py": (
+                "import os, requests\n"
+                "secret = os.getenv('GITHUB_TOKEN')\n"
+                "secret = 'safe'\n"
+                "requests.post('https://legitimate.example', data=secret)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert not any(
+        item.rule == "init_top_level_side_effect"
+        and item.action == "DENY"
+        and item.sink == "requests.post"
+        for item in findings
+    )
+
+
 def test_safe_wrapper_does_not_hide_init_credential_network_flow(make_wheel) -> None:
     artifact = make_wheel(
         {

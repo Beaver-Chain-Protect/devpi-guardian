@@ -1611,64 +1611,253 @@ def _assignment_parts(
     return [assignment.value], [assignment.target]
 
 
-def _credential_taint(
-    nodes: list[ast.AST], scope_sources: list[CredentialAccess]
-) -> tuple[set[str], dict[str, CredentialAccess]]:
-    tainted: set[str] = set()
-    source_for_name: dict[str, CredentialAccess] = {}
-    assignments = [
-        node for node in nodes if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
-    ]
-    changed = True
-    while changed:
-        changed = False
-        for assignment in assignments:
-            values, targets = _assignment_parts(assignment)
-            matching_source = next(
-                (
-                    item
-                    for item in scope_sources
-                    if any(_contains_node(value, item.node) for value in values)
-                ),
-                None,
+_TaintOrigin = CredentialAccess | str
+_TaintState = dict[str, frozenset[_TaintOrigin]]
+
+
+def _origin_sort_key(origin: _TaintOrigin) -> tuple[object, ...]:
+    if isinstance(origin, CredentialAccess):
+        return (0, origin.line, origin.description, origin.snippet)
+    return (1, origin)
+
+
+def _ordered_origins(origins: Iterable[_TaintOrigin]) -> tuple[_TaintOrigin, ...]:
+    return tuple(sorted(set(origins), key=_origin_sort_key))
+
+
+def _copy_taint_state(state: _TaintState) -> _TaintState:
+    return {name: frozenset(origins) for name, origins in state.items() if origins}
+
+
+def _join_taint_states(*states: _TaintState) -> _TaintState:
+    merged: _TaintState = {}
+    for state in states:
+        for name, origins in state.items():
+            if origins:
+                merged[name] = merged.get(name, frozenset()) | origins
+    return merged
+
+
+def _target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return {name for item in target.elts for name in _target_names(item)}
+    return set()
+
+
+def _import_bound_names(node: ast.Import | ast.ImportFrom) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {alias.asname or alias.name.split(".", 1)[0] for alias in node.names}
+    return {alias.asname or alias.name for alias in node.names if alias.name != "*"}
+
+
+class _OrderedTaintAnalyzer:
+    """Bounded, ordered taint analysis for one lexical scope."""
+
+    def __init__(
+        self,
+        scope_sources: list[CredentialAccess],
+        network_calls: Iterable[CallSite],
+        initial_state: _TaintState | None = None,
+    ) -> None:
+        self.scope_sources = scope_sources
+        self.network_calls = {id(call.node): call for call in network_calls}
+        self.state: _TaintState = _copy_taint_state(initial_state or {})
+        self.sink_origins: dict[int, tuple[_TaintOrigin, ...]] = {}
+        self.return_origins: list[tuple[_TaintOrigin, ...]] = []
+        self.call_snapshots: dict[int, _TaintState] = {}
+
+    def _direct_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
+        return frozenset(item for item in self.scope_sources if _contains_node(node, item.node))
+
+    def _name_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
+        return frozenset(
+            origin for name in _loaded_names(node) for origin in self.state.get(name, frozenset())
+        )
+
+    def _node_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
+        return self._direct_origins(node) | self._name_origins(node)
+
+    def _assign(self, targets: Iterable[ast.AST], origins: frozenset[_TaintOrigin]) -> None:
+        for target in targets:
+            for name in _target_names(target):
+                if origins:
+                    self.state[name] = origins
+                else:
+                    self.state.pop(name, None)
+
+    def _run_block(self, body: Iterable[ast.stmt], initial: _TaintState) -> _TaintState:
+        previous = self.state
+        self.state = _copy_taint_state(initial)
+        for statement in body:
+            self._statement(statement)
+        result = _copy_taint_state(self.state)
+        self.state = previous
+        return result
+
+    def _expression(self, node: ast.AST) -> frozenset[_TaintOrigin]:
+        if isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return self._node_origins(node)
+        if isinstance(node, ast.Call):
+            self.call_snapshots[id(node)] = _copy_taint_state(self.state)
+            origins = self._expression(node.func)
+            argument_origins: list[frozenset[_TaintOrigin]] = []
+            for argument in node.args:
+                argument_origins.append(self._expression(argument))
+            for keyword in node.keywords:
+                argument_origins.append(self._expression(keyword.value))
+            payload_origins = (
+                frozenset().union(*argument_origins) if argument_origins else frozenset()
             )
-            inherited_name = next(
-                (name for value in values for name in _loaded_names(value) if name in tainted),
-                None,
-            )
-            if matching_source is None and inherited_name is None:
+            origins = origins | payload_origins | self._direct_origins(node)
+            call = self.network_calls.get(id(node))
+            if call is not None:
+                self.sink_origins[id(node)] = _ordered_origins(payload_origins)
+            return origins
+        if isinstance(node, ast.NamedExpr):
+            origins = self._expression(node.value) | self._direct_origins(node.value)
+            self._assign([node.target], origins)
+            return origins
+        origins = self._direct_origins(node) | self._name_origins(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            origin = matching_source or source_for_name[inherited_name]  # type: ignore[index]
+            origins |= self._expression(child)
+        return origins
+
+    def _statement(self, node: ast.stmt) -> None:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            values, targets = _assignment_parts(node)
+            origins = frozenset()
+            for value in values:
+                origins |= self._expression(value)
             for target in targets:
+                if not isinstance(target, (ast.Name, ast.Tuple, ast.List)):
+                    self._expression(target)
+            self._assign(targets, origins)
+            return
+        if isinstance(node, ast.AugAssign):
+            previous = frozenset(
+                self.state.get(node.target.id, frozenset())
+                if isinstance(node.target, ast.Name)
+                else ()
+            )
+            origins = self._expression(node.value)
+            self._expression(node.target)
+            if isinstance(node.target, ast.Name):
+                self._assign([node.target], previous | origins)
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            self.state = {
+                name: origins
+                for name, origins in self.state.items()
+                if name not in _import_bound_names(node)
+            }
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            self.state.pop(node.name, None)
+            return
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
                 for name in _assigned_names(target):
-                    if name not in tainted:
-                        tainted.add(name)
-                        source_for_name[name] = origin
-                        changed = True
-    return tainted, source_for_name
+                    self.state.pop(name, None)
+            return
+        if isinstance(node, ast.If):
+            self._expression(node.test)
+            incoming = _copy_taint_state(self.state)
+            body_state = self._run_block(node.body, incoming)
+            else_state = self._run_block(node.orelse, incoming) if node.orelse else incoming
+            self.state = _join_taint_states(body_state, else_state)
+            return
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            incoming = _copy_taint_state(self.state)
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                iterable_origins = self._expression(node.iter)
+                self._assign([node.target], iterable_origins)
+            else:
+                self._expression(node.test)
+            loop_entry = _copy_taint_state(self.state)
+            body_state = self._run_block(node.body, loop_entry)
+            else_state = self._run_block(node.orelse, loop_entry) if node.orelse else loop_entry
+            self.state = _join_taint_states(incoming, body_state, else_state)
+            return
+        if isinstance(node, ast.Try):
+            incoming = _copy_taint_state(self.state)
+            try_state = self._run_block(node.body, incoming)
+            branch_states = [try_state]
+            if node.handlers:
+                for handler in node.handlers:
+                    if handler.type is not None:
+                        self._expression(handler.type)
+                    handler_state = self._run_block(handler.body, incoming)
+                    branch_states.append(handler_state)
+            else:
+                branch_states.append(incoming)
+            merged = _join_taint_states(*branch_states)
+            if node.orelse:
+                normal_else = self._run_block(node.orelse, try_state)
+                merged = _join_taint_states(merged, normal_else)
+            self.state = self._run_block(node.finalbody, merged) if node.finalbody else merged
+            return
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                context_origins = self._expression(item.context)
+                if item.optional_vars is not None:
+                    self._assign([item.optional_vars], context_origins)
+            self.state = self._run_block(node.body, self.state)
+            return
+        if isinstance(node, ast.Return):
+            if node.value is not None:
+                self.return_origins.append(_ordered_origins(self._expression(node.value)))
+            return
+        if isinstance(node, ast.Expr):
+            self._expression(node.value)
+            return
+        if isinstance(node, ast.Match):
+            subject_origins = self._expression(node.subject)
+            incoming = _copy_taint_state(self.state)
+            branches = []
+            for case in node.cases:
+                branch = _copy_taint_state(incoming)
+                if case.guard is not None:
+                    self.state = branch
+                    self._expression(case.guard)
+                    branch = _copy_taint_state(self.state)
+                self._assign([case.pattern], subject_origins)
+                branches.append(self._run_block(case.body, branch))
+            self.state = _join_taint_states(incoming, *branches)
+            return
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.stmt):
+                self._statement(child)
+            else:
+                self._expression(child)
+
+    def run(self, body: Iterable[ast.stmt]) -> None:
+        for statement in body:
+            self._statement(statement)
 
 
-def _payload_origin(
+def _payload_origins(
     payload_nodes: list[ast.AST],
     scope_sources: list[CredentialAccess],
-    tainted: set[str],
-    source_for_name: dict[str, CredentialAccess],
-) -> CredentialAccess | None:
-    direct = next(
-        (
-            item
-            for item in scope_sources
-            if any(_contains_node(payload, item.node) for payload in payload_nodes)
-        ),
-        None,
+    state: _TaintState,
+) -> tuple[CredentialAccess, ...]:
+    origins = frozenset(
+        item
+        for item in scope_sources
+        if any(_contains_node(payload, item.node) for payload in payload_nodes)
     )
-    if direct is not None:
-        return direct
-    tainted_arg = next(
-        (name for payload in payload_nodes for name in _loaded_names(payload) if name in tainted),
-        None,
+    origins |= frozenset(
+        origin
+        for payload in payload_nodes
+        for name in _loaded_names(payload)
+        for origin in state.get(name, frozenset())
     )
-    return source_for_name.get(tainted_arg) if tainted_arg is not None else None
+    return tuple(
+        origin for origin in _ordered_origins(origins) if isinstance(origin, CredentialAccess)
+    )
 
 
 def _function_parameter_sinks(
@@ -1682,46 +1871,17 @@ def _function_parameter_sinks(
             continue
         positional = [*function.args.posonlyargs, *function.args.args]
         parameters = [*positional, *function.args.kwonlyargs]
-        parameter_origins: dict[str, set[str]] = {
-            parameter.arg: {parameter.arg} for parameter in parameters
-        }
         function_nodes = _scope_nodes(function.body)
-        assignments = [
-            node
-            for node in function_nodes
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
-        ]
-        changed = True
-        while changed:
-            changed = False
-            for assignment in assignments:
-                values, targets = _assignment_parts(assignment)
-                inherited = {
-                    origin
-                    for value in values
-                    for name in _loaded_names(value)
-                    for origin in parameter_origins.get(name, set())
-                }
-                if not inherited:
-                    continue
-                for target in targets:
-                    for name in _assigned_names(target):
-                        previous = parameter_origins.setdefault(name, set())
-                        before = len(previous)
-                        previous.update(inherited)
-                        changed = changed or len(previous) != before
-
         function_sinks = [
             call for call in network_calls if any(node is call.node for node in function_nodes)
         ]
+        initial_state: _TaintState = {
+            parameter.arg: frozenset({parameter.arg}) for parameter in parameters
+        }
+        analyzer = _OrderedTaintAnalyzer([], function_sinks, initial_state)
+        analyzer.run(function.body)
         for sink in function_sinks:
-            payload = list(sink.node.args) + [keyword.value for keyword in sink.node.keywords]
-            used = {
-                origin
-                for node in payload
-                for name in _loaded_names(node)
-                for origin in parameter_origins.get(name, set())
-            }
+            used = analyzer.sink_origins.get(id(sink.node), ())
             for parameter_name in sorted(used):
                 position = next(
                     (
@@ -1737,10 +1897,10 @@ def _function_parameter_sinks(
 
 def _function_return_sources(
     tree: ast.Module, all_sources: list[CredentialAccess]
-) -> dict[str, CredentialAccess]:
+) -> dict[str, tuple[CredentialAccess, ...]]:
     """Summarize top-level helpers that return a credential-derived value."""
 
-    summaries: dict[str, CredentialAccess] = {}
+    summaries: dict[str, tuple[CredentialAccess, ...]] = {}
     for function in tree.body:
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -1752,13 +1912,16 @@ def _function_return_sources(
         ]
         if not scope_sources:
             continue
-        tainted, source_for_name = _credential_taint(function_nodes, scope_sources)
-        for node in function_nodes:
-            if not isinstance(node, ast.Return) or node.value is None:
-                continue
-            origin = _payload_origin([node.value], scope_sources, tainted, source_for_name)
-            if origin is not None:
-                summaries.setdefault(function.name, origin)
+        analyzer = _OrderedTaintAnalyzer(scope_sources, [])
+        analyzer.run(function.body)
+        origins = {
+            origin
+            for returned in analyzer.return_origins
+            for origin in returned
+            if isinstance(origin, CredentialAccess)
+        }
+        if origins:
+            summaries[function.name] = _ordered_origins(origins)  # type: ignore[assignment]
     return summaries
 
 
@@ -1782,13 +1945,12 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
         if not scope_sources or not scope_sinks:
             continue
 
-        tainted, source_for_name = _credential_taint(nodes, scope_sources)
-
+        analyzer = _OrderedTaintAnalyzer(scope_sources, scope_sinks)
+        analyzer.run(body)
         for sink in scope_sinks:
-            payload_nodes = list(sink.node.args) + [keyword.value for keyword in sink.node.keywords]
-            origin = _payload_origin(payload_nodes, scope_sources, tainted, source_for_name)
-            if origin is not None:
-                flows.append(CredentialFlow(origin, sink))
+            for origin in analyzer.sink_origins.get(id(sink.node), ()):
+                if isinstance(origin, CredentialAccess):
+                    flows.append(CredentialFlow(origin, sink))
 
     # One bounded interprocedural step: a credential read at module scope is
     # passed into a top-level helper whose corresponding parameter reaches a
@@ -1804,27 +1966,24 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
         ]
         module_calls = [call for call in calls if any(node is call.node for node in module_nodes)]
         for call in module_calls:
-            returned_source = return_sources.get(call.qualified_name)
-            if returned_source is not None:
-                module_sources.append(
+            returned_sources = return_sources.get(call.qualified_name)
+            if returned_sources is not None:
+                module_sources.extend(
                     CredentialAccess(
                         returned_source.description,
                         returned_source.line,
                         returned_source.snippet,
                         call.node,
                     )
+                    for returned_source in returned_sources
                 )
-        module_taint, module_source_for_name = _credential_taint(module_nodes, module_sources)
-        for sink in (call for call in module_calls if call.category == "network"):
-            payload_nodes = list(sink.node.args) + [keyword.value for keyword in sink.node.keywords]
-            origin = _payload_origin(
-                payload_nodes,
-                module_sources,
-                module_taint,
-                module_source_for_name,
-            )
-            if origin is not None:
-                flows.append(CredentialFlow(origin, sink))
+        module_sinks = [call for call in module_calls if call.category == "network"]
+        module_analyzer = _OrderedTaintAnalyzer(module_sources, module_sinks)
+        module_analyzer.run(tree.body)
+        for sink in module_sinks:
+            for origin in module_analyzer.sink_origins.get(id(sink.node), ()):
+                if isinstance(origin, CredentialAccess):
+                    flows.append(CredentialFlow(origin, sink))
         for call in module_calls:
             helper_name = call.qualified_name
             for parameter_name, position, sink in summaries.get(helper_name, []):
@@ -1836,13 +1995,8 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
                         argument = keyword.value
                 if argument is None:
                     continue
-                origin = _payload_origin(
-                    [argument],
-                    module_sources,
-                    module_taint,
-                    module_source_for_name,
-                )
-                if origin is not None:
+                snapshot = module_analyzer.call_snapshots.get(id(call.node), {})
+                for origin in _payload_origins([argument], module_sources, snapshot):
                     flows.append(
                         CredentialFlow(
                             origin,

