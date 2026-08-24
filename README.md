@@ -10,6 +10,61 @@ The [approved F3/F4 design][approved-design] is in the repository.
 
 [approved-design]: https://github.com/Beaver-Context-Protocol/devpi-guardian/blob/main/docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md
 
+## New-install activation boundary
+
+PR1 supports new Guardian deployments only. “New” means the first consistent
+Guardian activation snapshot has no existing Artifact candidates; a newly created
+devpi server directory is not enough. Guardian writes one immutable
+`guardian_activation` marker containing the devpi `devpi_uuid` and activation
+version. The first activation marker is created only after the offline KeyFS
+snapshot is checked, and later starts require the same UUID and preserved marker.
+
+Activation refuses with the bounded category `existing_artifacts` when any existing
+private or root-pypi Artifact candidate is found, including a cached mirror file or
+persisted release link. Inventory is a single offline snapshot: there is no
+online/public network inventory, mirror refresh, or public download. A missing
+Guardian DB on a restored devpi is a DB loss and is refused rather than treated as a
+new install. Migration/backfill is deferred and not supported in PR1; existing
+instances must remain without this plugin until the separate offline process exists.
+There is no compatibility bypass: no legacy allow flag, pass-through, route exception,
+or worker token can weaken the gate.
+
+Operational preflight must verify the devpi snapshot is empty of Artifact candidates,
+that one migration/activation owner is used, and that the Guardian database and its
+WAL/SHM files are on a persistent volume. Use a SQLite-consistent backup before
+changes, and keep a rollback plan that removes the plugin and restores the prior
+devpi service if activation fails. Any uncertainty remains fail-closed before
+readiness; do not serve unverified bytes to make rollback easier.
+
+## F5 quarantine
+
+F5 reads unapproved Artifact bytes only from `GUARDIAN_QUARANTINE_DIR`, an absolute
+dedicated permission-restricted path outside public devpi storage/routes. Deployment
+must not expose it through HTTP. The content-addressed layout is exactly
+`objects/sha256/<first-2>/<next-2>/<sha256>`; SQLite, filenames, projects, versions,
+and URLs never choose a filesystem path. Unapproved bytes never live in SQLite or
+public `+f`/`+e` storage as a worker input. Unapproved bytes never in
+SQLite/public +f/+e.
+
+Writers create a temporary file under `.incoming` on the same filesystem, hash and
+size the stream, then fsync the file. A digest/size mismatch discards the temporary
+file without discovery. Publish-before-discover ordering is mandatory: publishing is
+an atomic no-overwrite publish, and an existing
+digest is accepted only after duplicate digest byte identity is verified; conflicting
+bytes, symlinks, hard links, non-regular files, unsafe permissions, and path escape
+are refused. After the final object is atomically published, fsync the parent before
+discoverable metadata is written by `discover_artifact()`.
+
+F5 opens the CAS using no-symlink/no traversal semantics from a pre-opened quarantine
+root, verifies regular-file type and claimed size, hashes the same open file
+descriptor, and only then parses that descriptor; this is same-open-file digest
+verification. Mismatch/missing/I/O/symlink failures are fail-closed and record
+analysis error without a verdict. F5 alone reads unapproved path. F6 still uses
+HTTP(S) canonical +f/+e after ALLOW. There is no worker/public route bypass token,
+header, query, or loopback exception. Orphan
+objects remain safe and are handled by a separate cleanup/retention contract; PR1
+does not silently delete them.
+
 ## Implemented features
 
 - Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658

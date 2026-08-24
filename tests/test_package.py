@@ -375,3 +375,107 @@ def test_readme_documents_verdict_baseline_tier_contract() -> None:
         "sdist comparisons have lower confidence",
     ):
         assert phrase in f10_section
+
+
+def test_ci_covers_supported_python_and_quality_gates() -> None:
+    repo_root = Path(__file__).parents[1]
+    workflow_path = repo_root.joinpath(".github/workflows/ci.yml")
+    workflow = workflow_path.read_text(encoding="utf-8")
+
+    for version in ('"3.11"', '"3.12"', '"3.13"', '"3.14"'):
+        assert version in workflow
+    for required in (
+        "contents: read",
+        "cancel-in-progress: true",
+        "uv sync --locked --extra test",
+        "uv run pytest -v",
+        "uv run ruff format --check .",
+        "uv run ruff check .",
+        "uv run flake8 src tests",
+        "uv run python -m build",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "".join(
+            (
+                "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d ",
+                "# v10.0.1",
+            )
+        ),
+    ):
+        assert required in workflow
+    for forbidden in (
+        "pull-requests: write",
+        "contents: write",
+        "continue-on-error",
+        "-m 'not integration'",
+        '-m "not integration"',
+    ):
+        assert forbidden not in workflow
+
+
+def test_readme_documents_new_install_activation_boundary() -> None:
+    repo_root = Path(__file__).parents[1]
+    readme_path = repo_root.joinpath("README.md")
+    readme = readme_path.read_text(encoding="utf-8")
+    activation_marker = "## New-install activation boundary"
+    _, opening, remainder = readme.partition(activation_marker)
+    assert opening
+    activation_section, closing, _ = remainder.partition("## F5 quarantine")
+    assert closing
+    activation_section = " ".join(activation_section.split())
+
+    for phrase in (
+        "new Guardian deployments only",
+        "guardian_activation",
+        "devpi_uuid",
+        "first activation marker",
+        "existing_artifacts",
+        "any existing private or root-pypi Artifact candidate",
+        "DB loss",
+        "restored devpi",
+        "no online/public network inventory",
+        "Migration/backfill is deferred and not supported in PR1",
+        "no compatibility bypass",
+        "Operational preflight",
+        "backup",
+        "rollback",
+        "fail-closed",
+    ):
+        assert phrase in activation_section
+
+
+def test_readme_documents_f5_quarantine_contract() -> None:
+    repo_root = Path(__file__).parents[1]
+    readme_path = repo_root.joinpath("README.md")
+    readme = readme_path.read_text(encoding="utf-8")
+    _, opening, remainder = readme.partition("## F5 quarantine")
+    assert opening
+    error_mapping_marker = "## Error mapping for API callers"
+    quarantine_section, closing, _ = remainder.partition(error_mapping_marker)
+    assert closing
+    quarantine_section = " ".join(quarantine_section.split())
+
+    for phrase in (
+        "GUARDIAN_QUARANTINE_DIR",
+        "".join(
+            (
+                "absolute dedicated permission-restricted path outside ",
+                "public devpi ",
+                "storage/routes",
+            )
+        ),
+        "objects/sha256/<first-2>/<next-2>/<sha256>",
+        "Unapproved bytes never in SQLite/public +f/+e",
+        "same filesystem",
+        "Publish-before-discover ordering",
+        "atomic no-overwrite publish",
+        "duplicate digest byte identity",
+        "no-symlink/no traversal",
+        "same-open-file digest verification",
+        "only then parses",
+        "Mismatch/missing/I/O/symlink failures are fail-closed",
+        "F5 alone reads unapproved path",
+        "F6 still uses HTTP(S) canonical +f/+e after ALLOW",
+        "no worker/public route bypass token",
+        "cleanup/retention contract",
+    ):
+        assert phrase in quarantine_section
