@@ -22,6 +22,7 @@ open. Only `http` and `https` are accepted here for that reason.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 import shutil
 import tempfile
@@ -39,7 +40,9 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _HASH_PREFIX_PATTERN = re.compile(r"[0-9a-f]{3}", re.ASCII)
 _HASH_SUFFIX_PATTERN = re.compile(r"[0-9a-f]{13}", re.ASCII)
-_SAFE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*", re.ASCII)
+_DEVPI_NAME_PATTERN = re.compile(r"[A-Za-z0-9._@-]+", re.ASCII)
+_ARTIFACT_NAME_PATTERN = re.compile(r"[A-Za-z0-9._+@~-]+", re.ASCII)
+_NUMERIC_HOST_PATTERN = re.compile(r"[0-9.]+", re.ASCII)
 
 
 class ArtifactDownloadError(Exception):
@@ -249,7 +252,7 @@ def _canonical_devpi_base(value: str) -> tuple[str, str, int, str]:
 
     if type(value) is not str:
         raise ValueError("trusted_devpi_url must be a URL string")
-    if _has_control(value):
+    if _has_control(value) or "?" in value or "#" in value:
         raise ValueError("trusted_devpi_url contains control characters")
     try:
         parsed = urlsplit(value)
@@ -267,9 +270,10 @@ def _canonical_devpi_base(value: str) -> tuple[str, str, int, str]:
     if parsed.query or parsed.fragment:
         raise ValueError("trusted_devpi_url must not contain query or fragment")
     base_path = _validated_base_path(parsed.path)
-    host = hostname.lower()
-    if host.endswith("."):
-        raise ValueError("trusted_devpi_url host has ambiguous trailing dot")
+    try:
+        host = _canonical_host(hostname)
+    except ValueError as exc:
+        raise ValueError(f"invalid trusted_devpi_url host: {hostname!r}") from exc
     effective_port = port if port is not None else _default_port(scheme)
     return scheme, host, effective_port, base_path
 
@@ -279,6 +283,10 @@ def _default_port(scheme: str) -> int:
 
 
 def _validate_artifact_url(url: str, digest: str, trusted_base: tuple[str, str, int, str]) -> str:
+    if type(url) is not str:
+        raise ArtifactDownloadError("origin_url must be a URL string")
+    if _has_control(url) or "?" in url or "#" in url:
+        raise ArtifactDownloadError("origin_url contains raw control or delimiter")
     try:
         parsed = urlsplit(url)
         scheme = parsed.scheme.lower()
@@ -295,9 +303,10 @@ def _validate_artifact_url(url: str, digest: str, trusted_base: tuple[str, str, 
     if parsed.query or parsed.fragment:
         raise ArtifactDownloadError("origin_url에 query 또는 fragment가 포함됨")
     trusted_scheme, trusted_host, trusted_port, base_path = trusted_base
-    stored_host = hostname.lower()
-    if stored_host.endswith("."):
-        raise ArtifactDownloadError(f"origin_url 호스트의 trailing dot이 모호함: {url}")
+    try:
+        stored_host = _canonical_host(hostname)
+    except ValueError as exc:
+        raise ArtifactDownloadError(f"origin_url 호스트가 유효하지 않음: {url}") from exc
     stored_port = port if port is not None else _default_port(scheme)
     if (scheme, stored_host, stored_port) != (trusted_scheme, trusted_host, trusted_port):
         raise ArtifactDownloadError(f"origin_url이 trusted devpi URL과 다름: {url}")
@@ -322,7 +331,7 @@ def _validate_artifact_url(url: str, digest: str, trusted_base: tuple[str, str, 
     parts = relative_path.split("/")
     if not parts or any(not part or part in {".", ".."} for part in parts):
         raise ArtifactDownloadError(f"artifact 경로가 완전하지 않음: {url}")
-    if len(parts) < 3 or not all(_is_safe_component(part) for part in parts[:2]):
+    if len(parts) < 3 or not all(_is_devpi_name(part) for part in parts[:2]):
         raise ArtifactDownloadError(f"devpi stage 경로가 유효하지 않음: {url}")
     marker = parts[2]
     if marker == "+f":
@@ -333,11 +342,11 @@ def _validate_artifact_url(url: str, digest: str, trusted_base: tuple[str, str, 
             _HASH_PREFIX_PATTERN.fullmatch(first) is None
             or _HASH_SUFFIX_PATTERN.fullmatch(second) is None
             or first + second != digest[:16]
-            or not _is_safe_component(filename)
+            or not _is_artifact_name(filename)
         ):
             raise ArtifactDownloadError(f"+f artifact route가 digest와 일치하지 않음: {url}")
     elif marker == "+e":
-        if len(parts) != 5 or not all(_is_safe_component(part) for part in parts[3:]):
+        if len(parts) != 5 or not all(_is_artifact_name(part) for part in parts[3:]):
             raise ArtifactDownloadError(f"+e artifact route가 완전하지 않음: {url}")
     else:
         raise ArtifactDownloadError(f"artifact route marker가 유효하지 않음: {url}")
@@ -353,13 +362,45 @@ def _validated_base_path(path: str) -> str:
     if "%" in path or "\\" in path or _has_control(path):
         raise ValueError("trusted_devpi_url base path is not safe")
     parts = path[1:].split("/")
-    if not parts or not all(_is_safe_component(part) for part in parts):
+    if not parts or not all(_is_devpi_name(part) for part in parts):
         raise ValueError("trusted_devpi_url base path is not safe")
     return "/" + "/".join(parts)
 
 
-def _is_safe_component(value: str) -> bool:
-    return value not in {".", ".."} and _SAFE_COMPONENT_PATTERN.fullmatch(value) is not None
+def _canonical_host(hostname: str) -> str:
+    if not hostname or not hostname.isascii() or hostname.endswith("."):
+        raise ValueError("host must be ASCII and have no trailing dot")
+    try:
+        return str(ipaddress.ip_address(hostname))
+    except ValueError:
+        pass
+    if _NUMERIC_HOST_PATTERN.fullmatch(hostname) is not None:
+        raise ValueError("numeric host is not a valid IP address")
+    if len(hostname) > 253:
+        raise ValueError("host is too long")
+    labels = hostname.lower().split(".")
+    if not labels or any(
+        not label
+        or len(label) > 63
+        or label[0] == "-"
+        or label[-1] == "-"
+        or re.fullmatch(r"[A-Za-z0-9-]+", label, re.ASCII) is None
+        for label in labels
+    ):
+        raise ValueError("host labels are invalid")
+    return ".".join(labels)
+
+
+def _is_devpi_name(value: str) -> bool:
+    return value not in {".", ".."} and _DEVPI_NAME_PATTERN.fullmatch(value) is not None
+
+
+def _is_artifact_name(value: str) -> bool:
+    return (
+        value not in {".", ".."}
+        and bool(value.lstrip("."))
+        and _ARTIFACT_NAME_PATTERN.fullmatch(value) is not None
+    )
 
 
 def _has_control(value: str) -> bool:

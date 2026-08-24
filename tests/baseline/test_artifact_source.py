@@ -242,6 +242,87 @@ def test_a_non_ascii_trusted_devpi_host_is_rejected():
         make_source(trusted_devpi_url="https://devpi%2eexample")
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "devpi_example",
+        "-devpi.example",
+        "devpi..example",
+        "999.999.999.999",
+        "devpi.example\\evil",
+    ],
+)
+def test_a_malformed_trusted_host_is_rejected(host):
+    with pytest.raises(ValueError):
+        make_source(trusted_devpi_url=f"https://{host}:443")
+
+
+@pytest.mark.parametrize(
+    "trusted_url",
+    ["https://devpi\t.example", "https://devpi.example/mount\n"],
+)
+def test_a_trusted_url_with_raw_control_is_rejected(trusted_url):
+    with pytest.raises(ValueError):
+        make_source(trusted_devpi_url=trusted_url)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "devpi_example",
+        "-devpi.example",
+        "devpi..example",
+        "999.999.999.999",
+        "devpi.example\\evil",
+    ],
+)
+def test_a_malformed_stored_host_is_rejected_before_request(host):
+    session = FakeSession()
+    url = file_url(DIGEST, "demo.whl").replace("https://devpi.example", f"https://{host}:443")
+    with (
+        make_source(session, resolver=DictResolver({DIGEST: url})) as source,
+        pytest.raises(ArtifactDownloadError),
+    ):
+        source.open(DIGEST)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        file_url(DIGEST, "demo.whl").replace("devpi.example", "devpi\t.example"),
+        file_url(DIGEST, "demo.whl").replace("/demo.whl", "/demo\n.whl"),
+        file_url(DIGEST, "demo.whl") + "?",
+        file_url(DIGEST, "demo.whl") + "#",
+    ],
+)
+def test_raw_url_delimiters_and_controls_are_rejected_before_request(url):
+    session = FakeSession()
+    with (
+        make_source(session, resolver=DictResolver({DIGEST: url})) as source,
+        pytest.raises(ArtifactDownloadError),
+    ):
+        source.open(DIGEST)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("stage", ["user@example/index", "_private/index", "-internal/index"])
+def test_devpi_stage_names_allow_valid_server_components(stage):
+    session = FakeSession()
+    url = file_url(DIGEST, "demo.whl").replace("/root/dev/", f"/{stage}/")
+    with make_source(session, resolver=DictResolver({DIGEST: url})) as source:
+        source.open(DIGEST)
+    assert session.calls
+
+
+def test_devpi_file_route_allows_plus_in_filename():
+    session = FakeSession()
+    url = file_url(DIGEST, "pkg+local.whl")
+    with make_source(session, resolver=DictResolver({DIGEST: url})) as source:
+        source.open(DIGEST)
+    assert session.calls[0][0].endswith("/pkg+local.whl")
+
+
 def test_the_request_uses_a_reconstructed_canonical_ascii_url():
     stored = file_url(DIGEST, "demo.whl").replace(
         "https://devpi.example", "HTTPS://DEVPI.EXAMPLE:443"
@@ -256,6 +337,18 @@ def test_the_request_uses_a_reconstructed_canonical_ascii_url():
     assert session.calls[0][0] == file_url(DIGEST, "demo.whl").replace(
         "https://devpi.example", "https://devpi.example:443"
     )
+
+
+def test_ipv6_trusted_and_stored_hosts_are_canonicalized_with_brackets():
+    stored = file_url(DIGEST, "demo.whl").replace("https://devpi.example", "http://[::1]")
+    session = FakeSession()
+    with make_source(
+        session,
+        DictResolver({DIGEST: stored}),
+        trusted_devpi_url="http://[0:0:0:0:0:0:0:1]",
+    ) as source:
+        source.open(DIGEST)
+    assert session.calls[0][0] == stored.replace("http://[::1]", "http://[::1]:80")
 
 
 def test_a_configured_mount_path_is_required_and_preserved():
