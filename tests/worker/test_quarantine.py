@@ -36,6 +36,16 @@ def test_quarantine_streams_and_keeps_verified_artifact_by_digest(tmp_path: Path
     assert verified.size_bytes == len(payload)
     assert list((tmp_path / "incoming").iterdir()) == []
 
+    reused = store.get_verified(candidate(payload))
+
+    assert reused == verified
+
+
+def test_quarantine_returns_none_when_verified_file_is_absent(tmp_path: Path) -> None:
+    store = QuarantineStore(tmp_path, max_size_bytes=1024)
+
+    assert store.get_verified(candidate(b"missing")) is None
+
 
 def test_quarantine_rejects_hash_mismatch_and_removes_partial_file(tmp_path: Path) -> None:
     payload = b"actual"

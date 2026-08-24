@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from devpi_guardian.verdicts.models import ClaimedArtifact
 from devpi_guardian.worker.models import ArtifactCandidate
-from devpi_guardian.worker.preparer import HttpArtifactPreparer
+from devpi_guardian.worker.preparer import HttpArtifactPreparer, QuarantineArtifactPreparer
 from devpi_guardian.worker.quarantine import QuarantineStore
 
 
@@ -90,3 +90,29 @@ def test_preparer_downloads_target_and_one_same_release_counterpart(tmp_path) ->
     assert bundle.same_release_sdist is not None
     assert bundle.same_release_sdist.local_path.read_bytes() == sdist_payload
     assert all(response.closed for response in session.responses)
+
+
+def test_local_preparer_reuses_discovery_quarantine_files(tmp_path) -> None:
+    wheel_payload = b"wheel payload"
+    sdist_payload = b"sdist payload"
+    wheel = candidate("demo-1.0.0-py3-none-any.whl", wheel_payload)
+    sdist = candidate("demo-1.0.0.tar.gz", sdist_payload)
+    quarantine = QuarantineStore(tmp_path, max_size_bytes=1024)
+    expected_wheel = quarantine.persist(wheel, [wheel_payload])
+    expected_sdist = quarantine.persist(sdist, [sdist_payload])
+    preparer = QuarantineArtifactPreparer(
+        source=Source(wheel, (wheel, sdist)),
+        quarantine=quarantine,
+    )
+    claim = ClaimedArtifact(
+        sha256=wheel.sha256,
+        size_bytes=len(wheel_payload),
+        worker_id="worker-1",
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        lease_token="f" * 64,
+    )
+
+    bundle = preparer.prepare(claim)
+
+    assert bundle.target == expected_wheel
+    assert bundle.same_release_sdist == expected_sdist

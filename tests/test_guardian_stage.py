@@ -6,6 +6,8 @@ from devpi_guardian.verdicts.models import ArtifactState
 from devpi_guardian.verdicts.models import Decision
 from devpi_guardian.verdicts.models import DecisionSource
 from devpi_guardian.verdicts.models import EnforcementDecision
+from devpi_guardian.worker.discovery import DiscoveryUnavailable
+from devpi_guardian.worker.discovery import set_discovery_sink
 from devpi_server.config import get_pluginmanager
 from devpi_server.model import get_stage_customizer_class
 from devpi_server.model import SimplelinkMeta
@@ -28,6 +30,20 @@ class RecordingReader:
         if self.error is not None:
             raise self.error
         return self.decisions
+
+
+class RecordingSink:
+    def __init__(self, error=None):
+        self.batches = []
+        self.error = error
+
+    def discover(self, candidate):
+        self.discover_many((candidate,))
+
+    def discover_many(self, candidates):
+        self.batches.append(tuple(candidates))
+        if self.error is not None:
+            raise self.error
 
 
 class SinglePassLinks:
@@ -53,13 +69,16 @@ class UnusableProject:
         raise AssertionError("project must not participate in F2 policy")
 
 
-def make_stage(reader=None, *, initialized=True):
+def make_stage(reader=None, *, initialized=True, sink=None):
     plugin_manager = get_pluginmanager()
     xom = SimpleNamespace(config=SimpleNamespace(hook=plugin_manager.hook))
     if initialized:
         setattr(xom, _READER_ATTRIBUTE, reader)
+    if sink is None:
+        sink = RecordingSink()
+    set_discovery_sink(xom, sink)
     customizer_class = get_stage_customizer_class(xom, "guardian")
-    return customizer_class(SimpleNamespace(xom=xom))
+    return customizer_class(SimpleNamespace(xom=xom, name="company/guardian"))
 
 
 def make_link(name, fragment=""):
@@ -169,11 +188,8 @@ def test_filter_is_single_pass_batched_ordered_and_fail_closed() -> None:
     )
     source = SinglePassLinks(links)
 
-    decisions = run_filter(
-        make_stage(reader),
-        UnusableProject(),
-        source,
-    )
+    sink = RecordingSink()
+    decisions = run_filter(make_stage(reader, sink=sink), "demo", source)
 
     assert decisions == [
         True,
@@ -203,6 +219,12 @@ def test_filter_is_single_pass_batched_ordered_and_fail_closed() -> None:
     assert len(reader.calls) == 1
     assert len(reader.calls[0]) == 8
     assert set(reader.calls[0]) == set(digests.values())
+    [(discovered,)] = sink.batches
+    assert discovered.stage == "company/guardian"
+    assert discovered.project == "demo"
+    assert discovered.filename == "missing-state.whl"
+    assert discovered.sha256 == digests["d"]
+    assert discovered.link_href == links[4].href
 
 
 def test_filter_skips_reader_when_no_link_has_a_valid_sha256() -> None:
@@ -232,6 +254,29 @@ def test_store_unavailable_aborts_with_retryable_503(failure_source) -> None:
 
     with pytest.raises(HTTPServiceUnavailable) as caught:
         run_filter(stage, "demo", [link])
+
+    assert caught.value.status_code == 503
+    assert caught.value.headers["Retry-After"] == "5"
+
+
+def test_discovery_failure_aborts_with_retryable_503() -> None:
+    digest = "a" * 64
+    link = make_link("demo-1.0.0.whl", f"#sha256={digest}")
+    reader = RecordingReader(
+        {
+            digest: make_decision(
+                digest,
+                allowed=False,
+                decision=Decision.DENY,
+                source=DecisionSource.MISSING,
+                state=ArtifactState.MISSING,
+            )
+        }
+    )
+    sink = RecordingSink(DiscoveryUnavailable("queue unavailable"))
+
+    with pytest.raises(HTTPServiceUnavailable) as caught:
+        run_filter(make_stage(reader, sink=sink), "demo", [link])
 
     assert caught.value.status_code == 503
     assert caught.value.headers["Retry-After"] == "5"

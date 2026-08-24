@@ -10,8 +10,12 @@ from .verdicts.db import migrate
 from .verdicts.errors import InvalidSha256
 from .verdicts.errors import StoreUnavailable
 from .verdicts.models import validate_sha256
+from .verdicts.models import DecisionSource
 from .verdicts.reader import SQLiteVerdictReader
+from .worker.discovery import DiscoveryCandidate
+from .worker.discovery import DiscoveryUnavailable
 from .worker.discovery import FileDiscoverySink
+from .worker.discovery import get_discovery_sink
 from .worker.discovery import set_discovery_sink
 from pathlib import Path
 from pluggy import HookimplMarker
@@ -28,9 +32,11 @@ class GuardianStage:
         if not newconfig.get("bases"):
             raise self.InvalidIndexconfig("guardian index requires a base")
 
-    def get_simple_links_filter_iter(self, _project, links):
+    def get_simple_links_filter_iter(self, project, links):
+        link_snapshot = []
         link_sha256s = []
         for link in links:
+            link_snapshot.append(link)
             try:
                 sha256 = validate_sha256(link.hashes.get("sha256"))
             except InvalidSha256:
@@ -47,6 +53,27 @@ class GuardianStage:
         except StoreUnavailable as exc:
             unavailable = HTTPServiceUnavailable(headers={"Retry-After": "5"})
             raise unavailable from exc
+
+        missing = []
+        for link, sha256 in zip(link_snapshot, link_sha256s, strict=True):
+            decision = decisions.get(sha256) if sha256 is not None else None
+            if getattr(decision, "source", None) is not DecisionSource.MISSING:
+                continue
+            missing.append(
+                DiscoveryCandidate(
+                    stage=str(self.stage.name),
+                    project=str(project),
+                    filename=str(link.basename),
+                    sha256=sha256,
+                    link_href=str(link.href),
+                )
+            )
+        if missing:
+            try:
+                get_discovery_sink(self.stage.xom).discover_many(missing)
+            except DiscoveryUnavailable as exc:
+                unavailable = HTTPServiceUnavailable(headers={"Retry-After": "5"})
+                raise unavailable from exc
 
         return (
             getattr(decisions.get(sha256), "allowed", False) is True

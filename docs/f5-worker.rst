@@ -11,10 +11,15 @@ Flow
 
 The worker processes one SHA-256 identity through the following flow::
 
-   candidate received
+   F1/F2 observes a DecisionSource.MISSING Simple link
+     -> metadata batch registered in discovery/discovery.db
+     -> discovery job atomically claimed with a lease
+     -> bytes read from devpi filestore or its configured mirror upstream
      -> bytes downloaded into quarantine/incoming
      -> advertised and actual SHA-256 compared
      -> verified file moved to quarantine/sha256/<prefix>/<digest>.<format>
+     -> F4 stores Artifact + release mapping as DISCOVERED
+     -> discovery job acknowledged
      -> DISCOVERED artifact claimed from F4
      -> AnalysisEngine.analyze(bundle) called once
      -> PolicyEngine.evaluate(target, report) called once
@@ -55,9 +60,11 @@ F9 receives both the sdist and wheel path for one project and version.
 The F4 claim contains only SHA-256, size, and lease data.  F5 resolves the
 remaining fields through the shared reader's ``get_artifact_releases`` and
 ``list_release_artifacts`` methods.  ``VerdictReaderCandidateSource`` adapts
-those records into ``ArtifactCandidate`` values, and
-``HttpArtifactPreparer`` downloads and verifies the target plus one matching
-sdist/wheel counterpart.  F5 never reads Guardian SQLite tables directly.
+those records into ``ArtifactCandidate`` values.
+``QuarantineArtifactPreparer`` reopens the content-addressed files already
+verified during discovery, including an available same-release sdist/wheel
+counterpart.  It does not request the protected ``/+f/`` route.  F5 never
+reads Guardian SQLite tables directly.
 
 The metadata contract supplied for each file is:
 
@@ -73,33 +80,49 @@ as ``HttpArtifactBytesSource``'s origin resolver.  This is enforced by the
 Discovery boundary
 ------------------
 
-F1/F2 currently hide unknown links without registering them.  F5 provides
-``DiscoveryCandidate``, ``FileDiscoverySink``, and ``get_discovery_sink(xom)``
-for the request-driven handoff.  The sink writes immutable JSON metadata jobs
-under ``<guardian-db-parent>/discovery/pending`` and performs no download or
-analysis in the devpi request thread.  Distinct release mappings sharing one
-SHA-256 remain separate jobs, while an identical notification is idempotent.
+F1/F2 hide unknown links and batch-register only decisions whose source is
+exactly ``DecisionSource.MISSING``.  F5 provides ``DiscoveryCandidate``,
+``FileDiscoverySink``, and ``get_discovery_sink(xom)`` for this request-driven
+handoff.  The historical sink name remains stable, while its implementation is
+a separate SQLite queue at
+``<guardian-db-parent>/discovery/discovery.db``.  The request thread stores
+metadata only; it performs no network access or analysis.  Capacity is bounded
+and a queue failure returns retryable HTTP 503.
 
-The discovery message intentionally omits size and version.  The F5 discovery
-consumer will resolve the relative link, parse the filename, download into
-content-addressed quarantine storage, and verify both SHA-256 and size before
-calling F4's existing ``discover_artifact`` method.  F4's immutable size
-contract therefore does not need to change.  F1/F2 still needs to call the
-registered sink for ``DecisionSource.MISSING`` results.  A poller may replay
-configured base Simple pages to recover missed notifications.
+The queue owns ``PENDING``, ``PROCESSING``, ``COMPLETED``, and ``FAILED``
+states.  Claiming is atomic, processing has a lease, expired claims return to
+``PENDING``, and retry attempts are persisted.  A completed or terminally
+failed identity is not recreated by a repeated Simple request.  F4
+``TransitionConflict`` and byte identity failures are terminal; transient
+source and store failures use the bounded retry path.
 
-Claim-time metadata lookup and same-release pairing are implemented.  Unknown
-links remain hidden while the F1/F2 call site is being connected.
+The discovery message intentionally omits size and version.  ``stage`` is the
+Guardian stage that observed the link.  ``SimpleLinkResolver`` validates the
+link against the configured devpi origin, derives the F4 source stage from the
+``/{user}/{index}/+f/`` path, and parses the version from ``link.basename``.
+The consumer verifies actual SHA-256 and size before calling F4's existing
+``discover_artifact`` method.  F4's immutable size contract therefore does not
+change.
+
+``DevpiArtifactBytesSource`` avoids an F3 deadlock.  Cached bytes come from the
+internal devpi filestore; a mirror cache miss uses the source stage's configured
+HTTP client and devpi's stored upstream URL.  There is no worker bypass token or
+public ``/+f/`` exception.  The canonical original devpi link is stored in F4,
+not a redirect-time CDN URL.
+
+The consumer acknowledges its queue job only after quarantine publication and
+F4 registration both succeed.  If F4 is temporarily unavailable, the verified
+quarantine file is reused on retry instead of being downloaded again.
 
 Lease and retry boundary
 ------------------------
 
-``QuarantineWorker`` uses the existing atomic ``claim_next`` and
-``recover_expired_claims`` calls.  The current F4 interface has no lease
-renewal or retry schedule.  Production wiring needs a ``renew_claim`` method
-for downloads and multiple isolated analyses that may approach the lease
-deadline.  Retry count and next-attempt time also belong in F4's durable
-state rather than process memory.
+The discovery queue implements atomic claim, lease expiry recovery, persistent
+attempt counts, delayed retry, and terminal failure.  ``QuarantineWorker``
+uses F4's separate atomic ``claim_next`` and ``recover_expired_claims`` calls
+for analysis.  The current F4 interface still has no lease renewal method;
+long-running analysis needs that extension if it can approach the configured
+claim deadline.
 
 F8 and F9 already expose isolated entry points with timeout and memory limits.
 The current F6/F7 public entry point is synchronous and has no equivalent
@@ -143,15 +166,33 @@ combined report, including baseline presence, analyzer coverage, findings,
 origins, and baseline tier, and returns F4's ``VerdictInput``.  This keeps
 temporary scoring rules out of F5 while F10 is being integrated.
 
+Runtime composition
+-------------------
+
+``build_worker_thread`` is the production composition point.  It accepts the
+real F4 store, shared F4 reader, F10 policy engine, baseline HTTP session, and
+paths, then builds one devpi-ThreadPool-compatible runner.  The coordinator
+drains discovery work before claiming analysis work so same-release wheel and
+sdist files have the best chance to be available together for F9.
+
+The function deliberately requires an already composed F4 store.  F4 requires
+the real F12 ``AuditWriter`` for transactional state and audit changes, so F5
+does not install a no-op audit implementation.  Plugin startup can register the
+returned thread after the F10 implementation and F12 writer factories are
+available.
+
 Current verification
 --------------------
 
-Focused tests cover one-call orchestration, finding attribution, fail-closed
-error recording, expired-claim recovery, streaming SHA-256 verification,
-size verification, partial-file cleanup, F4 metadata adaptation, same-release
-pair download, and cooldown enforcement::
+Focused tests cover batched discovery, atomic claims, ACK, retry, recovery,
+queue limits, safe link resolution, internal devpi byte access, streaming
+SHA-256 verification, quarantine reuse, F4 registration ordering, terminal
+conflicts, one-call analysis orchestration, same-release pairing, and cooldown
+enforcement::
 
    uv run pytest tests/worker -q
    uv run ruff format --check src/devpi_guardian/worker tests/worker
    uv run ruff check src/devpi_guardian/worker tests/worker
    uv run flake8 src/devpi_guardian/worker tests/worker
+
+The 2026-08-24 integration run completed with 1,358 passing tests.
