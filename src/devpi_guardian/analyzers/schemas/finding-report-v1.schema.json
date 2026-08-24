@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpi-guardian:schema:finding-report:1.1",
+  "title": "devpi-guardian analyzer finding report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ruleset_version",
+    "analyzer",
+    "artifact_sha256",
+    "finding_count",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.1" },
+    "ruleset_version": { "type": "string", "minLength": 1 },
+    "analyzer": { "enum": ["F8", "F9"] },
+    "artifact_sha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "finding_count": { "type": "integer", "minimum": 0 },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "fingerprint",
+        "action",
+        "file",
+        "line",
+        "snippet",
+        "message",
+        "source",
+        "sink"
+      ],
+      "properties": {
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "rule": { "type": "string", "minLength": 1 },
+        "action": { "enum": ["REVIEW", "DENY"] },
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "snippet": { "type": "string", "maxLength": 200 },
+        "message": { "type": "string" },
+        "source": { "type": ["string", "null"] },
+        "sink": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

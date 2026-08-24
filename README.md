@@ -31,6 +31,15 @@ The [approved F3/F4 design][approved-design] is in the repository.
 - A narrower official `pytest-devpi-server` fixture smoke test exercises the installed
   plugin.
 
+## F8/F9 artifact analyzers
+
+The repository also includes deterministic, non-executing F8/F9 analyzers under
+`src/devpi_guardian/analyzers/`. F8 scans installation surfaces and F9 compares matching
+sdist/wheel releases for wheel-only risk signals. Their findings are advisory inputs for
+the policy/evidence layers; they do not change enforcement or verdict behavior. See the
+[F8/F9 handoff](docs/analyzers/f8-f9-handoff.md) for the public API, JSON schema, and demo
+commands.
+
 ## Repository structure
 
 The repository keeps enforcement, verdict storage, integration coverage, and delivery
@@ -42,15 +51,19 @@ metadata in this layout:
 │   └── devpi_guardian/
 │       ├── enforcement/       # Resolve identities, enforce, and record metrics.
 │       ├── verdicts/           # SQLite schema, reader, models, and store.
+│       ├── analyzers/          # Deterministic F8/F9 artifact analysis and schemas.
 │       └── plugin.py           # Register the devpi-server plugin and wire startup.
 ├── tests/
 │   ├── enforcement/           # Direct-download enforcement and metrics tests.
 │   ├── verdicts/               # Persistence, reader, claim, and transition tests.
+│   ├── analyzers/              # F8/F9 analyzer, contract, and integration tests.
 │   └── integration/            # Real devpi-server and resolver integration tests.
 ├── docs/
+│   ├── analyzers/               # F8/F9 public API and integration handoff.
 │   └── superpowers/
 │       ├── specs/              # Approved designs and supporting specifications.
 │       └── plans/              # Implementation plans.
+├── tools/                      # Offline F8/F9 corpus and demo utilities.
 ├── news/                       # Release-note fragments.
 ├── pyproject.toml              # Packaging, dependencies, and tool configuration.
 └── uv.lock                     # Locked development and runtime dependencies.
