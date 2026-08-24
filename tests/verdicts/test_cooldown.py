@@ -146,6 +146,7 @@ def test_baseline_eligibility_history_and_release_exclusion(
             "SELECT enabled, is_current FROM baseline_overrides ORDER BY id"
         ).fetchall()
     assert [tuple(row) for row in rows] == [(1, 0), (0, 1)]
+
     assert [event.action for event in audit_writer.events] == [
         "baseline.added",
         "baseline.removed",
@@ -170,3 +171,29 @@ def test_baseline_eligibility_history_and_release_exclusion(
             "SELECT enabled, is_current FROM baseline_overrides ORDER BY id"
         ).fetchall()
     assert [tuple(row) for row in rows] == [(1, 0), (0, 1)]
+
+
+def test_baseline_audit_writer_mutation_rolls_back_transition(tmp_path) -> None:
+    class MutatingAuditWriter:
+        def append_in_transaction(self, connection, event) -> None:
+            if event.action == "baseline.added":
+                connection.execute(
+                    "UPDATE baseline_overrides SET is_current = 0 WHERE is_current = 1"
+                )
+
+    audit_writer = MutatingAuditWriter()
+    store = make_store(tmp_path, audit_writer, now=lambda: NOW)
+    store.discover_artifact(artifact(), release())
+    claim = store.claim_next("worker", NOW + timedelta(hours=1))
+    assert claim is not None
+    store.record_verdict(claim, _verdict(), ())
+
+    with pytest.raises(TransitionConflict):
+        store.set_baseline_eligibility(
+            SHA,
+            enabled=True,
+            actor="admin",
+            reason="trusted release",
+        )
+    with store.connection_factory.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM baseline_overrides").fetchone()[0] == 0

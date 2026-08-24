@@ -13,6 +13,13 @@ CREATE UNIQUE INDEX baseline_overrides_one_current_idx
 CREATE INDEX baseline_overrides_sha256_idx
     ON baseline_overrides(sha256, created_at);
 
+CREATE TRIGGER baseline_overrides_history_insert_guard
+BEFORE INSERT ON baseline_overrides
+WHEN EXISTS(SELECT 1 FROM baseline_overrides WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable baseline override history');
+END;
+
 CREATE TRIGGER baseline_overrides_history_update_guard
 BEFORE UPDATE ON baseline_overrides
 WHEN NOT (

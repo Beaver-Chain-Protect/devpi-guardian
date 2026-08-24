@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
@@ -25,6 +24,7 @@ from .models import (
     EvidenceRecord,
     QuarantinePage,
     ReleaseArtifact,
+    parse_persisted_evidence,
     require_utc,
     validate_sha256,
 )
@@ -69,7 +69,7 @@ class SQLiteVerdictReader:
                     requested,
                     as_of,
                 )
-        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        except (sqlite3.Error, TypeError, ValueError, OverflowError, UnicodeError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
 
         return results
@@ -89,8 +89,8 @@ class SQLiteVerdictReader:
             raise ValueError("invalid quarantine states")
         if type(limit) is not int or not 1 <= limit <= 200:
             raise ValueError("limit must be between 1 and 200")
-        if type(offset) is not int or offset < 0:
-            raise ValueError("offset must be non-negative")
+        if type(offset) is not int or not 0 <= offset <= 2**63 - 1:
+            raise ValueError("offset must be between 0 and 2**63 - 1")
         values = tuple(dict.fromkeys(state.value for state in states))
         placeholders = ", ".join("?" for _ in values)
         as_of = require_utc(self._now(), "now")
@@ -116,7 +116,7 @@ class SQLiteVerdictReader:
                 requested = [row["sha256"] for row in rows]
                 self._read_effective_decisions(connection, requested, as_of)
                 items = tuple(self._admin_summary(row) for row in rows)
-        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        except (sqlite3.Error, TypeError, ValueError, OverflowError, UnicodeError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
         return QuarantinePage(items=items, total=total, limit=limit, offset=offset)
 
@@ -170,7 +170,7 @@ class SQLiteVerdictReader:
                 )
         except ArtifactNotFound:
             raise
-        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        except (sqlite3.Error, TypeError, ValueError, OverflowError, UnicodeError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
 
     def health(self) -> dict[str, object]:
@@ -238,17 +238,10 @@ class SQLiteVerdictReader:
             """,
             (verdict_id,),
         ).fetchall()
-        return tuple(
-            EvidenceRecord(
-                rule_id=row["rule_id"],
-                action=Decision(row["action"]),
-                file_path=row["file_path"],
-                line=row["line"],
-                message=row["message"],
-                details=json.loads(row["details_json"]),
-            )
-            for row in rows
-        )
+        try:
+            return tuple(parse_persisted_evidence(row) for row in rows)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError("invalid persisted evidence row") from exc
 
     def _read_effective_decisions(
         self,

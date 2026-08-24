@@ -349,6 +349,15 @@ def test_list_quarantine_fails_closed_for_corrupt_state(tmp_path, corruption) ->
         reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=10, offset=0)
 
 
+@pytest.mark.parametrize("offset", [-1, 2**63])
+def test_list_quarantine_rejects_offset_out_of_range(tmp_path, offset) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(ValueError, match="offset"):
+        reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=10, offset=offset)
+
+
 def test_quarantine_pagination_order_and_artifact_details_include_evidence(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
@@ -385,6 +394,69 @@ def test_quarantine_pagination_order_and_artifact_details_include_evidence(tmp_p
     assert details.summary.state is ArtifactState.REVIEW
     assert details.evidence[0].rule_id == "rule-1"
     assert details.evidence[0].message == "review"
+    with pytest.raises(TypeError):
+        details.evidence[0].details["mutated"] = True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "blank-rule",
+        "blank-message",
+        "invalid-line",
+        "non-object",
+        "oversized",
+        "noncanonical",
+        "malformed-nested",
+    ],
+)
+def test_artifact_details_rejects_semantically_invalid_evidence(tmp_path, corruption) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    sha256 = "9" * 64
+    seed_artifact(
+        factory,
+        sha256,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+    )
+    details_json = "{}"
+    rule_id = "rule-1"
+    message = "message"
+    line = 1
+    if corruption == "blank-rule":
+        rule_id = ""
+    elif corruption == "blank-message":
+        message = ""
+    elif corruption == "invalid-line":
+        line = 0
+    elif corruption == "non-object":
+        details_json = "[]"
+    elif corruption == "oversized":
+        details_json = '{"value":"' + ("x" * (1024 * 1024)) + '"}'
+    elif corruption == "noncanonical":
+        details_json = '{ "value": 1 }'
+    elif corruption == "malformed-nested":
+        details_json = '{"nested":{"value":1,"value":2}}'
+    with closing(factory.connect()) as connection, connection:
+        if corruption == "invalid-line":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+        verdict_id = connection.execute(
+            "SELECT id FROM verdicts WHERE sha256 = ?",
+            (sha256,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO evidence(
+                verdict_id, rule_id, action, file_path, line, message, details_json
+            ) VALUES (?, ?, 'REVIEW', 'pkg/mod.py', ?, ?, ?)
+            """,
+            (verdict_id, rule_id, line, message, details_json),
+        )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(StoreUnavailable):
+        reader.get_artifact_details(sha256)
 
 
 def test_list_allowed_releases_returns_all_mappings_in_deterministic_order(

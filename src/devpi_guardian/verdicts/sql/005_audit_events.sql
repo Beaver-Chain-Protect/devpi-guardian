@@ -45,6 +45,14 @@ CREATE INDEX audit_events_action_occurred_at_idx
 CREATE UNIQUE INDEX audit_events_event_hash_unique_idx
     ON audit_events(event_hash);
 
+CREATE TRIGGER audit_events_history_insert_guard
+BEFORE INSERT ON audit_events
+WHEN EXISTS(SELECT 1 FROM audit_events WHERE id = NEW.id)
+  OR EXISTS(SELECT 1 FROM audit_events WHERE event_hash = NEW.event_hash)
+BEGIN
+    SELECT RAISE(ABORT, 'immutable audit event history');
+END;
+
 CREATE TRIGGER audit_events_chain_insert_guard
 BEFORE INSERT ON audit_events
 WHEN NEW.id IS NOT COALESCE(

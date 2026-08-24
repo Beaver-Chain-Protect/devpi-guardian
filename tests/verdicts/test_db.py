@@ -126,6 +126,8 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "audit_events_delete_guard",
         "baseline_overrides_history_update_guard",
         "baseline_overrides_history_delete_guard",
+        "baseline_overrides_history_insert_guard",
+        "audit_events_history_insert_guard",
     }
     assert expected_tables <= tables
     assert triggers == expected_triggers
@@ -153,6 +155,59 @@ def test_guardian_activation_row_is_immutable(tmp_path) -> None:
             )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM guardian_activation")
+
+
+def test_replace_cannot_bypass_baseline_or_audit_history_guards(tmp_path) -> None:
+    path = tmp_path / "guardian.db"
+    factory = ConnectionFactory(path)
+    migrate(factory)
+    sha256 = "a" * 64
+    timestamp = "2026-08-24T00:00:00+00:00"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO artifacts(sha256, size_bytes, state, discovered_at, updated_at) "
+            "VALUES (?, 1, 'ALLOW', ?, ?)",
+            (sha256, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO baseline_overrides "
+            "(id, sha256, enabled, actor, reason, created_at, is_current) "
+            "VALUES (1, ?, 1, 'admin', 'original', ?, 1)",
+            (sha256, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO audit_events "
+            "(id, event_version, canonicalization_version, occurred_at, actor, action, "
+            "sha256, previous_decision, new_decision, reason, policy_version, "
+            "analyzer_version, previous_hash, event_hash) "
+            "VALUES (1, 1, 1, ?, 'admin', 'seed', ?, 'DENY', 'ALLOW', 'original', "
+            "NULL, NULL, ?, ?)",
+            (timestamp, sha256, "0" * 64, "f" * 64),
+        )
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT OR REPLACE INTO baseline_overrides "
+                "(id, sha256, enabled, actor, reason, created_at, is_current) "
+                "VALUES (1, ?, 0, 'attacker', 'replaced', ?, 1)",
+                (sha256, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT OR REPLACE INTO audit_events "
+                "(id, event_version, canonicalization_version, occurred_at, actor, action, "
+                "sha256, previous_decision, new_decision, reason, policy_version, "
+                "analyzer_version, previous_hash, event_hash) "
+                "VALUES (1, 1, 1, ?, 'attacker', 'replace', ?, 'DENY', 'ALLOW', "
+                "'replaced', NULL, NULL, ?, ?)",
+                (timestamp, sha256, "0" * 64, "f" * 64),
+            )
+        baseline = connection.execute(
+            "SELECT actor, reason FROM baseline_overrides WHERE id = 1"
+        ).fetchone()
+        audit = connection.execute("SELECT actor, reason FROM audit_events WHERE id = 1").fetchone()
+    assert tuple(baseline) == ("admin", "original")
+    assert tuple(audit) == ("admin", "original")
 
 
 def test_migrate_applied_v3_preserves_guardian_activation_row(tmp_path) -> None:

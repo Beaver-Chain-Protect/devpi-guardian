@@ -422,6 +422,17 @@ class SQLiteArtifactStore:
             if inserted.rowcount != 1:
                 raise TransitionConflict("baseline override insert failed")
 
+            expected_baseline_history = self._baseline_history(connection, canonical)
+            expected_override = None if _override is None else tuple(_override)
+            expected_administrator = {
+                "sha256": canonical,
+                "operation_at": operation_at,
+                "expected_artifact": tuple(_artifact),
+                "expected_counts": self._history_counts(connection, canonical),
+                "expected_verdict_id": context.current_verdict_id,
+                "expected_override": expected_override,
+            }
+
             self._audit(
                 connection,
                 actor=actor,
@@ -433,6 +444,12 @@ class SQLiteArtifactStore:
                 policy_version=context.policy_version,
                 analyzer_version=context.analyzer_version,
                 occurred_at=operation_at,
+            )
+            self._verify_administrator_result(connection, **expected_administrator)
+            self._verify_baseline_history(
+                connection,
+                canonical,
+                expected_baseline_history,
             )
 
     def discover_artifact(
@@ -1143,6 +1160,30 @@ class SQLiteArtifactStore:
         if row is None or any(type(value) is not int for value in row):
             raise TransitionConflict("history count failed")
         return tuple(row)
+
+    @staticmethod
+    def _baseline_history(
+        connection: sqlite3.Connection,
+        sha256: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        rows = connection.execute(
+            """
+            SELECT id, sha256, enabled, actor, reason, created_at, is_current
+            FROM baseline_overrides
+            WHERE sha256 = ? ORDER BY id
+            """,
+            (sha256,),
+        ).fetchall()
+        return tuple(tuple(row) for row in rows)
+
+    def _verify_baseline_history(
+        self,
+        connection: sqlite3.Connection,
+        sha256: str,
+        expected: tuple[tuple[object, ...], ...],
+    ) -> None:
+        if self._baseline_history(connection, sha256) != expected:
+            raise TransitionConflict("baseline override history changed")
 
     def _verify_administrator_result(
         self,
