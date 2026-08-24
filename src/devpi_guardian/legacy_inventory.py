@@ -1,12 +1,9 @@
 """Read-only inventory of Artifact-like data already persisted by devpi.
 
-This module deliberately speaks only to the small KeyFS snapshot interface needed
-for activation.  In particular, it does not resolve entries through the devpi
-model or attempt to read bytes from a file store.
+This module deliberately speaks only to the small KeyFS snapshot interface
+needed for activation.  In particular, it does not resolve entries through
+the devpi model or attempt to read bytes from a file store.
 """
-
-# flake8: noqa: E501
-# ruff: noqa: RUF100
 
 from __future__ import annotations
 
@@ -36,7 +33,8 @@ class _MalformedInventory(Exception):
 
 
 def _candidate(candidate: ExistingArtifactCandidate) -> str:
-    # StrEnum.value is the public boundary: callers must never receive the enum.
+    # StrEnum.value is the public boundary: callers must never receive the
+    # enum.
     return candidate.value
 
 
@@ -57,7 +55,15 @@ def _safe_relpath(value: object) -> bool:
 
 
 def _safe_scalar(value: object) -> bool:
-    return type(value) is str and bool(value)
+    invalid_type = type(value) is not str
+    invalid_shape = not value or len(value) > 4096 or "\x00" in value
+    if invalid_type or invalid_shape:
+        return False
+    try:
+        value.encode("utf-8")
+    except Exception:
+        return False
+    return True
 
 
 def _as_mapping(value: object) -> Mapping[Any, Any]:
@@ -76,8 +82,10 @@ def _mapping_value(mapping: Mapping[Any, Any], key: str) -> object:
 
 
 def _as_sequence(value: object) -> list[object]:
-    # ``str`` subclasses are rejected too; do not invoke their overridden methods.
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+    # ``str`` subclasses are rejected too; do not invoke their overridden
+    # methods.
+    is_string = isinstance(value, (str, bytes, bytearray))
+    if is_string or not isinstance(value, Sequence):
         raise _MalformedInventory
     try:
         return list(value)
@@ -103,8 +111,9 @@ def _simple_link_path(item: object) -> str:
     if isinstance(item, Mapping):
         path = _mapping_value(item, "entrypath")
         if path is _MISSING:
-            # Some devpi versions use href for this compact relation.  It is still
-            # a persisted path at this boundary, never a URL to be fetched.
+            # Some devpi versions use href for this compact relation.  It is
+            # still a persisted path at this boundary, never a URL to be
+            # fetched.
             path = _mapping_value(item, "href")
     else:
         values = _as_sequence(item)
@@ -118,6 +127,11 @@ def _simple_link_path(item: object) -> str:
 
 def _check_simple_value(value: object) -> bool:
     mapping = _as_mapping(value)
+    try:
+        if len(mapping) == 0:
+            return False
+    except Exception as exc:
+        raise _MalformedInventory from exc
     links = _mapping_value(mapping, "links")
     if links is _MISSING:
         raise _MalformedInventory
@@ -154,6 +168,8 @@ def _check_version_value(
             has_release = True
         elif relation in {_TOXRESULT, _DOCZIP}:
             known_non_artifacts.add(entrypath)
+        else:
+            raise _MalformedInventory
     return has_release
 
 
@@ -165,7 +181,11 @@ def _iter_infos(tx: object, keys: Sequence[object], serial: object):
         raise _MalformedInventory from exc
 
 
-def _scan_snapshot(tx: object, key_map: Mapping[str, object], serial: object) -> str | None:
+def _scan_snapshot(
+    tx: object,
+    key_map: Mapping[str, object],
+    serial: object,
+) -> str | None:
     known_non_artifacts: set[str] = set()
     relation_paths: dict[str, set[str]] = {}
 
@@ -208,8 +228,9 @@ def _scan_snapshot(tx: object, key_map: Mapping[str, object], serial: object) ->
 def find_existing_artifact_candidate(xom: object) -> str | None:
     """Return a bounded category for the first live Artifact candidate.
 
-    All KeyFS access is contained in one read transaction.  Any malformed persisted
-    shape or KeyFS failure returns ``"unclassified"`` so activation remains safe.
+    All KeyFS access is contained in one read transaction.  Any malformed
+    persisted shape or KeyFS failure returns ``"unclassified"`` so activation
+    remains safe.
     """
 
     try:

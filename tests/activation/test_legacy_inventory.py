@@ -10,9 +10,6 @@ from devpi_guardian.legacy_inventory import (
     find_existing_artifact_candidate,
 )
 
-# flake8: noqa: E501
-# ruff: noqa: RUF100
-
 
 class FakeRelpathInfo:
     def __init__(self, keyname: str, relpath: str, value: object) -> None:
@@ -50,7 +47,11 @@ class FakeTransaction:
         self.error = error
         self.iter_calls: list[tuple[tuple[str, ...], int]] = []
 
-    def iter_relpaths_at(self, keys: Sequence[FakeKey], serial: int) -> Iterator[object]:
+    def iter_relpaths_at(
+        self,
+        keys: Sequence[FakeKey],
+        serial: int,
+    ) -> Iterator[object]:
         names = tuple(key.keyname for key in keys)
         self.iter_calls.append((names, serial))
         if self.error is not None:
@@ -101,7 +102,11 @@ class FakeKeyFS:
 
 
 class FakeXom:
-    def __init__(self, rows: Mapping[str, Sequence[object]], **kwargs: object) -> None:
+    def __init__(
+        self,
+        rows: Mapping[str, Sequence[object]],
+        **kwargs: object,
+    ) -> None:
         self.keyfs = FakeKeyFS(rows, **kwargs)
         self.model = _ForbiddenAttribute()
         self.filestore = _ForbiddenAttribute()
@@ -161,21 +166,55 @@ def test_private_release_elink_is_candidate() -> None:
     assert result == "release_link"
     assert type(result) is str
     assert result is ExistingArtifactCandidate.RELEASE_LINK.value
-    assert xom.keyfs.transaction.iter_calls == [(("PROJSIMPLELINKS", "PROJVERSION"), 73)]
+    assert xom.keyfs.transaction.iter_calls == [
+        (("PROJSIMPLELINKS", "PROJVERSION"), 73),
+    ]
 
 
 def test_nonempty_persisted_simple_links_are_candidate() -> None:
+    filename = "demo-1.0.whl"
+    entrypath = "root/pypi/+e/demo-1.0.whl"
+    links = ReadonlySequence(((filename, entrypath),))
     simple = MappingProxyType(
-        {"links": ReadonlySequence((("demo-1.0.whl", "root/pypi/+e/demo-1.0.whl"),))}
+        {"links": links},
     )
-    xom = FakeXom({"PROJSIMPLELINKS": [info("PROJSIMPLELINKS", "root/pypi/demo", simple)]})
+    simple_info = info("PROJSIMPLELINKS", "root/pypi/demo", simple)
+    xom = FakeXom({"PROJSIMPLELINKS": [simple_info]})
 
     assert find_existing_artifact_candidate(xom) == "release_link"
 
 
+def test_empty_persisted_mirror_mapping_is_well_formed() -> None:
+    xom = FakeXom(
+        {"PROJSIMPLELINKS": [info("PROJSIMPLELINKS", "root/pypi/demo", {})]},
+    )
+
+    assert find_existing_artifact_candidate(xom) is None
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["", "\x00demo.whl", "\ud800", "a" * 4097],
+)
+def test_malformed_simple_link_filename_is_unclassified(filename: str) -> None:
+    simple = {"links": ((filename, "root/pypi/+e/demo-1.0.whl"),)}
+    simple_info = info("PROJSIMPLELINKS", "root/pypi/demo", simple)
+    xom = FakeXom({"PROJSIMPLELINKS": [simple_info]})
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
 def test_cached_mirror_file_is_candidate() -> None:
     xom = FakeXom(
-        {"PYPIFILE_NOMD5": [info("PYPIFILE_NOMD5", "root/pypi/+f/aa/demo.whl", {"size": 12})]}
+        {
+            "PYPIFILE_NOMD5": [
+                info(
+                    "PYPIFILE_NOMD5",
+                    "root/pypi/+f/aa/demo.whl",
+                    {"size": 12},
+                )
+            ]
+        },
     )
 
     assert find_existing_artifact_candidate(xom) == "file_entry"
@@ -208,7 +247,8 @@ def test_known_non_artifact_stage_files_are_ignored(relation: str) -> None:
 
 
 def test_unclassified_stage_file_is_fail_closed_candidate() -> None:
-    xom = FakeXom({"STAGEFILE": [info("STAGEFILE", "root/dev/+f/aa/demo.whl", {"size": 1})]})
+    stage_info = info("STAGEFILE", "root/dev/+f/aa/demo.whl", {"size": 1})
+    xom = FakeXom({"STAGEFILE": [stage_info]})
 
     result = find_existing_artifact_candidate(xom)
 
@@ -216,27 +256,87 @@ def test_unclassified_stage_file_is_fail_closed_candidate() -> None:
     assert type(result) is str
 
 
-def test_unknown_relation_live_file_is_candidate() -> None:
+def test_unknown_relation_is_unclassified_even_with_live_file() -> None:
     entrypath = "root/dev/+f/aa/demo.whl"
+    relation_item = {"rel": "future-relation", "entrypath": entrypath}
+    version_value = {"+elinks": (relation_item,)}
     xom = FakeXom(
         {
             "PROJVERSION": [
                 info(
                     "PROJVERSION",
                     "root/dev/demo/1.0/.config",
-                    {"+elinks": ({"rel": "future-relation", "entrypath": entrypath},)},
+                    version_value,
                 )
             ],
             "STAGEFILE": [info("STAGEFILE", entrypath, {"size": 1})],
         }
     )
 
-    assert find_existing_artifact_candidate(xom) == "file_entry"
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
+def test_unknown_relation_without_live_file_is_unclassified() -> None:
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {
+                        "+elinks": (
+                            {
+                                "rel": "future-relation",
+                                "entrypath": "root/dev/+f/aa/demo.whl",
+                            },
+                        )
+                    },
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
+@pytest.mark.parametrize(
+    "relation",
+    ["", "\x00future", "\ud800", "a" * 4097],
+)
+def test_unsafe_unknown_relation_is_unclassified(relation: str) -> None:
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {
+                        "+elinks": (
+                            {
+                                "rel": relation,
+                                "entrypath": "root/dev/+f/aa/demo.whl",
+                            },
+                        )
+                    },
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
 
 
 def test_version_without_elinks_is_well_formed() -> None:
     xom = FakeXom(
-        {"PROJVERSION": [info("PROJVERSION", "root/dev/demo/1.0/.config", {"serial": 1})]}
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"serial": 1},
+                )
+            ]
+        },
     )
 
     assert find_existing_artifact_candidate(xom) is None
@@ -245,8 +345,24 @@ def test_version_without_elinks_is_well_formed() -> None:
 @pytest.mark.parametrize(
     "rows",
     [
-        {"PROJSIMPLELINKS": [info("PROJSIMPLELINKS", "root/pypi/demo", {"links": None})]},
-        {"PROJSIMPLELINKS": [info("PROJSIMPLELINKS", "root/pypi/demo", {"links": (1,)})]},
+        {
+            "PROJSIMPLELINKS": [
+                info(
+                    "PROJSIMPLELINKS",
+                    "root/pypi/demo",
+                    {"links": None},
+                )
+            ],
+        },
+        {
+            "PROJSIMPLELINKS": [
+                info(
+                    "PROJSIMPLELINKS",
+                    "root/pypi/demo",
+                    {"links": (1,)},
+                )
+            ],
+        },
         {
             "PROJVERSION": [
                 info(
@@ -294,7 +410,14 @@ def test_unsafe_paths_are_unclassified(entrypath: str) -> None:
                 info(
                     "PROJVERSION",
                     "root/dev/demo/1.0/.config",
-                    {"+elinks": ({"rel": "releasefile", "entrypath": entrypath},)},
+                    {
+                        "+elinks": (
+                            {
+                                "rel": "releasefile",
+                                "entrypath": entrypath,
+                            },
+                        )
+                    },
                 )
             ]
         }
@@ -338,7 +461,12 @@ def test_keyfs_failures_are_unclassified(error_kind: str) -> None:
 
 
 def test_one_snapshot_and_no_model_or_network_access() -> None:
-    xom = FakeXom({"STAGEFILE": [info("STAGEFILE", "root/dev/+f/a.whl", SimpleNamespace(size=1))]})
+    stage_info = info(
+        "STAGEFILE",
+        "root/dev/+f/a.whl",
+        SimpleNamespace(size=1),
+    )
+    xom = FakeXom({"STAGEFILE": [stage_info]})
 
     assert find_existing_artifact_candidate(xom) == "file_entry"
     assert xom.keyfs.read_transactions == 1
