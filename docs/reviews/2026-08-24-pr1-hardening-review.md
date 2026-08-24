@@ -54,6 +54,33 @@ exit 0
 no output
 ```
 
+## Integrated stacked-PR review
+
+The integrated merge SHA is `ff879c8a968c61cffd5a0138fe50924b31aa2221`, with parents
+`808e621c9f4a5c332496a7eb0c8be8cb2dfda180` and
+`376dc35f3d1d2e9a97e7cc8c56be1b2f83dab7a6`. The remote was merged because PR #2 and
+PR #3 were already merged into the PR #1 head.
+
+Both independent reviews remained approved, with zero findings: specification
+approval (`INDEPENDENT SPEC APPROVED`, Critical 0, Important 0, Minor 0) and security
+approval (`INDEPENDENT SECURITY APPROVED`, Critical 0, Important 0, Minor 0).
+
+Focused verification passed: specification-focused tests, `129 passed`; security-focused
+tests, `442 passed`; real integration tests, `27 passed`.
+
+Final controller integrated verification:
+
+```text
+Python 3.12.11
+1271 passed, 9 warnings in 32.46s
+Ruff format: 82 files already formatted
+Ruff check: All checks passed!
+flake8: passed
+uv lock --check: 72 packages
+uv build: sdist and wheel successfully built
+git diff --check: passed
+```
+
 ## GitHub state
 
 PR #1 is open with head `feature/f3-f4-enforcement-store`. No checks existed before
