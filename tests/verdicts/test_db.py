@@ -124,7 +124,7 @@ def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
 
     def failing_read_migration(version: int) -> str:
         if version == 3:
-            return "THIS IS INVALID SQL;"
+            return real_read_migration(version) + "\nTHIS IS INVALID SQL;\n"
         return real_read_migration(version)
 
     monkeypatch.setattr(db, "_read_migration", failing_read_migration)
@@ -135,7 +135,18 @@ def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
+        activation_objects = connection.execute(
+            """
+            SELECT type, name FROM sqlite_master
+            WHERE name IN (
+                'guardian_activation',
+                'guardian_activation_immutable_update_guard',
+                'guardian_activation_immutable_delete_guard'
+            )
+            """
+        ).fetchall()
     assert [version[0] for version in versions] == [1, 2]
+    assert activation_objects == []
 
     monkeypatch.setattr(db, "_read_migration", real_read_migration)
     migrate(factory)
@@ -447,7 +458,7 @@ def test_migrate_rejects_v1_without_schema(tmp_path) -> None:
 
 def test_migrate_rejects_future_schema_version(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
-    _seed_schema_version(factory.path, 3)
+    _seed_schema_version(factory.path, 4)
 
     with pytest.raises(MigrationError):
         migrate(factory)
