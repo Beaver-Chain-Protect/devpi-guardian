@@ -458,6 +458,111 @@ send("https://bound.example")
     ] == [("httpx.Client.post", "network")]
 
 
+def test_callable_aliases_track_stable_object_attributes() -> None:
+    source = """
+import requests
+
+class Box:
+    pass
+
+box = Box()
+box.send = requests.post
+box.send("https://attribute.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("requests.post", "network")]
+
+
+def test_callable_aliases_track_receiver_attributes_in_same_method() -> None:
+    source = """
+import requests
+
+class Box:
+    def send(self):
+        self.post = requests.post
+        self.post("https://same-method.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("requests.post", "network")]
+
+
+def test_callable_receiver_attributes_seed_across_methods_conservatively() -> None:
+    source = """
+import requests
+
+class Api:
+    def __init__(self):
+        self.send = requests.post
+
+    def call(self):
+        self.send("https://cross-method.example")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [
+        (call.qualified_name, call.category) for call in calls if call.category == "network"
+    ] == [("requests.post", "network")]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+import requests
+box = Box()
+box.send = requests.post
+box.send = Fake()
+box.send("not-network")
+""",
+        """
+import requests
+box = Box()
+box.send = requests.post
+del box.send
+box.send("not-network")
+""",
+        """
+import requests
+box = Box()
+box.send = requests.post
+box = {}
+box.send("not-network")
+""",
+        """
+import requests
+box = Box()
+box.send = requests.post
+[box.send for box.send in values]
+box.send("not-network")
+""",
+    ],
+)
+def test_callable_attribute_aliases_invalidate_reassignment_and_scope_targets(source: str) -> None:
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
+def test_callable_receiver_attribute_summary_suppresses_conflicting_writers() -> None:
+    source = """
+import requests
+
+class Api:
+    def __init__(self):
+        self.send = requests.post
+
+    def reset(self):
+        self.send = Fake()
+
+    def call(self):
+        self.send("not-network")
+"""
+    calls, _ = scan_calls(ast.parse(source), source)
+    assert [call for call in calls if call.category == "network"] == []
+
+
 @pytest.mark.parametrize(
     "source",
     [

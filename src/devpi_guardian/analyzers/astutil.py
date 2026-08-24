@@ -487,6 +487,11 @@ def _callable_identity(
 ) -> str | None:
     """Resolve a callable assignment RHS without treating arbitrary names as known."""
 
+    reference = _reference_path(node)
+    if reference is not None:
+        identity = callable_aliases.get(reference)
+        if identity is not None:
+            return identity
     if isinstance(node, ast.Name):
         identity = callable_aliases.get(node.id)
         if identity is not None:
@@ -499,7 +504,6 @@ def _callable_identity(
         kind = _constructor_kind(node.value, aliases, constructor_bindings)
         if kind is not None:
             return f"{kind}.{node.attr}"
-    reference = _reference_path(node)
     if reference is None:
         return None
     root = reference.split(".", 1)[0]
@@ -567,6 +571,7 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         module_instances: dict[str, str],
         module_constructors: dict[str, str],
         initial: dict[str, str] | None = None,
+        callable_initial: dict[str, str] | None = None,
         local_names: Iterable[str] = (),
     ) -> None:
         self.receiver = receiver
@@ -576,6 +581,9 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         self.known: dict[str, str] = {}
         self.receiver_known = dict(initial or {})
         self.events: list[tuple[str, str | None]] = []
+        self.callable_known: dict[str, str] = {}
+        self.receiver_callable_known = dict(callable_initial or {})
+        self.callable_events: list[tuple[str, str | None]] = []
         for name in local_names:
             self._clear_local_name(name)
 
@@ -584,6 +592,7 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         _clear_reference_path(self.module_instances, name)
         _clear_reference_path(self.constructors, name)
         _clear_reference_path(self.known, name)
+        _clear_reference_path(self.callable_known, name)
 
     def _clear_target_state(self, target: ast.AST) -> None:
         for name in _binding_names(target):
@@ -628,6 +637,20 @@ class _ClassAttributeCollector(ast.NodeVisitor):
                     kind = self.receiver_known.get(relative)
         return kind
 
+    def _callable_kind(self, value: ast.AST | None) -> str | None:
+        if value is None:
+            return None
+        instances = dict(self.module_instances)
+        instances.update(self.known)
+        instances.update(
+            {f"{self.receiver}.{path}": kind for path, kind in self.receiver_known.items()}
+        )
+        aliases = dict(self.callable_known)
+        aliases.update(
+            {f"{self.receiver}.{path}": kind for path, kind in self.receiver_callable_known.items()}
+        )
+        return _callable_identity(value, self.aliases, instances, self.constructors, aliases)
+
     def _record(self, target: ast.AST, value: ast.AST | None) -> None:
         kind = self._kind(value)
         for path in _target_reference_paths(target):
@@ -652,6 +675,31 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             elif kind is not None:
                 self.known[path] = kind
 
+    def _record_callable(self, target: ast.AST, identity: str | None) -> None:
+        for path in _target_reference_paths(target):
+            relative = _relative_receiver_path(path, self.receiver)
+            binding_map = (
+                self.receiver_callable_known if relative is not None else self.callable_known
+            )
+            binding_path = relative if relative is not None else path
+            descendants = [
+                known_path
+                for known_path in binding_map
+                if known_path.startswith(f"{binding_path}.")
+            ]
+            for descendant in descendants:
+                if relative is not None:
+                    self.callable_events.append((descendant, None))
+            _clear_reference_path(binding_map, binding_path)
+            if relative is not None:
+                self.callable_events.append((relative, identity))
+                if identity is None:
+                    self.receiver_callable_known.pop(relative, None)
+                else:
+                    self.receiver_callable_known[relative] = identity
+            elif identity is not None:
+                self.callable_known[path] = identity
+
     def _update_constructor_alias(self, target: ast.AST, value: ast.AST) -> None:
         if not isinstance(target, ast.Name):
             return
@@ -665,10 +713,12 @@ class _ClassAttributeCollector(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
+        identity = self._callable_kind(node.value)
         for target in node.targets:
             self._clear_target_state(target)
             self._update_constructor_alias(target, node.value)
             self._record(target, node.value)
+            self._record_callable(target, identity)
             self._invalidate_alias_target(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -676,36 +726,44 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
+            identity = self._callable_kind(node.value)
             self._clear_target_state(node.target)
             self._update_constructor_alias(node.target, node.value)
         else:
+            identity = None
             self._clear_target_state(node.target)
         self._record(node.target, node.value)
+        self._record_callable(node.target, identity)
         self._invalidate_alias_target(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
+        identity = self._callable_kind(node.value)
         self._clear_target_state(node.target)
         self._update_constructor_alias(node.target, node.value)
         self._record(node.target, node.value)
+        self._record_callable(node.target, identity)
         self._invalidate_alias_target(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.target)
         self.visit(node.value)
         self._record(node.target, None)
+        self._record_callable(node.target, None)
         self._invalidate_alias_target(node.target)
         self._clear_target_state(node.target)
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
             self._record(target, None)
+            self._record_callable(target, None)
             self._invalidate_alias_target(target)
             self._clear_target_state(target)
 
     def visit_For(self, node: ast.For) -> None:
         self.visit(node.iter)
         self._record(node.target, None)
+        self._record_callable(node.target, None)
         self._invalidate_alias_target(node.target)
         self._clear_target_state(node.target)
         for statement in [*node.body, *node.orelse]:
@@ -719,6 +777,7 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             if item.optional_vars is not None:
                 self._clear_target_state(item.optional_vars)
                 self._record(item.optional_vars, item.context_expr)
+                self._record_callable(item.optional_vars, None)
                 self._invalidate_alias_target(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
@@ -743,6 +802,8 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         constructors = self.constructors
         known = self.known
         receiver_known = self.receiver_known
+        callable_known = self.callable_known
+        receiver_callable_known = self.receiver_callable_known
         receiver_mutations = [
             path for generator in generators for path in _attribute_target_paths(generator.target)
         ]
@@ -753,7 +814,10 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             self.constructors = dict(self.constructors)
             self.known = dict(self.known)
             self.receiver_known = dict(self.receiver_known)
+            self.callable_known = dict(self.callable_known)
+            self.receiver_callable_known = dict(self.receiver_callable_known)
             self._record(generator.target, None)
+            self._record_callable(generator.target, None)
             self._invalidate_alias_target(generator.target)
             self._clear_target_state(generator.target)
             for condition in generator.ifs:
@@ -766,6 +830,9 @@ class _ClassAttributeCollector(ast.NodeVisitor):
         self.constructors = constructors
         self.known = known
         self.receiver_known = receiver_known
+        receiver_callable_after = self.receiver_callable_known
+        self.callable_known = callable_known
+        self.receiver_callable_known = receiver_callable_known
         for path in receiver_mutations:
             relative = _relative_receiver_path(path, self.receiver)
             if relative is None:
@@ -774,6 +841,10 @@ class _ClassAttributeCollector(ast.NodeVisitor):
             for known_path, kind in receiver_after.items():
                 if known_path == relative or known_path.startswith(f"{relative}."):
                     self.receiver_known[known_path] = kind
+            _clear_reference_path(self.receiver_callable_known, relative)
+            for known_path, kind in receiver_callable_after.items():
+                if known_path == relative or known_path.startswith(f"{relative}."):
+                    self.receiver_callable_known[known_path] = kind
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._visit_comprehension(node.generators, [node.elt])
@@ -802,7 +873,12 @@ def _class_attribute_summary(
     aliases: dict[str, str],
     module_instances: dict[str, str],
     module_constructors: dict[str, str],
-) -> tuple[dict[str, str], dict[str, frozenset[int]]]:
+) -> tuple[
+    dict[str, str],
+    dict[str, frozenset[int]],
+    dict[str, str],
+    dict[str, frozenset[int]],
+]:
     methods = [
         child
         for child in node.body
@@ -810,6 +886,7 @@ def _class_attribute_summary(
         and _instance_method_receiver(child, aliases) is not None
     ]
     direct: dict[str, set[str]] = {}
+    direct_callable: dict[str, set[str]] = {}
     for method in methods:
         receiver = _instance_method_receiver(method, aliases)
         assert receiver is not None
@@ -834,10 +911,18 @@ def _class_attribute_summary(
         for path, kind in collector.events:
             if kind is not None:
                 direct.setdefault(path, set()).add(kind)
+        for path, identity in collector.callable_events:
+            if identity is not None:
+                direct_callable.setdefault(path, set()).add(identity)
 
     provisional = {path: next(iter(kinds)) for path, kinds in direct.items() if len(kinds) == 1}
+    provisional_callable = {
+        path: next(iter(kinds)) for path, kinds in direct_callable.items() if len(kinds) == 1
+    }
     all_events: dict[str, list[str | None]] = {}
     event_methods: dict[str, set[int]] = {}
+    all_callable_events: dict[str, list[str | None]] = {}
+    callable_event_methods: dict[str, set[int]] = {}
     for method in methods:
         receiver = _instance_method_receiver(method, aliases)
         assert receiver is not None
@@ -859,14 +944,18 @@ def _class_attribute_summary(
             aliases,
             module_instances,
             module_constructors,
-            provisional,
-            local_names,
+            initial=provisional,
+            callable_initial=provisional_callable,
+            local_names=local_names,
         )
         for statement in method.body:
             collector.visit(statement)
         for path, kind in collector.events:
             all_events.setdefault(path, []).append(kind)
             event_methods.setdefault(path, set()).add(id(method))
+        for path, identity in collector.callable_events:
+            all_callable_events.setdefault(path, []).append(identity)
+            callable_event_methods.setdefault(path, set()).add(id(method))
 
     summary = {
         path: kinds[0]
@@ -874,7 +963,13 @@ def _class_attribute_summary(
         if kinds and None not in kinds and len(set(kinds)) == 1
     }
     writers = {path: frozenset(event_methods[path]) for path in summary}
-    return summary, writers
+    callable_summary = {
+        path: identities[0]
+        for path, identities in all_callable_events.items()
+        if identities and None not in identities and len(set(identities)) == 1
+    }
+    callable_writers = {path: frozenset(callable_event_methods[path]) for path in callable_summary}
+    return summary, writers, callable_summary, callable_writers
 
 
 class _CallVisitor(ast.NodeVisitor):
@@ -890,6 +985,8 @@ class _CallVisitor(ast.NodeVisitor):
         self._callable_scopes: list[dict[str, str]] = [{}]
         self._class_summaries: dict[ast.ClassDef, dict[str, str]] = {}
         self._class_summary_writers: dict[ast.ClassDef, dict[str, frozenset[int]]] = {}
+        self._class_callable_summaries: dict[ast.ClassDef, dict[str, str]] = {}
+        self._class_callable_summary_writers: dict[ast.ClassDef, dict[str, frozenset[int]]] = {}
         self._class_stack: list[ast.ClassDef] = []
         self._class_alias_bases: list[dict[str, str]] = []
         self._class_callable_bases: list[dict[str, str]] = []
@@ -903,7 +1000,8 @@ class _CallVisitor(ast.NodeVisitor):
     def _invalidate_alias_target(self, target: ast.AST) -> None:
         for name in _binding_names(target):
             self.active_aliases.pop(name, None)
-            self.callable_aliases.pop(name, None)
+        for path in _target_reference_paths(target):
+            _clear_reference_path(self.callable_aliases, path)
 
     def _bind_import(self, node: ast.Import) -> None:
         for imported in node.names:
@@ -1005,8 +1103,8 @@ class _CallVisitor(ast.NodeVisitor):
         if identity is None:
             return
         for target in targets:
-            if isinstance(target, ast.Name):
-                self.callable_aliases[target.id] = identity
+            for path in _target_reference_paths(target):
+                self.callable_aliases[path] = identity
 
     def _visit_scope_body(
         self,
@@ -1030,9 +1128,11 @@ class _CallVisitor(ast.NodeVisitor):
         self._instance_scopes.append(instances)
         self._constructor_scopes.append(constructors)
         self._alias_scopes.append(aliases)
-        callable_aliases = dict(self.callable_aliases if callable_seed is None else callable_seed)
+        callable_aliases = dict(self.callable_aliases if callable_seed is None else {})
         for name in clear_names:
             _clear_reference_path(callable_aliases, name)
+        if callable_seed:
+            callable_aliases.update(callable_seed)
         self._callable_scopes.append(callable_aliases)
         for statement in body:
             self.visit(statement)
@@ -1099,6 +1199,8 @@ class _CallVisitor(ast.NodeVisitor):
             receiver = _instance_method_receiver(node, self.active_aliases)
             summary = self._class_summaries.get(self._class_stack[-1], {})
             writers = self._class_summary_writers.get(self._class_stack[-1], {})
+            callable_summary = self._class_callable_summaries.get(self._class_stack[-1], {})
+            callable_writers = self._class_callable_summary_writers.get(self._class_stack[-1], {})
             if receiver is not None:
                 instance_seed = {
                     f"{receiver}.{path}": kind
@@ -1111,7 +1213,16 @@ class _CallVisitor(ast.NodeVisitor):
         callable_seed = None
         if self._class_stack and self._function_depth - 1 == self._class_function_depths[-1]:
             alias_seed = self._class_alias_bases[-1]
-            callable_seed = self._class_callable_bases[-1]
+            callable_seed = dict(self._class_callable_bases[-1])
+            callable_seed.update(
+                {
+                    f"{receiver}.{path}": identity
+                    for path, identity in callable_summary.items()
+                    if receiver is not None
+                    and node.name != "__init__"
+                    and any(writer != id(node) for writer in callable_writers.get(path, ()))
+                }
+            )
         self._visit_scope_body(
             node.body,
             clear_names=local_names,
@@ -1147,7 +1258,7 @@ class _CallVisitor(ast.NodeVisitor):
             self.visit(keyword.value)
         outer_aliases = dict(self.active_aliases)
         outer_callable_aliases = dict(self.callable_aliases)
-        summary, writers = _class_attribute_summary(
+        summary, writers, callable_summary, callable_writers = _class_attribute_summary(
             node,
             outer_aliases,
             self.instance_bindings,
@@ -1155,6 +1266,8 @@ class _CallVisitor(ast.NodeVisitor):
         )
         self._class_summaries[node] = summary
         self._class_summary_writers[node] = writers
+        self._class_callable_summaries[node] = callable_summary
+        self._class_callable_summary_writers[node] = callable_writers
         self._class_stack.append(node)
         self._class_alias_bases.append(outer_aliases)
         self._class_callable_bases.append(outer_callable_aliases)
@@ -1293,6 +1406,7 @@ class _CallVisitor(ast.NodeVisitor):
         self._constructor_scopes.pop()
         for path in attribute_targets:
             _clear_reference_path(self.instance_bindings, path)
+            _clear_reference_path(self.callable_aliases, path)
             self.constructor_bindings.pop(path, None)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
