@@ -233,6 +233,7 @@ verdict = VerdictInput(
     policy_version="policy-1",
     analyzer_version="analyzer-1",
     baseline_sha256=None,
+    baseline_tier=None,
     created_at=datetime.now(UTC),
 )
 evidence = [
@@ -247,6 +248,13 @@ evidence = [
 ]
 store.record_verdict(claim, verdict, evidence)
 ```
+
+`baseline_tier` is typed as `Literal["same_tag", "universal_wheel", "sdist"]`.
+`baseline_sha256 and baseline_tier must both be set or both be None`.
+F6 passes `selection.tier` unchanged through F10, so `baseline_tier=None` is
+used when no baseline is selected. `sdist comparisons have lower confidence`
+than same-tag or universal-wheel comparisons and remain distinguishable in F4's
+immutable verdict history.
 
 Manual transitions are also transaction-bound and audited:
 

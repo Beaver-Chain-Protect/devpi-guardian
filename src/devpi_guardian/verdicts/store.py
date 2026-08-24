@@ -28,6 +28,7 @@ from .models import (
     ReleaseInput,
     VerdictInput,
     require_utc,
+    validate_baseline_tier,
     validate_sha256,
 )
 from .releases import sanitize_origin_url
@@ -661,6 +662,7 @@ class SQLiteArtifactStore:
                 "analyzer_version",
             )
             baseline_sha256 = verdict.baseline_sha256
+            baseline_tier = verdict.baseline_tier
             created_at = _iso(verdict.created_at, "created_at")
         except AttributeError:
             message = "VerdictInput missing required fields"
@@ -669,6 +671,11 @@ class SQLiteArtifactStore:
             raise ValueError("decision must be a Decision")
         if baseline_sha256 is not None:
             baseline_sha256 = validate_sha256(baseline_sha256)
+        if (baseline_sha256 is None) != (baseline_tier is None):
+            message = "baseline_sha256 and baseline_tier must be paired"
+            raise ValueError(message)
+        if baseline_tier is not None:
+            baseline_tier = validate_baseline_tier(baseline_tier)
         if sha256 != claim_sha256:
             raise TransitionConflict(sha256)
 
@@ -730,8 +737,8 @@ class SQLiteArtifactStore:
                 """
                 INSERT INTO verdicts(
                     sha256, decision, score, policy_version, analyzer_version,
-                    baseline_sha256, is_current, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                    baseline_sha256, is_current, created_at, baseline_tier
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     sha256,
@@ -741,6 +748,7 @@ class SQLiteArtifactStore:
                     analyzer_version,
                     baseline_sha256,
                     created_at,
+                    baseline_tier,
                 ),
             )
             if inserted.rowcount != 1 or type(inserted.lastrowid) is not int:
@@ -806,7 +814,7 @@ class SQLiteArtifactStore:
                 """
                 SELECT sha256, decision, score, policy_version,
                        analyzer_version,
-                       baseline_sha256, is_current, created_at
+                       baseline_sha256, is_current, created_at, baseline_tier
                 FROM verdicts WHERE id = ?
                 """,
                 (verdict_id,),
@@ -820,6 +828,7 @@ class SQLiteArtifactStore:
                 baseline_sha256,
                 1,
                 created_at,
+                baseline_tier,
             ):
                 raise TransitionConflict("stored verdict mismatch")
 

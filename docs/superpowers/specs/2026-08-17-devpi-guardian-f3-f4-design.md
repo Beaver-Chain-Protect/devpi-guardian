@@ -110,7 +110,7 @@ F2와 F3는 반드시 같은 `VerdictReader` 구현을 사용한다. 각자 별�
 | `schema_migrations` | DB 스키마 버전 | `version`, `applied_at` |
 | `artifacts` | Artifact와 분석 생명주기 | `sha256`, `size_bytes`, `state`, `discovered_at`, `updated_at`, `lease_owner`, `lease_expires_at`, `lease_token`, `last_error` |
 | `release_mappings` | 패키지 파일과 SHA-256 연결 | `stage`, `project`, `version`, `filename`, `sha256`, `origin_url`, `discovered_at` |
-| `verdicts` | 자동 판정의 불변 이력 | `id`, `sha256`, `decision`, `score`, `policy_version`, `analyzer_version`, `baseline_sha256`, `is_current`, `created_at` |
+| `verdicts` | 자동 판정의 불변 이력 | `id`, `sha256`, `decision`, `score`, `policy_version`, `analyzer_version`, `baseline_sha256`, `baseline_tier`, `is_current`, `created_at` |
 | `evidence` | 판정 근거 | `id`, `verdict_id`, `rule_id`, `action`, `file_path`, `line`, `message`, `details_json` |
 | `manual_overrides` | 관리자 승인·차단 이력 | `id`, `sha256`, `decision`, `actor`, `reason`, `created_at`, `expires_at`, `is_current` |
 | `audit_events` | F12 감사 기록 | 6번이 정의하며 F4 트랜잭션에 참여 |
@@ -341,7 +341,7 @@ URL fragment, 사용자 header, filename에 포함된 값은 SHA-256 근거로 �
 - 분석 결과를 `VerdictInput`과 `EvidenceInput` DTO로 반환한다.
 - `EvidenceInput`의 공통 필드는 `rule_id`, `action`, `file_path`, `line`, `message`, `details`다.
 - Source·Sink, 함수명, diff fragment처럼 규칙별로 달라지는 값은 JSON 직렬화 가능한 `details`에 둔다.
-- Artifact SHA-256, baseline SHA-256, analyzer version을 항상 함께 전달한다.
+- Artifact SHA-256, baseline SHA-256, baseline tier, analyzer version을 항상 함께 전달한다. baseline이 없으면 baseline SHA와 tier는 모두 None이다.
 
 ### 9.3 5번 — 워커와 관리자 API·CLI
 
@@ -357,7 +357,7 @@ URL fragment, 사용자 header, filename에 포함된 값은 SHA-256 근거로 �
 
 ### 9.4 6번 — 정책 엔진과 감사 로그
 
-- 정책 엔진은 `decision`, `score`, `policy_version`, `analyzer_version`, `baseline_sha256`이 채워진 `VerdictInput`을 만든다.
+- 정책 엔진은 `decision`, `score`, `policy_version`, `analyzer_version`, `baseline_sha256`, `baseline_tier`를 포함한 `VerdictInput`을 만든다. tier는 `same_tag`/`universal_wheel`/`sdist` 중 하나이며 baseline SHA와 함께 존재하거나 둘 다 None이다.
 - 자동 판정을 저장할 때 기존 current verdict를 갱신하지 않고 새 verdict를 추가한다.
 - F12는 `AuditWriter.append_in_transaction()` adapter와 `audit_events` migration을 제공한다.
 - 감사 event에는 actor, action, sha256, 이전 effective decision, 새 effective decision, reason, policy version, analyzer version, 발생 시각을 포함한다.
@@ -378,6 +378,7 @@ URL fragment, 사용자 header, filename에 포함된 값은 SHA-256 근거로 �
 - 수동 `ALLOW`와 `DENY`, 취소, 만료가 정해진 우선순위로 계산된다.
 - 만료 시각 이후 첫 조회부터 override가 적용되지 않는다.
 - 감사 기록 실패 시 판정 변경이 rollback된다.
+- 새 automatic verdict는 F6의 세 tier 중 하나를 불변으로 보존하며, 기존 v1 baseline verdict의 unknown tier는 계속 NULL이다.
 - F12의 persistent audit adapter integration은 별도 deliverable이다. F4
   현재 검증은 audit writer failure가 같은 transaction의 상태 변경을
   rollback하는지 증명한다.

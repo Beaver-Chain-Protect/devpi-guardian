@@ -1,1 +1,1 @@
-Add a read-only Guardian index that exposes only effective-ALLOW Simple links through the shared verdict reader.
+Preserve F6 baseline selection tiers in F10 VerdictInput values and immutable F4 verdict history.
