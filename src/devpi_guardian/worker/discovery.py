@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,19 @@ _REQUIRED_DISCOVERY_COLUMNS = frozenset(
         "updated_at",
     }
 )
+_DISCOVERY_COLUMN_TYPES = {
+    "job_id": ("TEXT", 0, 1),
+    "candidate_json": ("TEXT", 1, 0),
+    "state": ("TEXT", 1, 0),
+    "attempt_count": ("INTEGER", 1, 0),
+    "available_at": ("TEXT", 1, 0),
+    "lease_owner": ("TEXT", 0, 0),
+    "lease_expires_at": ("TEXT", 0, 0),
+    "lease_token": ("TEXT", 0, 0),
+    "last_error": ("TEXT", 0, 0),
+    "created_at": ("TEXT", 1, 0),
+    "updated_at": ("TEXT", 1, 0),
+}
 
 
 def _validate_claim(claim: DiscoveryClaim) -> None:
@@ -109,6 +123,191 @@ def _job_id(candidate: DiscoveryCandidate) -> str:
     return hashlib.sha256(_candidate_payload(candidate).encode("utf-8")).hexdigest()
 
 
+def _validate_catalog(connection: sqlite3.Connection) -> None:
+    table = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'discovery_jobs'"
+    ).fetchone()
+    rows = connection.execute("PRAGMA table_info(discovery_jobs)").fetchall()
+    actual = {row[1]: (row[2].upper(), row[3], row[5]) for row in rows}
+    if actual != _DISCOVERY_COLUMN_TYPES:
+        raise DiscoveryUnavailable("incompatible discovery schema: column contract mismatch")
+    defaults = {row[1]: row[4] for row in rows}
+    if defaults["attempt_count"] != "0":
+        raise DiscoveryUnavailable("incompatible discovery schema: attempt_count default")
+    sql = "" if table is None or table[0] is None else " ".join(table[0].upper().split())
+    required_fragments = (
+        "PRIMARY KEY",
+        "CANDIDATE_JSON TEXT NOT NULL",
+        "STATE TEXT NOT NULL CHECK",
+        "ATTEMPT_COUNT INTEGER NOT NULL DEFAULT 0 CHECK",
+        "CHECK(",
+        "LEASE_TOKEN IS NOT NULL",
+        "LEASE_TOKEN IS NULL",
+    )
+    if any(fragment not in sql for fragment in required_fragments):
+        raise DiscoveryUnavailable("incompatible discovery schema: constraint contract mismatch")
+    indexes = connection.execute("PRAGMA index_list(discovery_jobs)").fetchall()
+    names = {row[1] for row in indexes}
+    if "discovery_jobs_ready_idx" not in names:
+        raise DiscoveryUnavailable("incompatible discovery schema: ready index missing")
+    ready = connection.execute("PRAGMA index_info(discovery_jobs_ready_idx)").fetchall()
+    if [row[2] for row in sorted(ready, key=lambda row: row[0])] != [
+        "state",
+        "available_at",
+        "created_at",
+        "job_id",
+    ]:
+        raise DiscoveryUnavailable("incompatible discovery schema: ready index mismatch")
+    lease_index = next(
+        (row for row in indexes if row[1] == "discovery_jobs_processing_lease_idx"), None
+    )
+    if lease_index is None or lease_index[2] != 1:
+        raise DiscoveryUnavailable("incompatible discovery schema: lease index missing")
+    lease_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'discovery_jobs_processing_lease_idx'"
+    ).fetchone()[0]
+    lease_columns = connection.execute(
+        "PRAGMA index_info(discovery_jobs_processing_lease_idx)"
+    ).fetchall()
+    if [row[2] for row in lease_columns] != [
+        "lease_token"
+    ] or "WHERE LEASE_TOKEN IS NOT NULL" not in lease_sql.upper():
+        raise DiscoveryUnavailable("incompatible discovery schema: lease index mismatch")
+    probe_candidate = DiscoveryCandidate(
+        stage="schema-probe",
+        project="probe",
+        filename="probe-1.0.tar.gz",
+        sha256="a" * 64,
+        link_href="https://example.invalid/probe-1.0.tar.gz",
+    )
+    probe_payload = _candidate_payload(probe_candidate)
+    probe_job_id = _job_id(probe_candidate)
+    probe_timestamp = "2026-01-01T00:00:00+00:00"
+    probe_values = (
+        probe_job_id,
+        probe_payload,
+        "PENDING",
+        0,
+        probe_timestamp,
+        None,
+        None,
+        None,
+        None,
+        probe_timestamp,
+        probe_timestamp,
+    )
+    probe_sql = """
+        INSERT INTO discovery_jobs(
+            job_id, candidate_json, state, attempt_count, available_at,
+            lease_owner, lease_expires_at, lease_token, last_error,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    connection.execute("SAVEPOINT discovery_schema_probe")
+    try:
+        probes = (
+            ("invalid state", (*probe_values[:2], "BROKEN", *probe_values[3:])),
+            ("negative attempt", (*probe_values[:3], -1, *probe_values[4:])),
+            ("pending lease", (*probe_values[:5], "worker", None, "token", *probe_values[8:])),
+            (
+                "processing lease",
+                (
+                    *probe_values[:2],
+                    "PROCESSING",
+                    0,
+                    probe_timestamp,
+                    "worker",
+                    None,
+                    None,
+                    None,
+                    probe_timestamp,
+                    probe_timestamp,
+                ),
+            ),
+        )
+        for label, values in probes:
+            try:
+                connection.execute(probe_sql, values)
+            except sqlite3.IntegrityError:
+                continue
+            raise DiscoveryUnavailable(f"incompatible discovery schema: {label} constraint missing")
+        valid_processing = (
+            *probe_values[:2],
+            "PROCESSING",
+            0,
+            probe_timestamp,
+            "worker",
+            probe_timestamp,
+            "token",
+            None,
+            probe_timestamp,
+            probe_timestamp,
+        )
+        connection.execute(probe_sql, valid_processing)
+        duplicate_processing = (*valid_processing[:7], "token", *valid_processing[8:])
+        try:
+            connection.execute(probe_sql, duplicate_processing)
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise DiscoveryUnavailable(
+                "incompatible discovery schema: lease token uniqueness missing"
+            )
+    finally:
+        connection.execute("ROLLBACK TO discovery_schema_probe")
+        connection.execute("RELEASE discovery_schema_probe")
+
+
+def _canonical_timestamp(value: object, field_name: str) -> datetime:
+    if type(value) is not str:
+        raise ValueError(f"invalid {field_name}")
+    parsed = require_utc(datetime.fromisoformat(value), field_name)
+    if parsed.isoformat() != value:
+        raise ValueError(f"invalid canonical {field_name}")
+    return parsed
+
+
+def _validate_pending_row(row: sqlite3.Row) -> DiscoveryCandidate:
+    job_id = row["job_id"]
+    if type(job_id) is not str or re.fullmatch(r"[0-9a-f]{64}", job_id) is None:
+        raise ValueError("invalid discovery job_id")
+    candidate_json = row["candidate_json"]
+    if type(candidate_json) is not str:
+        raise ValueError("invalid candidate_json")
+    data = json.loads(candidate_json)
+    if type(data) is not dict or set(data) != {
+        "stage",
+        "project",
+        "filename",
+        "sha256",
+        "link_href",
+    }:
+        raise ValueError("invalid candidate fields")
+    if any(type(value) is not str for value in data.values()):
+        raise ValueError("invalid candidate scalar types")
+    candidate = DiscoveryCandidate(**data)
+    if _candidate_payload(candidate) != candidate_json or _job_id(candidate) != job_id:
+        raise ValueError("candidate identity does not match job_id")
+    if row["state"] != "PENDING":
+        raise ValueError("invalid pending state")
+    if type(row["attempt_count"]) is not int or row["attempt_count"] < 0:
+        raise ValueError("invalid attempt_count")
+    _canonical_timestamp(row["available_at"], "available_at")
+    _canonical_timestamp(row["created_at"], "created_at")
+    _canonical_timestamp(row["updated_at"], "updated_at")
+    if (
+        row["lease_owner"] is not None
+        or row["lease_expires_at"] is not None
+        or row["lease_token"] is not None
+    ):
+        raise ValueError("invalid pending lease state")
+    last_error = row["last_error"]
+    if last_error is not None and (type(last_error) is not str or len(last_error) > 4096):
+        raise ValueError("invalid last_error")
+    return candidate
+
+
 class FileDiscoverySink:
     """SQLite-backed discovery queue kept under the supplied directory.
 
@@ -135,7 +334,7 @@ class FileDiscoverySink:
     def _initialize(self) -> None:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 existing = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery_jobs'"
                 ).fetchone()
@@ -175,6 +374,8 @@ class FileDiscoverySink:
                     );
                     CREATE INDEX IF NOT EXISTS discovery_jobs_ready_idx
                     ON discovery_jobs(state, available_at, created_at, job_id);
+                    CREATE UNIQUE INDEX IF NOT EXISTS discovery_jobs_processing_lease_idx
+                    ON discovery_jobs(lease_token) WHERE lease_token IS NOT NULL;
                     """
                 )
                 columns = {
@@ -185,6 +386,7 @@ class FileDiscoverySink:
                     raise DiscoveryUnavailable(
                         "incompatible discovery schema; missing columns: " + ", ".join(missing)
                     )
+                _validate_catalog(connection)
         except (OSError, sqlite3.Error) as exc:
             raise DiscoveryUnavailable(str(self.path)) from exc
 
@@ -197,9 +399,15 @@ class FileDiscoverySink:
     @contextmanager
     def _write(self):
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                yield connection
+                try:
+                    yield connection
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    connection.commit()
         except DiscoveryUnavailable:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -266,39 +474,53 @@ class FileDiscoverySink:
         lease = lease_value.isoformat()
         lease_token = secrets.token_hex(32)
         with self._write() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
-                SELECT job_id, candidate_json, attempt_count
+                SELECT *
                 FROM discovery_jobs
-                WHERE state = 'PENDING' AND available_at <= ?
-                ORDER BY available_at, created_at, job_id
-                LIMIT 1
-                """,
-                (now,),
-            ).fetchone()
-            if row is None:
-                return None
-            attempt_count = row["attempt_count"] + 1
-            cursor = connection.execute(
+                WHERE state = 'PENDING'
+                ORDER BY created_at, job_id
                 """
-                UPDATE discovery_jobs
-                SET state = 'PROCESSING', attempt_count = ?, lease_owner = ?,
-                    lease_expires_at = ?, lease_token = ?, last_error = NULL, updated_at = ?
-                WHERE job_id = ? AND state = 'PENDING'
-                """,
-                (attempt_count, worker_id, lease, lease_token, now, row["job_id"]),
-            )
-            if cursor.rowcount != 1:
-                raise DiscoveryUnavailable("discovery job could not be claimed")
-            data = json.loads(row["candidate_json"])
-            return DiscoveryClaim(
-                job_id=row["job_id"],
-                candidate=DiscoveryCandidate(**data),
-                worker_id=worker_id,
-                attempt_count=attempt_count,
-                lease_expires_at=lease_value,
-                lease_token=lease_token,
-            )
+            ).fetchall()
+            for row in rows:
+                try:
+                    candidate = _validate_pending_row(row)
+                    if _canonical_timestamp(row["available_at"], "available_at") > now_value:
+                        continue
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+                    diagnostic = f"discovery row invalid: {type(error).__name__}: {error}"[:4096]
+                    connection.execute(
+                        """
+                        UPDATE discovery_jobs
+                        SET state = 'FAILED', lease_owner = NULL,
+                            lease_expires_at = NULL, lease_token = NULL,
+                            last_error = ?, updated_at = ?
+                        WHERE job_id = ? AND state = 'PENDING'
+                        """,
+                        (diagnostic, now, row["job_id"]),
+                    )
+                    continue
+                attempt_count = row["attempt_count"] + 1
+                cursor = connection.execute(
+                    """
+                    UPDATE discovery_jobs
+                    SET state = 'PROCESSING', attempt_count = ?, lease_owner = ?,
+                        lease_expires_at = ?, lease_token = ?, last_error = NULL, updated_at = ?
+                    WHERE job_id = ? AND state = 'PENDING'
+                    """,
+                    (attempt_count, worker_id, lease, lease_token, now, row["job_id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise DiscoveryUnavailable("discovery job could not be claimed")
+                return DiscoveryClaim(
+                    job_id=row["job_id"],
+                    candidate=candidate,
+                    worker_id=worker_id,
+                    attempt_count=attempt_count,
+                    lease_expires_at=lease_value,
+                    lease_token=lease_token,
+                )
+            return None
 
     def complete(self, claim: DiscoveryClaim) -> None:
         self._finish(claim, state="COMPLETED", error=None)
@@ -370,7 +592,7 @@ class FileDiscoverySink:
         if state not in _ALL_STATES:
             raise ValueError("invalid discovery state")
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection:
                 return connection.execute(
                     "SELECT COUNT(*) FROM discovery_jobs WHERE state = ?",
                     (state,),

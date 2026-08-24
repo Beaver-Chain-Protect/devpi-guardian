@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -63,6 +64,7 @@ def build_analysis_engine(
         bytes_source=bytes_source,
         analyzer_version=analyzer_version,
         limits=limits,
+        owns_bytes_source=True,
     )
 
 
@@ -83,6 +85,7 @@ class GuardianAnalysisEngine:
         baseline_analyzer: BaselineAnalyzer = compare_release_to_baseline,
         install_surface_analyzer: InstallSurfaceAnalyzer = scan_install_surface_isolated,
         sdist_wheel_analyzer: SdistWheelAnalyzer = compare_sdist_wheel_isolated,
+        owns_bytes_source: bool = False,
     ) -> None:
         if not analyzer_version.strip():
             raise ValueError("analyzer_version must not be blank")
@@ -93,31 +96,100 @@ class GuardianAnalysisEngine:
         self._baseline_analyzer = baseline_analyzer
         self._install_surface_analyzer = install_surface_analyzer
         self._sdist_wheel_analyzer = sdist_wheel_analyzer
+        self._owns_bytes_source = owns_bytes_source
+        self._source_closed = False
+
+    def close(self) -> None:
+        if self._source_closed:
+            return
+        self._source_closed = True
+        if self._owns_bytes_source:
+            self._bytes_source.close()
+
+    def __enter__(self) -> GuardianAnalysisEngine:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.close()
+        return False
 
     def analyze(self, bundle: AnalysisBundle) -> AnalysisReport:
         """Analyze one verified artifact through one worker-facing call."""
 
         workspace = TemporaryDirectory(prefix="guardian-analysis-")
+
+        def cleanup() -> list[tuple[str, BaseException]]:
+            errors: list[tuple[str, BaseException]] = []
+            try:
+                workspace.cleanup()
+            except BaseException as error:
+                errors.append(("analysis workspace cleanup", error))
+            if self._owns_bytes_source:
+                try:
+                    self._bytes_source.close()
+                except BaseException as error:
+                    errors.append(("baseline source cleanup", error))
+            return errors
+
         try:
             paths = self._materialize(bundle, Path(workspace.name))
-            return self._analyze_paths(bundle, paths)
-        finally:
-            workspace.cleanup()
+            report = self._analyze_paths(bundle, paths)
+        except BaseException as primary:
+            for label, cleanup_error in cleanup():
+                primary.add_note(f"{label} failed: {type(cleanup_error).__name__}: {cleanup_error}")
+            raise
+        else:
+            cleanup_errors = cleanup()
+            if cleanup_errors:
+                (_first_label, first), *additional = cleanup_errors
+                for label, cleanup_error in additional:
+                    first.add_note(
+                        f"additional {label} failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise first
+            return report
 
     @staticmethod
     def _materialize(bundle: AnalysisBundle, workspace: Path) -> dict[int, Path]:
         """Copy owned streams to private, short-lived files for legacy analyzers."""
         paths: dict[int, Path] = {}
+        identities: dict[int, tuple[str, str, str, str, str, int]] = {}
         artifacts = (bundle.target, bundle.same_release_sdist, bundle.same_release_wheel)
         for index, artifact in enumerate(item for item in artifacts if item is not None):
             stream_id = id(artifact._stream)
+            identity = (
+                artifact.stage,
+                artifact.project,
+                artifact.version,
+                artifact.filename,
+                artifact.sha256,
+                artifact.size_bytes,
+            )
+            previous = identities.get(stream_id)
+            if previous is not None and previous != identity:
+                raise ValueError("shared stream has conflicting artifact identity")
+            identities[stream_id] = identity
             if stream_id in paths:
                 continue
             suffix = "".join(Path(artifact.filename).suffixes)
             destination = workspace / f"artifact-{index}{suffix}"
             with artifact.open_for_analysis() as source, destination.open("wb") as output:
-                while chunk := source.read(1024 * 1024):
+                digest = hashlib.sha256()
+                total = 0
+                while total <= artifact.size_bytes:
+                    chunk = source.read(min(1024 * 1024, artifact.size_bytes - total + 1))
+                    if not chunk:
+                        break
+                    if total + len(chunk) > artifact.size_bytes:
+                        raise ValueError("artifact stream exceeds declared size")
                     output.write(chunk)
+                    digest.update(chunk)
+                    total += len(chunk)
+                if total != artifact.size_bytes:
+                    raise ValueError("artifact stream is shorter than declared size")
+                if digest.hexdigest() != artifact.sha256:
+                    raise ValueError("artifact stream digest does not match metadata")
             paths[stream_id] = destination
         return paths
 

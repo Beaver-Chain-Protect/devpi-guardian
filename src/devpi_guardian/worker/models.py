@@ -101,8 +101,17 @@ class _RewoundOwnedStream(AbstractContextManager[BinaryIO]):
         self._stream.seek(0)
         return self._stream
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self._stream.close()
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            self._stream.close()
+        except BaseException as cleanup_error:
+            if exc_value is not None:
+                exc_value.add_note(
+                    f"stream cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                return False
+            raise
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +130,12 @@ class AnalysisBundle:
             if artifact is None or id(artifact._stream) in self._closed_streams:
                 continue
             self._closed_streams.add(id(artifact._stream))
-            if not getattr(artifact._stream, "closed", False):
+            try:
+                already_closed = artifact._stream.closed
+            except BaseException as error:
+                errors.append(error)
+                already_closed = False
+            if not already_closed:
                 try:
                     artifact._stream.close()
                 except BaseException as error:

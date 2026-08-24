@@ -384,6 +384,131 @@ def test_worker_finally_closes_all_bundle_streams_after_analyzer_failure(tmp_pat
     assert counterpart_stream.closed
 
 
+def test_worker_closes_bundle_before_recording_verdict(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = artifact(tmp_path)
+
+    class OrderedStore(Store):
+        def record_verdict(self, claim, verdict, evidence):
+            assert target._stream.closed
+            super().record_verdict(claim, verdict, evidence)
+
+    store = OrderedStore(make_claim(now))
+    report = AnalysisReport(
+        analyzer_version="analyzers-1",
+        has_baseline=False,
+        baseline_sha256=None,
+        baseline_tier=None,
+        evidence=(),
+        steps=(AnalysisStep("F7", "skipped"),),
+    )
+    worker = QuarantineWorker(
+        store=store,
+        preparer=Preparer(AnalysisBundle(target=target)),
+        analysis_engine=Engine(report),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    assert worker.run_once().status is WorkerCycleStatus.COMPLETED
+
+
+def test_worker_cleanup_failure_prevents_recording_and_marks_error(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = FailingCloseStream(b"wheel")
+    verified = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0-py3-none-any.whl",
+        sha256=SHA256,
+        size_bytes=5,
+        _stream=target,
+    )
+    report = AnalysisReport(
+        analyzer_version="analyzers-1",
+        has_baseline=False,
+        baseline_sha256=None,
+        baseline_tier=None,
+        evidence=(),
+        steps=(AnalysisStep("F7", "skipped"),),
+    )
+    store = Store(make_claim(now))
+    worker = QuarantineWorker(
+        store=store,
+        preparer=Preparer(AnalysisBundle(target=verified)),
+        analysis_engine=Engine(report),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    result = worker.run_once()
+
+    assert result.status is WorkerCycleStatus.ERROR
+    assert store.recorded == []
+    assert "close failed" in store.errors[0][1]
+
+
+def test_worker_preserves_analysis_error_when_cleanup_also_fails(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = FailingCloseStream(b"wheel")
+    verified = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0-py3-none-any.whl",
+        sha256=SHA256,
+        size_bytes=5,
+        _stream=target,
+    )
+    store = Store(make_claim(now))
+
+    class BrokenEngine:
+        def analyze(self, bundle):
+            raise ValueError("analysis primary")
+
+    worker = QuarantineWorker(
+        store=store,
+        preparer=Preparer(AnalysisBundle(target=verified)),
+        analysis_engine=BrokenEngine(),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    result = worker.run_once()
+
+    assert result.status is WorkerCycleStatus.ERROR
+    assert store.errors[0][1].startswith("ValueError: analysis primary")
+
+
+def test_worker_surfaces_primary_when_mark_error_fails(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = artifact(tmp_path)
+
+    class BrokenStore(Store):
+        def mark_analysis_error(self, claim, error):
+            raise RuntimeError("mark failed")
+
+    class BrokenEngine:
+        def analyze(self, bundle):
+            raise ValueError("analysis primary")
+
+    worker = QuarantineWorker(
+        store=BrokenStore(make_claim(now)),
+        preparer=Preparer(AnalysisBundle(target=target)),
+        analysis_engine=BrokenEngine(),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    with pytest.raises(ValueError, match="analysis primary"):
+        worker.run_once()
+
+
 def test_worker_closes_bundle_when_analyzer_raises(tmp_path) -> None:
     now = datetime(2026, 8, 21, tzinfo=UTC)
     target = artifact(tmp_path)

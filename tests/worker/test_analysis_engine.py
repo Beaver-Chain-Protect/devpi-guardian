@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,8 +18,8 @@ def verified(path: Path, filename: str, sha256: str) -> VerifiedArtifact:
         project="demo",
         version="1.0.0",
         filename=filename,
-        sha256=sha256,
-        size_bytes=8,
+        sha256=hashlib.sha256(b"artifact").hexdigest(),
+        size_bytes=len(b"artifact"),
         _stream=BytesIO(b"artifact"),
     )
 
@@ -267,6 +268,180 @@ def test_verified_artifact_preserves_validation_error_when_close_lookup_fails() 
         )
     assert "stage" in str(raised.value)
     assert any("cleanup lookup failed" in note for note in raised.value.__notes__)
+
+
+def test_analysis_scope_preserves_body_error_when_close_fails() -> None:
+    stream = CloseFailStream(b"artifact", "scope cleanup")
+    artifact = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0.tar.gz",
+        sha256="a" * 64,
+        size_bytes=8,
+        _stream=stream,
+    )
+
+    with (
+        pytest.raises(ValueError, match="body failure") as raised,
+        artifact.open_for_analysis() as opened,
+    ):
+        opened.read()
+        raise ValueError("body failure")
+    assert any("scope cleanup" in note for note in raised.value.__notes__)
+
+
+def _valid_stream_artifact(payload: bytes, *, filename: str = "demo-1.0.0.whl") -> VerifiedArtifact:
+    return VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename=filename,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size_bytes=len(payload),
+        _stream=BytesIO(payload),
+    )
+
+
+def _materialization_engine(calls: list[Path]):
+    def baseline(*args, **kwargs):
+        calls.append(Path(args[1]))
+        return SimpleNamespace(
+            has_baseline=False,
+            baseline_sha256=None,
+            selection=None,
+            findings=(),
+        )
+
+    return GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=object(),
+        analyzer_version="analyzers-1",
+        baseline_analyzer=baseline,
+        install_surface_analyzer=lambda path, *, limits: calls.append(Path(path)) or [],
+        sdist_wheel_analyzer=lambda *args, **kwargs: pytest.fail("F9 must be skipped"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "size", "sha256"),
+    [
+        (b"artifact-plus", 8, hashlib.sha256(b"artifact-plus").hexdigest()),
+        (b"short", 8, hashlib.sha256(b"short").hexdigest()),
+        (b"artifact", 8, "b" * 64),
+    ],
+)
+def test_materialization_rejects_excess_short_or_mismatched_digest(payload, size, sha256) -> None:
+    stream = BytesIO(payload)
+    artifact = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0.whl",
+        sha256=sha256,
+        size_bytes=size,
+        _stream=stream,
+    )
+    calls: list[Path] = []
+
+    with pytest.raises(ValueError):
+        _materialization_engine(calls).analyze(AnalysisBundle(target=artifact))
+    assert calls == []
+    assert stream.closed
+
+
+def test_materialization_accepts_exact_bytes_and_closes_stream() -> None:
+    payload = b"artifact"
+    artifact = _valid_stream_artifact(payload)
+    calls: list[Path] = []
+
+    report = _materialization_engine(calls).analyze(AnalysisBundle(target=artifact))
+
+    assert report.steps[0].status == "skipped"
+    assert len(calls) == 2
+    assert artifact._stream.closed
+
+
+def test_shared_stream_conflicting_identity_fails_before_analyzers() -> None:
+    payload = b"artifact"
+    stream = BytesIO(payload)
+    first = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="demo-1.0.0.whl",
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size_bytes=len(payload),
+        _stream=stream,
+    )
+    second = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0.0",
+        filename="other-1.0.0.whl",
+        sha256=first.sha256,
+        size_bytes=first.size_bytes,
+        _stream=stream,
+    )
+    calls: list[Path] = []
+
+    with pytest.raises(ValueError, match="shared stream"):
+        _materialization_engine(calls).analyze(
+            AnalysisBundle(target=first, same_release_wheel=second)
+        )
+    assert calls == []
+    assert first._stream.closed
+    assert stream.closed
+
+
+class TrackingBytesSource:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_owned_bytes_source_closes_after_each_analysis_and_explicit_close() -> None:
+    source = TrackingBytesSource()
+    calls: list[Path] = []
+    engine = GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=source,
+        analyzer_version="analyzers-1",
+        owns_bytes_source=True,
+        baseline_analyzer=lambda *args, **kwargs: SimpleNamespace(
+            has_baseline=False, baseline_sha256=None, selection=None, findings=()
+        ),
+        install_surface_analyzer=lambda path, *, limits: calls.append(Path(path)) or [],
+        sdist_wheel_analyzer=lambda *args, **kwargs: pytest.fail("F9 must be skipped"),
+    )
+
+    engine.analyze(AnalysisBundle(target=_valid_stream_artifact(b"artifact")))
+    engine.analyze(AnalysisBundle(target=_valid_stream_artifact(b"artifact")))
+    engine.close()
+    engine.close()
+
+    assert source.close_calls == 3
+
+
+def test_injected_bytes_source_is_not_closed_unless_owned() -> None:
+    source = TrackingBytesSource()
+    engine = GuardianAnalysisEngine(
+        lookup=object(),
+        bytes_source=source,
+        analyzer_version="analyzers-1",
+        baseline_analyzer=lambda *args, **kwargs: SimpleNamespace(
+            has_baseline=False, baseline_sha256=None, selection=None, findings=()
+        ),
+        install_surface_analyzer=lambda path, *, limits: [],
+        sdist_wheel_analyzer=lambda *args, **kwargs: pytest.fail("F9 must be skipped"),
+    )
+
+    engine.analyze(AnalysisBundle(target=_valid_stream_artifact(b"artifact")))
+    engine.close()
+
+    assert source.close_calls == 0
 
 
 def test_verified_artifact_preserves_validation_error_when_cleanup_fails() -> None:

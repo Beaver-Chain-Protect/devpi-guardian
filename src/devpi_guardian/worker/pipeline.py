@@ -134,13 +134,26 @@ class QuarantineWorker:
                         },
                     ),
                 )
+            bundle.close()
+            bundle = None
             self._store.record_verdict(claim, verdict, evidence)
-        except Exception as exc:
-            message = f"{type(exc).__name__}: {str(exc)[:512]}"
-            self._store.mark_analysis_error(claim, message)
-            return WorkerCycle(WorkerCycleStatus.ERROR, claim.sha256)
-        finally:
+        except BaseException as primary:
             if bundle is not None:
-                bundle.close()
+                try:
+                    bundle.close()
+                except BaseException as cleanup_error:
+                    primary.add_note(
+                        f"bundle cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            notes = getattr(primary, "__notes__", ())
+            message = "; ".join([f"{type(primary).__name__}: {str(primary)[:512]}", *notes])[:4096]
+            try:
+                self._store.mark_analysis_error(claim, message)
+            except BaseException as mark_error:
+                primary.add_note(
+                    f"mark_analysis_error failed: {type(mark_error).__name__}: {mark_error}"
+                )
+                raise primary from mark_error
+            return WorkerCycle(WorkerCycleStatus.ERROR, claim.sha256)
 
         return WorkerCycle(WorkerCycleStatus.COMPLETED, claim.sha256)

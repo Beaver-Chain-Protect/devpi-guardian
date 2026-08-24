@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -242,3 +243,77 @@ def test_discovery_rejects_any_incomplete_preexisting_schema(tmp_path, missing) 
 
     with pytest.raises(DiscoveryUnavailable, match=rf"incompatible.*{missing}"):
         FileDiscoverySink(tmp_path)
+
+
+def test_discovery_rejects_constraintless_catalog(tmp_path) -> None:
+    columns = (
+        "job_id TEXT, candidate_json TEXT, state TEXT, attempt_count INTEGER, "
+        "available_at TEXT, lease_owner TEXT, lease_expires_at TEXT, lease_token TEXT, "
+        "last_error TEXT, created_at TEXT, updated_at TEXT"
+    )
+    with sqlite3.connect(tmp_path / "discovery.db") as connection:
+        connection.execute(f"CREATE TABLE discovery_jobs ({columns})")
+        connection.commit()
+
+    with pytest.raises(DiscoveryUnavailable, match="incompatible"):
+        FileDiscoverySink(tmp_path)
+
+
+def test_discovery_catalog_has_ready_and_unique_lease_indexes(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    with sqlite3.connect(sink.path) as connection:
+        indexes = connection.execute("PRAGMA index_list(discovery_jobs)").fetchall()
+        names = {row[1] for row in indexes}
+    assert "discovery_jobs_ready_idx" in names
+    assert "discovery_jobs_processing_lease_idx" in names
+    assert any(row[2] == 1 for row in indexes if row[1] == "discovery_jobs_processing_lease_idx")
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("candidate_json", "not-json"),
+        ("available_at", "not-a-time"),
+        ("attempt_count", -1),
+        ("lease_owner", "unexpected-owner"),
+    ],
+)
+def test_corrupt_head_is_failed_and_valid_job_can_be_claimed(tmp_path, column, value) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    corrupt = candidate(project="aaa")
+    sink.discover(corrupt)
+    sink.discover(candidate(project="valid"))
+    with sqlite3.connect(sink.path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            f"UPDATE discovery_jobs SET {column} = ? WHERE job_id = ?",
+            (value, _job_id_for_test(corrupt)),
+        )
+        connection.execute(
+            "UPDATE discovery_jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+            ("2026-08-23T01:02:03+00:00", "2026-08-23T01:02:03+00:00", _job_id_for_test(corrupt)),
+        )
+        connection.commit()
+
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+
+    assert claim is not None
+    assert claim.candidate.project == "valid"
+    assert sink.count("FAILED") == 1
+
+
+def _job_id_for_test(item: DiscoveryCandidate) -> str:
+    payload = json.dumps(
+        {
+            "filename": item.filename,
+            "link_href": item.link_href,
+            "project": item.project,
+            "sha256": item.sha256,
+            "stage": item.stage,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    import hashlib
+
+    return hashlib.sha256(payload.encode()).hexdigest()
