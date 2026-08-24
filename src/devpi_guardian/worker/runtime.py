@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from threading import Lock
 
 from .adapters import VerdictReaderCandidateSource
 from .analysis import build_analysis_engine
@@ -52,18 +54,64 @@ class WorkerCoordinator:
 class GuardianWorkerThread:
     """devpi ThreadPool-compatible polling runner."""
 
-    def __init__(self, coordinator: WorkerCoordinator, *, poll_interval: float = 0.25) -> None:
+    def __init__(
+        self,
+        coordinator: WorkerCoordinator,
+        *,
+        poll_interval: float = 0.25,
+        shutdown: Callable[[], None] | None = None,
+    ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
         self._coordinator = coordinator
         self._poll_interval = poll_interval
+        self._shutdown = shutdown
+        self._health_lock = Lock()
+        self._started_at: datetime | None = None
+        self._last_cycle_at: datetime | None = None
+        self._last_error: str | None = None
+        self._cycles = 0
+        self._completed = 0
+
+    def worker_health(self) -> dict[str, object]:
+        with self._health_lock:
+            thread = getattr(self, "thread", None)
+            alive = bool(thread is not None and getattr(thread, "is_alive", lambda: False)())
+            return {
+                "status": "running" if alive else "registered",
+                "started_at": self._started_at,
+                "last_cycle_at": self._last_cycle_at,
+                "last_error": self._last_error,
+                "cycles": self._cycles,
+                "completed": self._completed,
+            }
 
     def thread_run(self) -> None:
+        with self._health_lock:
+            self._started_at = datetime.now(UTC)
         self._coordinator.recover_expired_claims()
         while True:
-            cycle = self._coordinator.run_once()
+            try:
+                cycle = self._coordinator.run_once()
+            except Exception as exc:
+                with self._health_lock:
+                    self._last_cycle_at = datetime.now(UTC)
+                    self._last_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+                    self._cycles += 1
+                self.thread.sleep(self._poll_interval)
+                continue
+            with self._health_lock:
+                self._last_cycle_at = datetime.now(UTC)
+                self._last_error = None
+                self._cycles += 1
+                if cycle.status is not CoordinatorStatus.IDLE:
+                    self._completed += 1
             if cycle.status is CoordinatorStatus.IDLE:
                 self.thread.sleep(self._poll_interval)
+
+    def thread_shutdown(self) -> None:
+        if self._shutdown is not None:
+            self._shutdown()
 
 
 def build_worker_thread(
@@ -119,4 +167,5 @@ def build_worker_thread(
     return GuardianWorkerThread(
         WorkerCoordinator(discovery=discovery, analysis=analysis),
         poll_interval=poll_interval,
+        shutdown=getattr(baseline_http_session, "close", None),
     )

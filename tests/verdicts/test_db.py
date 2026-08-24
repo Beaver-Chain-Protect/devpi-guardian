@@ -68,6 +68,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "evidence",
         "manual_overrides",
         "audit_events",
+        "baseline_overrides",
     }
     expected_triggers = {
         "artifacts_identity_immutable",
@@ -90,6 +91,8 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "audit_events_chain_insert_guard",
         "audit_events_update_guard",
         "audit_events_delete_guard",
+        "baseline_overrides_history_update_guard",
+        "baseline_overrides_history_delete_guard",
     }
     assert expected_tables <= tables
     assert {
@@ -98,7 +101,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "audit_events_event_hash_unique_idx",
     } <= indexes
     assert triggers == expected_triggers
-    assert version == 4
+    assert version == 5
 
 
 def test_connection_enables_required_pragmas(tmp_path) -> None:
@@ -401,7 +404,7 @@ def test_migrate_rejects_v1_without_schema(tmp_path) -> None:
 
 def test_migrate_rejects_future_schema_version(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
-    _seed_schema_version(factory.path, 4)
+    _seed_schema_version(factory.path, 6)
 
     with pytest.raises(MigrationError):
         migrate(factory)
@@ -509,7 +512,7 @@ def test_migrate_v3_to_v4_preserves_data(tmp_path) -> None:
         audit_table = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2, 3, 4]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5]
     assert tuple(row) == (
         "a" * 64,
         42,
@@ -552,7 +555,7 @@ def test_migrate_v3_to_v4_failure_rolls_back_and_retry_succeeds(
             connection.execute(
                 "SELECT MAX(version) FROM schema_migrations",
             ).fetchone()
-        ) == (4,)
+        ) == (5,)
 
 
 def _seed_legacy_v1_verdict(path: Path) -> tuple[str, str]:
@@ -700,7 +703,7 @@ def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2, 3, 4]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -751,7 +754,7 @@ def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2, 3, 4]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -816,7 +819,7 @@ def test_migrate_upgrades_v1_and_preserves_unclassified_legacy_baseline(
             "SELECT baseline_sha256, baseline_tier FROM verdicts",
         ).fetchone()
 
-    assert [version[0] for version in versions] == [1, 2, 3, 4]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5]
     assert tuple(row) == ("b" * 64, None)
 
 

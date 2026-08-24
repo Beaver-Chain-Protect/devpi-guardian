@@ -88,6 +88,23 @@ class AnalysisStep:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalysisFileDiff:
+    """Persistable F7 path delta for the F11 diff endpoint."""
+
+    added: tuple[str, ...]
+    changed: tuple[str, ...]
+    removed: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for field_name in ("added", "changed", "removed"):
+            value = getattr(self, field_name)
+            if not isinstance(value, tuple) or not all(
+                isinstance(item, str) and item.strip() for item in value
+            ):
+                raise ValueError(f"{field_name} must be a tuple of nonblank paths")
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisReport:
     """Combined F7/F8/F9 evidence passed to the policy engine."""
 
@@ -97,8 +114,11 @@ class AnalysisReport:
     baseline_tier: str | None
     evidence: tuple[AnalysisEvidence, ...]
     steps: tuple[AnalysisStep, ...]
+    file_diff: AnalysisFileDiff | None = None
 
     def __post_init__(self) -> None:
         _required(self.analyzer_version, "analyzer_version")
         if self.baseline_sha256 is not None:
             validate_sha256(self.baseline_sha256)
+        if self.file_diff is not None and type(self.file_diff) is not AnalysisFileDiff:
+            raise ValueError("file_diff must be an AnalysisFileDiff")

@@ -24,6 +24,7 @@ from devpi_guardian.baseline import (
 from .models import (
     AnalysisBundle,
     AnalysisEvidence,
+    AnalysisFileDiff,
     AnalysisReport,
     AnalysisStatus,
     AnalysisStep,
@@ -143,6 +144,7 @@ class GuardianAnalysisEngine:
             )
             steps.append(AnalysisStep("F9", _status(f9_findings)))
 
+        baseline_diff = getattr(comparison, "diff", None)
         return AnalysisReport(
             analyzer_version=self._analyzer_version,
             has_baseline=comparison.has_baseline,
@@ -150,6 +152,15 @@ class GuardianAnalysisEngine:
             baseline_tier=tier,
             evidence=tuple(evidence),
             steps=tuple(steps),
+            file_diff=(
+                None
+                if baseline_diff is None
+                else AnalysisFileDiff(
+                    added=baseline_diff.files.added,
+                    changed=baseline_diff.files.changed,
+                    removed=baseline_diff.files.removed,
+                )
+            ),
         )
 
     @staticmethod

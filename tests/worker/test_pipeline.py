@@ -8,6 +8,7 @@ from devpi_guardian.verdicts.models import ClaimedArtifact, Decision, VerdictInp
 from devpi_guardian.worker.models import (
     AnalysisBundle,
     AnalysisEvidence,
+    AnalysisFileDiff,
     AnalysisReport,
     AnalysisStep,
     VerifiedArtifact,
@@ -136,6 +137,11 @@ def test_worker_runs_one_analysis_and_records_attributed_evidence(tmp_path) -> N
             ),
         ),
         steps=(AnalysisStep("F7", "completed"),),
+        file_diff=AnalysisFileDiff(
+            added=("demo/new.py",),
+            changed=("demo/update.py",),
+            removed=(),
+        ),
     )
     store = Store(make_claim(now))
     preparer = Preparer(bundle)
@@ -159,7 +165,7 @@ def test_worker_runs_one_analysis_and_records_attributed_evidence(tmp_path) -> N
     assert len(store.recorded) == 1
     _, verdict, evidence = store.recorded[0]
     assert verdict.decision is Decision.REVIEW
-    assert len(evidence) == 1
+    assert len(evidence) == 2
     assert evidence[0].rule_id == "credential_to_network"
     assert evidence[0].details == {
         "analyzer": "F7",
@@ -169,6 +175,15 @@ def test_worker_runs_one_analysis_and_records_attributed_evidence(tmp_path) -> N
         "sink": "requests.post",
         "snippet": "requests.post(secret)",
         "source": "os.environ",
+    }
+    assert evidence[1].rule_id == "baseline_file_diff"
+    assert evidence[1].action is Decision.ALLOW
+    assert evidence[1].details == {
+        "analyzer": "F7",
+        "kind": "file_diff",
+        "added": ("demo/new.py",),
+        "changed": ("demo/update.py",),
+        "removed": (),
     }
     assert store.errors == []
 

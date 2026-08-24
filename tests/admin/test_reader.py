@@ -78,7 +78,7 @@ def test_reader_returns_details_release_and_evidence(tmp_path) -> None:
     assert details.releases[0].project == "demo"
     assert details.evidence[0].rule_id == "new_network"
     assert details.evidence[0].details == {"host": "example.test"}
-    assert reader.health() == {"database": "ok", "schema_version": 4}
+    assert reader.health() == {"database": "ok", "schema_version": 5}
 
 
 def test_reader_detail_raises_for_missing_artifact(tmp_path) -> None:

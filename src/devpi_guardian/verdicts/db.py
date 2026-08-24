@@ -15,6 +15,7 @@ _MIGRATION_FILES = (
     "002_baseline_tier.sql",
     "003_artifact_cooldown.sql",
     "004_audit_events.sql",
+    "005_baseline_overrides.sql",
 )
 _SUPPORTED_SCHEMA_VERSION = len(_MIGRATION_FILES)
 _CATALOG_QUERY = """

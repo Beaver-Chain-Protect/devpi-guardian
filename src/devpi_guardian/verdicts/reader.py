@@ -352,6 +352,23 @@ class SQLiteVerdictReader:
                         requested,
                         as_of,
                     )
+                    placeholders = ", ".join("?" for _ in requested)
+                    baseline_rows = connection.execute(
+                        f"""
+                        SELECT sha256, enabled FROM baseline_overrides
+                        WHERE is_current = 1 AND sha256 IN ({placeholders})
+                        ORDER BY id
+                        """,
+                        requested,
+                    ).fetchall()
+                    baseline_enabled: dict[str, bool] = {}
+                    for row in baseline_rows:
+                        digest = validate_sha256(row["sha256"])
+                        if digest in baseline_enabled or row["enabled"] not in (0, 1):
+                            raise PersistedStateCorruption(
+                                "invalid current baseline override",
+                            )
+                        baseline_enabled[digest] = bool(row["enabled"])
                     missing_state = ArtifactState.MISSING
                     for mapping in mappings:
                         decision = decisions[mapping.sha256]
@@ -360,7 +377,7 @@ class SQLiteVerdictReader:
                             raise PersistedStateCorruption(
                                 message,
                             )
-                        if decision.allowed:
+                        if decision.allowed and baseline_enabled.get(mapping.sha256, True):
                             results.append(mapping)
         except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc

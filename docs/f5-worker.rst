@@ -177,9 +177,16 @@ sdist files have the best chance to be available together for F9.
 
 The function deliberately requires an already composed F4 store.  F4 requires
 the real F12 ``AuditWriter`` for transactional state and audit changes, so F5
-does not install a no-op audit implementation.  Plugin startup can register the
-returned thread after the F10 implementation and F12 writer factories are
-available.
+does not install a no-op audit implementation.  Plugin startup now composes the
+SQLite store, F12 writer, F10 engine and analysis engine, then registers the
+runner with devpi's thread pool.  Replicas do not start an analysis runner.
+
+The operational settings are ``--guardian-base-url``,
+``--guardian-quarantine-root``, ``--guardian-cooldown-hours`` and
+``--guardian-worker-poll-interval``.  Defaults keep quarantine storage beside
+``guardian.db``, use a 24-hour cooldown, and poll at 0.25 seconds.  The F11
+health response reports runner state, queue counts, Artifact-state counts,
+cycle totals and the most recent worker error.
 
 Current verification
 --------------------
@@ -195,4 +202,5 @@ enforcement::
    uv run ruff check src/devpi_guardian/worker tests/worker
    uv run flake8 src/devpi_guardian/worker tests/worker
 
-The 2026-08-24 integration run completed with 1,358 passing tests.
+The 2026-08-25 production-composition integration run completed with 1,471
+passing tests before the final packaging verification.

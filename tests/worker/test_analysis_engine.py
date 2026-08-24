@@ -45,6 +45,13 @@ def test_engine_exposes_one_call_and_keeps_f7_f8_f9_attribution(tmp_path) -> Non
             has_baseline=True,
             baseline_sha256="c" * 64,
             selection=SimpleNamespace(tier="same_tag"),
+            diff=SimpleNamespace(
+                files=SimpleNamespace(
+                    added=("demo/new.py",),
+                    changed=("demo/core.py",),
+                    removed=(),
+                )
+            ),
             findings=((finding("f7_rule"), "diff_changed"),),
         )
 
@@ -70,6 +77,9 @@ def test_engine_exposes_one_call_and_keeps_f7_f8_f9_attribution(tmp_path) -> Non
     )
 
     assert [item.analyzer for item in report.evidence] == ["F7", "F8", "F9"]
+    assert report.file_diff is not None
+    assert report.file_diff.added == ("demo/new.py",)
+    assert report.file_diff.changed == ("demo/core.py",)
     assert [item.finding.rule for item in report.evidence] == [
         "f7_rule",
         "f8_rule",

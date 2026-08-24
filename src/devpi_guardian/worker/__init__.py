@@ -20,6 +20,7 @@ from .discovery_consumer import (
 from .models import (
     AnalysisBundle,
     AnalysisEvidence,
+    AnalysisFileDiff,
     AnalysisReport,
     AnalysisStep,
     ArtifactCandidate,
@@ -33,6 +34,7 @@ from .runtime import GuardianWorkerThread, WorkerCoordinator, build_worker_threa
 __all__ = [
     "AnalysisBundle",
     "AnalysisEvidence",
+    "AnalysisFileDiff",
     "AnalysisReport",
     "AnalysisStep",
     "ArtifactCandidate",

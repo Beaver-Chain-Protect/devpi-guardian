@@ -68,3 +68,25 @@ def test_thread_runner_sleeps_only_when_no_work_is_available() -> None:
         runner.thread_run()
 
     assert runner.thread.sleeps == [0.25]
+
+
+def test_thread_runner_reports_health_and_closes_session() -> None:
+    from devpi_guardian.worker.runtime import GuardianWorkerThread
+
+    coordinator = Cycles(SimpleNamespace(status=CoordinatorStatus.IDLE))
+    closed = []
+    runner = GuardianWorkerThread(
+        coordinator,
+        poll_interval=0.25,
+        shutdown=lambda: closed.append(True),
+    )
+
+    class RegisteredThread:
+        def is_alive(self):
+            return False
+
+    runner.thread = RegisteredThread()
+
+    assert runner.worker_health()["status"] == "registered"
+    runner.thread_shutdown()
+    assert closed == [True]

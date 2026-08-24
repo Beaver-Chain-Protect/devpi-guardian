@@ -56,6 +56,15 @@ class FakePyramidConfig:
         self.views.append((view, kwargs))
 
 
+class FakeThreadPool:
+    def __init__(self):
+        self.objects = []
+
+    def register(self, obj):
+        obj.thread = SimpleNamespace(is_alive=lambda: False)
+        self.objects.append(obj)
+
+
 def test_package_exposes_devpi_server_entry_point() -> None:
     matches = [
         entry_point
@@ -132,17 +141,17 @@ def test_parser_exposes_guardian_db_option() -> None:
 
     devpiserver_add_parser_options(parser)
 
-    assert parser.calls == [
-        (
-            ("--guardian-db",),
-            {
-                "action": "store",
-                "dest": "guardian_db",
-                "default": None,
-                "help": help_text,
-            },
-        )
-    ]
+    options = {args[0]: kwargs for args, kwargs in parser.calls}
+    assert options["--guardian-db"] == {
+        "action": "store",
+        "dest": "guardian_db",
+        "default": None,
+        "help": help_text,
+    }
+    assert options["--guardian-base-url"]["default"] is None
+    assert options["--guardian-quarantine-root"]["default"] is None
+    assert options["--guardian-cooldown-hours"]["default"] == 24.0
+    assert options["--guardian-worker-poll-interval"]["default"] == 0.25
 
 
 def test_pyramid_hook_migrates_and_registers_reader_and_tween(
@@ -183,14 +192,23 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert metrics.snapshot() == {}
     assert pyramid.registry[ADMIN_SERVICE_REGISTRY_KEY].health() == {
         "database": "ok",
-        "schema_version": 4,
+        "schema_version": 5,
         "mutations_ready": True,
-        "worker": {"status": "unavailable"},
+        "worker": {
+            "status": "not_registered",
+            "queue": {
+                "pending": 0,
+                "processing": 0,
+                "completed": 0,
+                "failed": 0,
+            },
+            "artifacts": {},
+        },
         "features": {
-            "audit": False,
-            "artifact_diff": False,
-            "baseline": False,
-            "policy": False,
+            "audit": True,
+            "artifact_diff": True,
+            "baseline": True,
+            "policy": True,
         },
     }
     assert len(pyramid.routes) == 14
@@ -222,10 +240,40 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert (tmp_path / "guardian.db").exists()
     with sqlite3.connect(tmp_path / "guardian.db") as connection:
         migration_query = "SELECT MAX(version) FROM schema_migrations"
-        assert connection.execute(migration_query).fetchone() == (4,)
+        assert connection.execute(migration_query).fetchone() == (5,)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)
+
+
+def test_pyramid_hook_registers_production_worker_when_thread_pool_exists(tmp_path) -> None:
+    pyramid = FakePyramidConfig()
+    pyramid.xom.thread_pool = FakeThreadPool()
+    config = SimpleNamespace(
+        args=SimpleNamespace(
+            guardian_db=str(tmp_path / "guardian.db"),
+            guardian_base_url="https://devpi.test",
+            guardian_quarantine_root=str(tmp_path / "quarantine"),
+            guardian_cooldown_hours=12.0,
+            guardian_worker_poll_interval=0.5,
+        ),
+        server_path=tmp_path / "server",
+    )
+
+    devpiserver_pyramid_configure(config, pyramid)
+
+    assert len(pyramid.xom.thread_pool.objects) == 1
+    worker = pyramid.xom.thread_pool.objects[0]
+    assert worker.worker_health()["status"] == "registered"
+    health = pyramid.registry[ADMIN_SERVICE_REGISTRY_KEY].health()
+    assert health["worker"]["status"] == "registered"
+    assert health["features"] == {
+        "audit": True,
+        "artifact_diff": True,
+        "baseline": True,
+        "policy": True,
+    }
+    worker.thread_shutdown()
 
 
 @pytest.mark.parametrize(

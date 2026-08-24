@@ -116,6 +116,23 @@ class QuarantineWorker:
                     cooldown_until=completed_at + self._cooldown_duration,
                 )
             evidence = tuple(_evidence_input(item) for item in report.evidence)
+            if report.file_diff is not None:
+                evidence += (
+                    EvidenceInput(
+                        rule_id="baseline_file_diff",
+                        action=Decision.ALLOW,
+                        file_path=None,
+                        line=None,
+                        message="baseline file delta",
+                        details={
+                            "analyzer": "F7",
+                            "kind": "file_diff",
+                            "added": list(report.file_diff.added),
+                            "changed": list(report.file_diff.changed),
+                            "removed": list(report.file_diff.removed),
+                        },
+                    ),
+                )
             self._store.record_verdict(claim, verdict, evidence)
         except Exception as exc:
             message = f"{type(exc).__name__}: {str(exc)[:512]}"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations  # noqa: I001 - use devpi order
 
+from . import __version__
+from .admin.providers import ProductionAdminProviders
 from .admin.service import GuardianAdminService
 from .admin.views import ADMIN_SERVICE_REGISTRY_KEY
 from .admin.views import configure_admin_routes
@@ -10,6 +12,7 @@ from .audit import verify_audit_chain
 from .enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from .enforcement.metrics import InMemoryBlockMetricRecorder
 from .enforcement.tween import VERDICT_READER_REGISTRY_KEY
+from .policy import PolicyEngine
 from .verdicts.db import ConnectionFactory
 from .verdicts.db import migrate
 from .verdicts.errors import InvalidSha256
@@ -23,9 +26,14 @@ from .worker.discovery import DiscoveryUnavailable
 from .worker.discovery import FileDiscoverySink
 from .worker.discovery import get_discovery_sink
 from .worker.discovery import set_discovery_sink
+from .worker.runtime import build_worker_thread
+from datetime import timedelta
 from pathlib import Path
 from pluggy import HookimplMarker
 from pyramid.httpexceptions import HTTPServiceUnavailable
+import os
+import requests
+import socket
 
 server_hookimpl = HookimplMarker("devpiserver")
 _VERDICT_READER_XOM_ATTRIBUTE = "_devpi_guardian_verdict_reader"
@@ -110,6 +118,52 @@ def devpiserver_add_parser_options(parser) -> None:
         default=None,
         help="path to the persistent devpi-guardian SQLite database",
     )
+    parser.addoption(
+        "--guardian-base-url",
+        action="store",
+        dest="guardian_base_url",
+        default=None,
+        help="absolute devpi URL used to validate discovered artifact links",
+    )
+    parser.addoption(
+        "--guardian-quarantine-root",
+        action="store",
+        dest="guardian_quarantine_root",
+        default=None,
+        help="path to the persistent SHA-256 quarantine directory",
+    )
+    parser.addoption(
+        "--guardian-cooldown-hours",
+        action="store",
+        type=float,
+        dest="guardian_cooldown_hours",
+        default=24.0,
+        help="hours an automated ALLOW remains quarantined",
+    )
+    parser.addoption(
+        "--guardian-worker-poll-interval",
+        action="store",
+        type=float,
+        dest="guardian_worker_poll_interval",
+        default=0.25,
+        help="seconds between idle Guardian worker polls",
+    )
+
+
+def _worker_base_url(config) -> str:
+    configured = getattr(config.args, "guardian_base_url", None)
+    if configured is not None:
+        return configured
+    outside = getattr(config.args, "outside_url", None)
+    if outside is not None:
+        return outside
+    host = getattr(config.args, "host", "localhost") or "localhost"
+    if host in ("0.0.0.0", "::", "*"):
+        host = "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = getattr(config.args, "port", 3141) or 3141
+    return f"http://{host}:{port}"
 
 
 @server_hookimpl
@@ -130,17 +184,64 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
     reader = SQLiteVerdictReader(factory)
     discovery_sink = FileDiscoverySink(db_path.parent / "discovery")
     block_metrics = InMemoryBlockMetricRecorder()
+    policy_engine = PolicyEngine()
+    xom = pyramid_config.registry["xom"]
+    set_discovery_sink(xom, discovery_sink)
+    worker = None
+    thread_pool = getattr(xom, "thread_pool", None)
+    is_replica = getattr(xom, "is_replica", lambda: False)()
+    if thread_pool is not None and not is_replica:
+        quarantine_configured = getattr(config.args, "guardian_quarantine_root", None)
+        quarantine_root = (
+            Path(quarantine_configured)
+            if quarantine_configured is not None
+            else db_path.parent / "quarantine"
+        )
+        baseline_session = requests.Session()
+        baseline_session.headers["User-Agent"] = f"devpi-guardian/{__version__}"
+        worker = build_worker_thread(
+            xom=xom,
+            store=store,
+            reader=reader,
+            policy_engine=policy_engine,
+            baseline_http_session=baseline_session,
+            base_url=_worker_base_url(config),
+            quarantine_root=quarantine_root,
+            analyzer_version=__version__,
+            worker_id=f"{socket.gethostname()}-{os.getpid()}",
+            cooldown_duration=timedelta(
+                hours=getattr(config.args, "guardian_cooldown_hours", 24.0),
+            ),
+            poll_interval=getattr(
+                config.args,
+                "guardian_worker_poll_interval",
+                0.25,
+            ),
+        )
+        thread_pool.register(worker)
+    providers = ProductionAdminProviders(
+        factory=factory,
+        reader=reader,
+        store=store,
+        discovery=discovery_sink,
+        policy_engine=policy_engine,
+        worker=worker,
+    )
     setattr(
-        pyramid_config.registry["xom"],
+        xom,
         _VERDICT_READER_XOM_ATTRIBUTE,
         reader,
     )
-    set_discovery_sink(pyramid_config.registry["xom"], discovery_sink)
     pyramid_config.registry[VERDICT_READER_REGISTRY_KEY] = reader
     pyramid_config.registry[BLOCK_METRIC_REGISTRY_KEY] = block_metrics
     pyramid_config.registry[ADMIN_SERVICE_REGISTRY_KEY] = GuardianAdminService(
         reader=reader,
         store=store,
+        worker_health_reader=providers,
+        audit_reader=providers,
+        diff_reader=providers,
+        baseline_manager=providers,
+        policy_manager=providers,
     )
     configure_admin_routes(pyramid_config)
     pyramid_config.add_tween(

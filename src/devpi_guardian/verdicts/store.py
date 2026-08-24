@@ -361,6 +361,89 @@ class SQLiteArtifactStore:
             ),
         )
 
+    def set_baseline_eligibility(
+        self,
+        sha256: str,
+        *,
+        enabled: bool,
+        actor: str,
+        reason: str,
+    ) -> None:
+        """Enable or exclude an Artifact as an F6 trusted baseline.
+
+        This changes baseline eligibility only.  It never changes the
+        Artifact's install decision or cooldown window.
+        """
+
+        canonical = validate_sha256(sha256)
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a bool")
+        actor = _require_stored_string(actor, "actor")
+        reason = _require_stored_string(reason, "reason")
+
+        with self._write() as connection:
+            operation_at = require_utc(
+                _require_datetime(self._now(), "now"),
+                "now",
+            )
+            _artifact, _override, context = self._administrator_context(
+                connection,
+                canonical,
+                operation_at,
+            )
+            if enabled and not (
+                context.effective_decision is Decision.ALLOW and context.cooldown_finished
+            ):
+                raise TransitionConflict("baseline must be an effective, cooldown-finished ALLOW")
+
+            current_rows = connection.execute(
+                """
+                SELECT id, enabled FROM baseline_overrides
+                WHERE sha256 = ? AND is_current = 1
+                ORDER BY id LIMIT 2
+                """,
+                (canonical,),
+            ).fetchall()
+            if len(current_rows) > 1:
+                raise TransitionConflict("multiple current baseline overrides")
+            if current_rows and bool(current_rows[0]["enabled"]) is enabled:
+                return
+            if current_rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE baseline_overrides SET is_current = 0
+                    WHERE id = ? AND is_current = 1
+                    """,
+                    (current_rows[0]["id"],),
+                )
+                if cursor.rowcount != 1:
+                    raise TransitionConflict("baseline override update failed")
+
+            created_at = operation_at.isoformat()
+            inserted = connection.execute(
+                """
+                INSERT INTO baseline_overrides(
+                    sha256, enabled, actor, reason, created_at, is_current
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (canonical, int(enabled), actor, reason, created_at),
+            )
+            if inserted.rowcount != 1:
+                raise TransitionConflict("baseline override insert failed")
+
+            self._audit(
+                connection,
+                actor=actor,
+                action="baseline.added" if enabled else "baseline.removed",
+                sha256=canonical,
+                reason=reason,
+                previous=context.effective_decision,
+                new=context.effective_decision,
+                policy_version=context.policy_version,
+                analyzer_version=context.analyzer_version,
+                occurred_at=operation_at,
+            )
+
     def discover_artifact(
         self,
         artifact: ArtifactInput,

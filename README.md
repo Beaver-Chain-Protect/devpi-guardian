@@ -393,6 +393,23 @@ serving with an unvalidated database.
 
 ## Operations and security
 
+The plugin composes and registers the F5 worker automatically on a primary
+devpi server.  F11's audit, Artifact diff, baseline, policy simulation and
+worker-health providers use the same SQLite reader/store, F10 policy engine,
+F12 audit writer and discovery queue as enforcement.  Baseline removal changes
+only F6 eligibility; it does not silently block an otherwise allowed Artifact.
+Every baseline eligibility change is stored as append-only history and recorded
+in the audit hash chain.
+
+The F11 routes remain protected by devpi's root-context ``user_modify``
+permission.  Configure ``--restrict-modify`` to delegate administration.  The
+CLI continues to use the REST API and never edits ``guardian.db`` directly.
+
+Worker defaults can be changed with ``--guardian-base-url``,
+``--guardian-quarantine-root``, ``--guardian-cooldown-hours`` and
+``--guardian-worker-poll-interval``.  Keep the quarantine directory on a
+persistent volume with the verdict database.
+
 - During P0 first initialization, exactly one startup/migration owner must run
   `migrate` before readiness. Do not concurrently start multiple Guardian devpi
   instances against an empty database. After the owner is ready, later starts
