@@ -41,6 +41,10 @@ BASELINE_SHA256 = "b" * 64
 MISSING_SHA256 = "c" * 64
 
 
+class DerivedTier(str):
+    pass
+
+
 def verdict(**changes: Any) -> VerdictInput:
     values = {
         "sha256": SHA256,
@@ -49,6 +53,7 @@ def verdict(**changes: Any) -> VerdictInput:
         "policy_version": "policy-1",
         "analyzer_version": "analyzer-1",
         "baseline_sha256": None,
+        "baseline_tier": None,
         "created_at": NOW,
     }
     values.update(changes)
@@ -77,6 +82,7 @@ def unchecked_verdict(**changes: Any) -> VerdictInput:
         "policy_version": valid.policy_version,
         "analyzer_version": valid.analyzer_version,
         "baseline_sha256": valid.baseline_sha256,
+        "baseline_tier": valid.baseline_tier,
         "created_at": valid.created_at,
     }
     values.update(changes)
@@ -582,9 +588,14 @@ def test_record_verdict_preserves_history_and_replaces_only_current_marker(
     ]
 
 
-def test_record_verdict_accepts_existing_baseline_foreign_key(
+@pytest.mark.parametrize(
+    "baseline_tier",
+    ["same_tag", "universal_wheel", "sdist"],
+)
+def test_record_verdict_persists_existing_baseline_foreign_key(
     tmp_path,
     audit_writer,
+    baseline_tier,
 ) -> None:
     store, claim = prepare_scanning(tmp_path, audit_writer)
     store.discover_artifact(
@@ -599,12 +610,15 @@ def test_record_verdict_accepts_existing_baseline_foreign_key(
 
     store.record_verdict(
         claim,
-        verdict(baseline_sha256=BASELINE_SHA256),
+        verdict(baseline_sha256=BASELINE_SHA256, baseline_tier=baseline_tier),
         (),
     )
 
-    row = fetchall(store, "SELECT baseline_sha256 FROM verdicts")[0]
-    assert row[0] == BASELINE_SHA256
+    row = fetchall(
+        store,
+        "SELECT baseline_sha256, baseline_tier FROM verdicts",
+    )[0]
+    assert tuple(row) == (BASELINE_SHA256, baseline_tier)
 
 
 def test_record_verdict_rejects_missing_baseline_without_changes(
@@ -616,7 +630,7 @@ def test_record_verdict_rejects_missing_baseline_without_changes(
     with pytest.raises(ArtifactNotFound):
         store.record_verdict(
             claim,
-            verdict(baseline_sha256=BASELINE_SHA256),
+            verdict(baseline_sha256=BASELINE_SHA256, baseline_tier="same_tag"),
             (),
         )
 
@@ -720,6 +734,23 @@ def test_record_verdict_rejects_claim_verdict_sha_mismatch_before_connecting(
         ({"analyzer_version": None}, ValueError),
         ({"analyzer_version": "a" * 4097}, ValueError),
         ({"baseline_sha256": "invalid"}, InvalidSha256),
+        ({"baseline_tier": "same_tag"}, ValueError),
+        ({"baseline_sha256": BASELINE_SHA256}, ValueError),
+        (
+            {"baseline_sha256": BASELINE_SHA256, "baseline_tier": "unknown"},
+            ValueError,
+        ),
+        (
+            {"baseline_sha256": BASELINE_SHA256, "baseline_tier": 1},
+            ValueError,
+        ),
+        (
+            {
+                "baseline_sha256": BASELINE_SHA256,
+                "baseline_tier": DerivedTier("same_tag"),
+            },
+            ValueError,
+        ),
         ({"created_at": NOW.replace(tzinfo=None)}, ValueError),
         ({"created_at": "2026-08-17"}, ValueError),
     ],

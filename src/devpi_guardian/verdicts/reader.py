@@ -89,7 +89,7 @@ class SQLiteVerdictReader:
                 f"""
                 SELECT id, sha256, decision, score,
                        policy_version, analyzer_version,
-                       baseline_sha256, is_current, created_at
+                       baseline_sha256, is_current, created_at, baseline_tier
                 FROM (
                     SELECT v.*,
                         ROW_NUMBER() OVER (

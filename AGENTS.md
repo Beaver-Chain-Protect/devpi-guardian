@@ -5,7 +5,10 @@ This file applies to the entire repository.
 ## Authoritative inputs
 
 - Approved design: `docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md`
+- Approved baseline-tier extension:
+  `docs/superpowers/specs/2026-08-21-verdict-baseline-tier-design.md`
 - Execution plan: `docs/superpowers/plans/2026-08-17-f3-f4-enforcement-verdict-store.md`
+- The baseline-tier extension takes precedence only for the `baseline_tier` contract.
 - If code, plan, and design disagree, stop implementation and resolve the disagreement before proceeding.
 
 ## Agent roles

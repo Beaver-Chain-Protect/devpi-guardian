@@ -6,11 +6,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal, cast
 
 from .errors import InvalidSha256
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
+BaselineTier = Literal["same_tag", "universal_wheel", "sdist"]
+_BASELINE_TIERS = frozenset(("same_tag", "universal_wheel", "sdist"))
 
 
 class _FrozenList(tuple[Any, ...]):
@@ -123,6 +125,12 @@ def validate_sha256(value: str) -> str:
     return value
 
 
+def validate_baseline_tier(value: object) -> BaselineTier:
+    if type(value) is not str or value not in _BASELINE_TIERS:
+        raise ValueError("invalid baseline_tier")
+    return cast(BaselineTier, value)
+
+
 def require_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
@@ -198,6 +206,7 @@ class VerdictInput:
     policy_version: str
     analyzer_version: str
     baseline_sha256: str | None
+    baseline_tier: BaselineTier | None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
@@ -206,6 +215,11 @@ class VerdictInput:
         object.__setattr__(self, "score", _normalize_score(self.score))
         if self.baseline_sha256 is not None:
             validate_sha256(self.baseline_sha256)
+        if (self.baseline_sha256 is None) != (self.baseline_tier is None):
+            message = "baseline_sha256 and baseline_tier must be paired"
+            raise ValueError(message)
+        if self.baseline_tier is not None:
+            validate_baseline_tier(self.baseline_tier)
         versions = self.policy_version.strip(), self.analyzer_version.strip()
         if not all(versions):
             message = "policy_version and analyzer_version"
