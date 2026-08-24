@@ -22,6 +22,7 @@ MAX_UNCOMPRESSED_SIZE = 1_000_000_000
 MAX_COMPRESSION_RATIO = 100.0
 MAX_MEMBERS = 10_000
 _COPY_CHUNK_SIZE = 1024 * 1024
+_TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar", ".tar.bz2", ".tar.xz", ".tbz2", ".txz")
 _WINDOWS_RESERVED_NAMES = frozenset(
     {
         "con",
@@ -423,7 +424,7 @@ def extract_artifact(artifact_path: str | os.PathLike[str], destination: Path) -
                         False,
                     )
                 _extract_zip(archive, members, destination)
-        elif path.name.lower().endswith((".tar.gz", ".tgz", ".tar")):
+        elif path.name.lower().endswith(_TAR_SUFFIXES):
             with tarfile.open(path, mode="r:*") as archive:
                 members, findings = _preflight_tar(
                     archive, destination, path.name, path.stat().st_size
@@ -441,7 +442,9 @@ def extract_artifact(artifact_path: str | os.PathLike[str], destination: Path) -
                 else:
                     _extract_tar_manually(archive, members, destination)
         else:
-            raise ValueError("지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar 입니다")
+            raise ValueError(
+                "지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar.bz2/.tar.xz/.tbz2/.txz 입니다"
+            )
 
         files = tuple(sorted(member.relative_path for member in members if not member.is_directory))
         executable_files = frozenset(

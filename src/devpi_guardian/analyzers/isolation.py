@@ -19,6 +19,14 @@ _Analyzer = Literal["F8", "F9"]
 
 @dataclass(frozen=True)
 class AnalysisLimits:
+    """Limits for an analyzer child process and its wall-clock execution.
+
+    Isolated APIs always use a child process and timeout on every operating
+    system. ``memory_limit_mb`` is POSIX best-effort only; it is not a hard
+    guarantee on Windows or unsupported POSIX platforms. Deployments that
+    require hard memory enforcement must provide OS- or container-level limits.
+    """
+
     timeout_seconds: float = 30.0
     memory_limit_mb: int | None = 512
 
@@ -141,7 +149,7 @@ def scan_install_surface_isolated(
     *,
     limits: AnalysisLimits = _DEFAULT_LIMITS,
 ) -> list[Finding]:
-    """Run F8 in a child process with a wall-clock timeout."""
+    """Run F8 in a child process with a wall-clock timeout for untrusted input."""
 
     return _isolated("F8", (artifact_path,), limits)
 
@@ -152,6 +160,6 @@ def compare_sdist_wheel_isolated(
     *,
     limits: AnalysisLimits = _DEFAULT_LIMITS,
 ) -> list[Finding]:
-    """Run F9 in a child process with a wall-clock timeout."""
+    """Run F9 in a child process with a wall-clock timeout for untrusted input."""
 
     return _isolated("F9", (sdist_path, wheel_path), limits)

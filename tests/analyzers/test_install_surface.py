@@ -17,6 +17,37 @@ def _deny(findings):
     return [item for item in findings if item.action == "DENY"]
 
 
+@pytest.mark.parametrize(
+    ("compression", "suffix"),
+    [("w:bz2", ".tar.bz2"), ("w:xz", ".tar.xz"), ("w:bz2", ".tbz2"), ("w:xz", ".txz")],
+)
+def test_f8_recognizes_tar_compression_aliases(
+    tmp_path: Path, compression: str, suffix: str
+) -> None:
+    artifact = tmp_path / f"demo-1.0.0{suffix}"
+    with tarfile.open(artifact, compression) as archive:
+        payload = b"import subprocess\nsubprocess.run(['echo', 'blocked'])\n"
+        info = tarfile.TarInfo("demo-1.0.0/setup.py")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    findings = scan_install_surface(str(artifact))
+
+    assert "setup_py_process" in _rules(findings)
+
+
+@pytest.mark.parametrize("suffix", [".tar.bz2", ".tar.xz", ".tbz2", ".txz"])
+def test_f8_corrupt_tar_compression_alias_returns_analyzer_error(
+    tmp_path: Path, suffix: str
+) -> None:
+    artifact = tmp_path / f"broken{suffix}"
+    artifact.write_bytes(b"not a tar archive")
+
+    findings = scan_install_surface(str(artifact))
+
+    assert [item.rule for item in findings] == ["analyzer_error"]
+
+
 def test_setup_py_subprocess_is_denied(make_sdist) -> None:
     artifact = make_sdist(
         {

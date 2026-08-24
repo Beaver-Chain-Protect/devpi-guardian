@@ -1002,16 +1002,17 @@ def _artifact_kind(path: Path) -> _ArtifactKind:
     name = path.name.lower()
     if name.endswith(".whl"):
         return "wheel"
-    if name.endswith((".zip", ".tar.gz", ".tgz", ".tar")):
+    if name.endswith((".zip", ".tar.gz", ".tgz", ".tar", ".tar.bz2", ".tar.xz", ".tbz2", ".txz")):
         return "sdist"
-    raise ValueError("지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar 입니다")
+    raise ValueError("지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar.bz2/.tar.xz/.tbz2/.txz 입니다")
 
 
 def scan_install_surface(artifact_path: str) -> list[Finding]:
-    """F8. Inspect one artifact and return evidence, never a final verdict.
+    """F8 trusted direct API; inspect one artifact and return evidence only.
 
-    An empty result means "not detected by these rules", not "safe".
-    No artifact code is imported or executed.
+    Use :func:`scan_install_surface_isolated` for untrusted worker input.
+    An empty result means "not detected by these rules", not "safe". No
+    artifact code is imported or executed.
     """
 
     try:

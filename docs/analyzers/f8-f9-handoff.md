@@ -48,10 +48,21 @@ from devpi_guardian.analyzers import (
     scan_install_surface_isolated,
 )
 
-f8_findings = scan_install_surface("dist/demo-1.0.1-py3-none-any.whl")
-f9_findings = compare_sdist_wheel(
+# F5 and any worker handling untrusted artifacts MUST use the isolated APIs.
+limits = AnalysisLimits(timeout_seconds=20, memory_limit_mb=512)
+f8_findings = scan_install_surface_isolated(
+    "dist/demo-1.0.1-py3-none-any.whl", limits=limits
+)
+f9_findings = compare_sdist_wheel_isolated(
     "dist/demo-1.0.1.tar.gz",
     "dist/demo-1.0.1-py3-none-any.whl",
+    limits=limits,
+)
+
+# Direct APIs are for trusted offline tooling and unit tests only.
+trusted_f8 = scan_install_surface("dist/demo-1.0.1-py3-none-any.whl")
+trusted_f9 = compare_sdist_wheel(
+    "dist/demo-1.0.1.tar.gz", "dist/demo-1.0.1-py3-none-any.whl"
 )
 
 for finding in [*f8_findings, *f9_findings]:
@@ -69,10 +80,8 @@ report_json = dumps_report(
     artifact_sha256="0" * 64,
 )
 
-# 신뢰하지 않는 큰 입력은 별도 프로세스에서 제한 시간을 두고 검사할 수 있습니다.
-limits = AnalysisLimits(timeout_seconds=20, memory_limit_mb=512)
-f8_isolated = scan_install_surface_isolated("dist/demo.whl", limits=limits)
-f9_isolated = compare_sdist_wheel_isolated("dist/demo.tar.gz", "dist/demo.whl", limits=limits)
+# F5/워커가 신뢰하지 않는 입력을 처리할 때는 반드시 위의 isolated API만
+# 호출해야 합니다. direct API는 신뢰된 오프라인 도구와 단위 테스트 전용입니다.
 ```
 
 일반 함수는 잘못된 입력이나 손상된 artifact에 대해 예외를 노출하지 않고
@@ -84,9 +93,19 @@ JSON 보고서에는 `schema_version`, `ruleset_version`, 분석기 종류와 �
 안정적인 SHA-256 `fingerprint`는 직렬화 단계에서 생성됩니다. 함께 배포되는
 `finding-report-v1.schema.json`으로 다른 컴포넌트의 입력 형식을 검증할 수 있습니다.
 
-격리 함수는 모든 운영체제에서 하위 프로세스와 제한 시간을 사용합니다. 메모리 제한은
-POSIX 환경에서 적용되며 Windows에서는 제한 시간이 안전장치로 동작합니다. 제한 초과나
-작업 프로세스 오류는 호출자에게 예외를 던지는 대신 `analyzer_error`로 반환합니다.
+격리 함수는 모든 운영체제에서 하위 프로세스와 제한 시간을 사용합니다. `memory_limit_mb`는
+POSIX의 best-effort `RLIMIT_AS`일 뿐이며 Windows 또는 지원되지 않는 POSIX에서는 하드
+보장이 아닙니다. 하드 메모리 집행이 필요한 배포 환경은 OS 또는 컨테이너 수준의 별도
+메모리 제한을 제공해야 합니다. 제한 초과나 작업 프로세스 오류는 호출자에게 예외를
+던지는 대신 `analyzer_error`로 반환합니다.
+
+### 신뢰 경계 계약
+
+F5 및 아티팩트를 신뢰하지 않는 운영 워커 코드는 반드시
+`scan_install_surface_isolated`와 `compare_sdist_wheel_isolated`만 호출해야 합니다.
+`scan_install_surface`와 `compare_sdist_wheel` 직접 API는 신뢰된 오프라인 도구와 단위
+테스트에서만 사용합니다. 격리 API의 프로세스·시간 제한만으로 하드 메모리 격리를
+주장하지 않으며, 필요한 경우 배포 환경의 OS/컨테이너 정책을 함께 적용해야 합니다.
 
 ## 팀 연동 계약
 

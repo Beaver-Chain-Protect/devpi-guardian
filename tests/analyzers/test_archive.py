@@ -6,6 +6,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 import devpi_guardian.analyzers.archive as archive_module
 from devpi_guardian.analyzers.archive import extract_artifact
 
@@ -21,6 +23,34 @@ def test_normal_wheel_and_sdist_extract(make_wheel, make_sdist, tmp_path: Path) 
     assert sdist_result.usable and not sdist_result.findings
     assert (wheel_result.root / "demo" / "__init__.py").is_file()
     assert (sdist_result.root / "demo-1.0.0" / "demo" / "__init__.py").is_file()
+
+
+@pytest.mark.parametrize(
+    ("compression", "suffix"),
+    [("w:bz2", ".tar.bz2"), ("w:xz", ".tar.xz"), ("w:bz2", ".tbz2"), ("w:xz", ".txz")],
+)
+def test_tar_compression_aliases_extract(tmp_path: Path, compression: str, suffix: str) -> None:
+    artifact = tmp_path / f"demo-1.0.0{suffix}"
+    with tarfile.open(artifact, compression) as archive:
+        payload = b"VALUE = 1\n"
+        info = tarfile.TarInfo("demo-1.0.0/demo/__init__.py")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    result = extract_artifact(artifact, tmp_path / "out")
+
+    assert result.usable
+    assert (result.root / "demo-1.0.0" / "demo" / "__init__.py").read_bytes() == payload
+
+
+@pytest.mark.parametrize("suffix", [".tar.bz2", ".tar.xz", ".tbz2", ".txz"])
+def test_corrupt_tar_compression_alias_returns_analyzer_error(tmp_path: Path, suffix: str) -> None:
+    artifact = tmp_path / f"broken{suffix}"
+    artifact.write_bytes(b"not a tar archive")
+
+    result = extract_artifact(artifact, tmp_path / "out")
+
+    assert [item.rule for item in result.findings] == ["analyzer_error"]
 
 
 def _malicious_tar(tmp_path: Path, member: tarfile.TarInfo, data: bytes = b"x") -> Path:

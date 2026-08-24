@@ -761,8 +761,9 @@ def _compare_extracted(sdist: ExtractedArtifact, wheel: ExtractedArtifact) -> li
 
 
 def compare_sdist_wheel(sdist_path: str, wheel_path: str) -> list[Finding]:
-    """F9. Compare one same-release sdist/wheel pair and return evidence only.
+    """F9 trusted direct API; compare one pair and return evidence only.
 
+    Use :func:`compare_sdist_wheel_isolated` for untrusted worker input.
     A missing sdist deliberately skips this optional comparison and returns an
     empty list. No artifact code is imported or executed, and no exception is
     exposed to the caller.
