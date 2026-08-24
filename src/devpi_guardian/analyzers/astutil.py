@@ -1864,7 +1864,7 @@ class _OrderedTaintAnalyzer:
             return
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
-                context_origins = self._expression(item.context)
+                context_origins = self._expression(item.context_expr)
                 if item.optional_vars is not None:
                     self._assign([item.optional_vars], context_origins)
             self.state = self._run_block(node.body, self.state)

