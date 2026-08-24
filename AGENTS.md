@@ -10,6 +10,8 @@ This file applies to the entire repository.
 - Approved PR #1 hardening addendum:
   `docs/superpowers/specs/2026-08-24-pr1-safe-activation-f5-quarantine-design.md`
 - Execution plan: `docs/superpowers/plans/2026-08-17-f3-f4-enforcement-verdict-store.md`
+- PR #1 hardening execution plan:
+  `docs/superpowers/plans/2026-08-24-pr1-safe-activation-f5-quarantine.md`
 - The baseline-tier extension takes precedence only for the `baseline_tier` contract.
 - For activation support, F5 Artifact bytes, CI, and PR review status, the hardening
   addendum takes precedence over the base design.
