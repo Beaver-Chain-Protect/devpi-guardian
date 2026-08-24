@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .types import Action
 
-RULESET_VERSION = "1.2.0"
+RULESET_VERSION = "1.3.0"
 
 
 @dataclass(frozen=True)
@@ -16,12 +16,18 @@ class Rule:
 
 
 RULES: dict[str, Rule] = {
-    # F8: the fourteen installation-surface rules in SPEC-F8-F9 section 3.1.
+    # F8: installation-surface rules in SPEC-F8-F9 section 3.1 plus wheel RECORD integrity.
     "setup_py_process": Rule("DENY", "setup.py가 설치 중 외부 프로세스를 실행합니다."),
     "setup_py_network": Rule("DENY", "setup.py가 설치 중 네트워크 통신을 시도합니다."),
     "setup_py_cmdclass": Rule("DENY", "setup.py가 설치 명령을 사용자 정의 코드로 재정의합니다."),
     "setup_py_file_write": Rule("REVIEW", "setup.py가 설치 중 파일을 쓰거나 이동합니다."),
     "nonstandard_build_backend": Rule("REVIEW", "표준 허용 목록에 없는 빌드 백엔드를 사용합니다."),
+    "in_tree_build_backend": Rule(
+        "REVIEW", "프로젝트 소스 트리 안의 빌드 백엔드 경로를 사용합니다."
+    ),
+    "unsafe_backend_path": Rule(
+        "DENY", "PEP 517 빌드 백엔드 경로가 프로젝트 소스 트리 밖을 가리킵니다."
+    ),
     "unknown_build_requirement": Rule(
         "REVIEW", "알려진 빌드 도구 목록에 없는 빌드 의존성이 있습니다."
     ),
@@ -36,9 +42,22 @@ RULES: dict[str, Rule] = {
     "native_or_executable": Rule(
         "REVIEW", "네이티브 바이너리 또는 실행 권한 파일이 포함되어 있습니다."
     ),
+    "wheel_install_script": Rule(
+        "REVIEW", "wheel이 설치 시 scripts 디렉터리의 실행 파일을 설치합니다."
+    ),
+    "wheel_install_script_risky": Rule(
+        "REVIEW", "wheel 설치 스크립트에 외부 프로세스·통신·동적 실행·파일 쓰기가 있습니다."
+    ),
+    "wheel_install_script_credential_network": Rule(
+        "DENY", "wheel 설치 스크립트가 credential을 읽어 외부 통신 함수로 전달합니다."
+    ),
     "archive_unsafe_member": Rule("DENY", "아카이브에 경로 이탈·링크·특수 파일 멤버가 있습니다."),
     "archive_bomb": Rule("DENY", "아카이브가 크기·압축률·파일 수 안전 한도를 초과합니다."),
-    # F9: the six sdist/wheel mismatch rules in section 4.4.
+    "wheel_record_missing": Rule("DENY", "wheel에 정확히 하나의 dist-info/RECORD가 없습니다."),
+    "wheel_record_integrity": Rule(
+        "DENY", "wheel의 dist-info/RECORD가 파일 목록·해시·크기와 일치하지 않습니다."
+    ),
+    # F9: sdist/wheel mismatch rules in the analyzer handoff contract.
     "wheel_only_risky_python": Rule(
         "DENY",
         "sdist에는 없고 wheel에만 있는 Python 파일에 위험 동작이 있습니다.",
@@ -54,6 +73,9 @@ RULES: dict[str, Rule] = {
     "entry_point_mismatch": Rule("REVIEW", "sdist와 wheel이 서로 다른 실행 진입점을 등록합니다."),
     "python_ast_mismatch": Rule(
         "REVIEW", "같은 경로의 Python 코드가 의미 있는 AST 차이를 보입니다."
+    ),
+    "requires_dist_mismatch": Rule(
+        "REVIEW", "sdist와 wheel의 런타임 의존성(Requires-Dist)이 서로 다릅니다."
     ),
     # Defensive error reporting required by the public contract.
     "artifact_identity_mismatch": Rule(

