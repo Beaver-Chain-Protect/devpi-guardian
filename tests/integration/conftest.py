@@ -152,6 +152,7 @@ class RunningDevpi:
     client_dir: Path
     server_dir: Path
     uv_executable: str
+    allowed_test_root: Path
     mirror_artifact: MirrorArtifact | None = None
     mirror_upstream_requests: list[str] | None = None
     _server: _ServerProcess | None = field(default=None, repr=False)
@@ -251,9 +252,9 @@ class RunningDevpi:
             raise RuntimeError("devpi-server lifecycle is unavailable")
         _terminate(server)
         self._server = None
-        _remove_temporary_guardian_db(self.guardian_db)
+        _remove_temporary_guardian_db(self.guardian_db, self.allowed_test_root)
         try:
-            _start_server(
+            unexpected = _start_server(
                 self.server_dir,
                 self.guardian_db,
                 log_dir,
@@ -261,9 +262,10 @@ class RunningDevpi:
                 preferred_port=server.port,
                 log_label="expected-activation-failure",
             )
+            _terminate(unexpected)
+            raise AssertionError("devpi-server unexpectedly became ready")
         except _ServerReadinessError as error:
             return StartupFailure(str(error), error.log_path)
-        raise AssertionError("devpi-server unexpectedly became ready")
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,21 +360,36 @@ def _terminate(server: _ServerProcess) -> None:
         time.sleep(0.05)
 
 
-def _remove_temporary_guardian_db(path: Path) -> None:
+def _remove_temporary_guardian_db(path: Path, allowed_test_root: Path) -> None:
     """Delete the explicitly allocated temporary Guardian DB and sidecars."""
-    resolved = path.resolve()
-    is_guardian_db = resolved.name == "guardian.db"
-    is_guardian_directory = resolved.parent.name in {
+    root = Path(allowed_test_root).absolute()
+    lexical = Path(path).absolute()
+    is_guardian_db = lexical.name == "guardian.db"
+    is_guardian_directory = lexical.parent.name in {
         "guardian",
         "mirror-guardian",
     }
     if not is_guardian_db or not is_guardian_directory:
         raise ValueError("refusing to remove a non-test Guardian DB")
-    sidecars = (
-        resolved.with_name(resolved.name + "-wal"),
-        resolved.with_name(resolved.name + "-shm"),
+    targets = (
+        lexical,
+        lexical.with_name(lexical.name + "-wal"),
+        lexical.with_name(lexical.name + "-shm"),
     )
-    for target in (resolved, *sidecars):
+    root_resolved = root.resolve()
+    if root.is_symlink():
+        raise ValueError("refusing a symlinked test root")
+    for target in targets:
+        if not target.is_relative_to(root):
+            raise ValueError("refusing a Guardian DB outside the test root")
+        if not target.resolve().is_relative_to(root_resolved):
+            raise ValueError("refusing a Guardian DB outside the test root")
+        current = root
+        for part in target.relative_to(root).parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError("refusing symlinked Guardian storage")
+    for target in targets:
         target.unlink(missing_ok=True)
 
 
@@ -549,6 +566,7 @@ def running_devpi(tmp_path: Path) -> RunningDevpi:
         client_dir,
         server_dir,
         _executable("uv"),
+        tmp_path,
         _server=server,
         _log_dir=log_dir,
     )
@@ -590,6 +608,7 @@ def running_mirror_devpi(
             client_dir,
             server_dir,
             _executable("uv"),
+            tmp_path,
         )
         client.api("use", protected.base_url)
         client.api("login", "root", "--password=")
@@ -643,6 +662,7 @@ def running_mirror_devpi(
             client_dir,
             server_dir,
             _executable("uv"),
+            tmp_path,
             mirror_artifact,
             local_upstream.requests,
             _server=protected,

@@ -5,8 +5,11 @@ import json
 import sqlite3
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from tests.integration import conftest as integration_conftest
 
 pytestmark = pytest.mark.integration
 _SECRET_PATH = "https://user:password@example.invalid/secret?"
@@ -53,6 +56,142 @@ def _secret_wheel(tmp_path: Path) -> tuple[Path, bytes]:
 
 def _contains(path: Path, value: str) -> bool:
     return value.encode() in path.read_bytes()
+
+
+def _fake_server(tmp_path: Path, port: int) -> object:
+    return integration_conftest._ServerProcess(
+        SimpleNamespace(),
+        "http://127.0.0.1:12345",
+        port,
+        tmp_path / f"server-{port}.log",
+    )
+
+
+def test_expected_ready_server_is_terminated_before_assertion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original = _fake_server(tmp_path, 1001)
+    unexpected = _fake_server(tmp_path, 1002)
+    running = integration_conftest.RunningDevpi(
+        "http://127.0.0.1:1001",
+        tmp_path / "guardian" / "guardian.db",
+        tmp_path / "client",
+        tmp_path / "server",
+        "uv",
+        tmp_path,
+        _server=original,
+        _log_dir=tmp_path,
+    )
+    terminated: list[object] = []
+    monkeypatch.setattr(
+        integration_conftest,
+        "_terminate",
+        lambda server: terminated.append(server),
+    )
+    monkeypatch.setattr(
+        integration_conftest,
+        "_remove_temporary_guardian_db",
+        lambda path, allowed_root: None,
+    )
+    monkeypatch.setattr(
+        integration_conftest,
+        "_start_server",
+        lambda *args, **kwargs: unexpected,
+    )
+
+    with pytest.raises(AssertionError, match="unexpectedly became ready"):
+        running.reset_guardian_db_and_expect_failure()
+
+    assert terminated == [original, unexpected]
+
+
+def test_guardian_cleanup_removes_owned_database_and_sidecars(
+    tmp_path: Path,
+) -> None:
+    guardian = tmp_path / "guardian"
+    guardian.mkdir()
+    database = guardian / "guardian.db"
+    sidecars = (
+        guardian / "guardian.db-wal",
+        guardian / "guardian.db-shm",
+    )
+    for path in (database, *sidecars):
+        path.write_bytes(b"owned")
+
+    integration_conftest._remove_temporary_guardian_db(database, tmp_path)
+
+    assert all(not path.exists() for path in (database, *sidecars))
+
+
+def test_guardian_cleanup_rejects_database_outside_owned_root(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / "guardian" / "guardian.db"
+    outside.parent.mkdir()
+    outside.write_bytes(b"must survive")
+
+    with pytest.raises(ValueError):
+        integration_conftest._remove_temporary_guardian_db(outside, tmp_path)
+
+    assert outside.read_bytes() == b"must survive"
+
+
+def test_guardian_cleanup_rejects_symlinked_guardian_directory(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path.parent / "external-guardian"
+    external.mkdir()
+    outside = external / "guardian.db"
+    outside.write_bytes(b"must survive")
+    (tmp_path / "guardian").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        integration_conftest._remove_temporary_guardian_db(
+            tmp_path / "guardian" / "guardian.db",
+            tmp_path,
+        )
+
+    assert outside.read_bytes() == b"must survive"
+
+
+def test_guardian_cleanup_rejects_symlinked_database_and_sidecar(
+    tmp_path: Path,
+) -> None:
+    guardian = tmp_path / "guardian"
+    guardian.mkdir()
+    external = tmp_path.parent / "external-db"
+    external.write_bytes(b"must survive")
+    database = guardian / "guardian.db"
+    database.symlink_to(external)
+    sidecar = guardian / "guardian.db-wal"
+    sidecar.write_bytes(b"must survive")
+    (guardian / "guardian.db-shm").symlink_to(external)
+
+    with pytest.raises(ValueError):
+        integration_conftest._remove_temporary_guardian_db(database, tmp_path)
+
+    assert external.read_bytes() == b"must survive"
+    assert sidecar.read_bytes() == b"must survive"
+
+
+def test_guardian_cleanup_rejects_symlinked_sidecar_without_deleting_database(
+    tmp_path: Path,
+) -> None:
+    guardian = tmp_path / "guardian"
+    guardian.mkdir()
+    database = guardian / "guardian.db"
+    database.write_bytes(b"must survive")
+    external = tmp_path.parent / "external-sidecar"
+    external.write_bytes(b"must survive")
+    (guardian / "guardian.db-wal").symlink_to(external)
+    (guardian / "guardian.db-shm").write_bytes(b"must survive")
+
+    with pytest.raises(ValueError):
+        integration_conftest._remove_temporary_guardian_db(database, tmp_path)
+
+    assert database.read_bytes() == b"must survive"
+    assert external.read_bytes() == b"must survive"
 
 
 def test_activation_marker_survives_restart_and_legacy_reset_fails_closed(
