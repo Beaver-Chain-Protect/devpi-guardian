@@ -10,6 +10,8 @@ from devpi_guardian.plugin import devpiserver_add_parser_options
 from devpi_guardian.plugin import devpiserver_pyramid_configure
 from devpi_guardian.audit import SQLiteAuditWriter
 from devpi_guardian.audit import verify_audit_chain
+from devpi_guardian.worker.discovery import FileDiscoverySink
+from devpi_guardian.worker.discovery import get_discovery_sink
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.models import AuditEventInput, ArtifactInput, Decision
@@ -187,6 +189,9 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert len(pyramid.routes) == 7
     assert len(pyramid.views) == 7
     assert all(options["permission"] == "user_modify" for _, options in pyramid.views)
+    discovery_sink = get_discovery_sink(pyramid.xom)
+    assert isinstance(discovery_sink, FileDiscoverySink)
+    assert discovery_sink.root == tmp_path / "discovery"
     tween_prefix = "devpi_guardian.enforcement.tween."
     tween_suffix = "guardian_enforcement_tween_factory"
     tween_name = tween_prefix + tween_suffix
@@ -366,6 +371,7 @@ def test_migration_failure_has_no_registry_or_tween_side_effects(
 
     assert pyramid.registry == {"xom": pyramid.xom}
     assert not hasattr(pyramid.xom, "_devpi_guardian_verdict_reader")
+    assert not hasattr(pyramid.xom, "_devpi_guardian_discovery_sink")
     assert pyramid.tweens == []
 
 

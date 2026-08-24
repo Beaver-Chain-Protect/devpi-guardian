@@ -2,6 +2,13 @@
 
 from .adapters import VerdictReaderCandidateSource
 from .analysis import GuardianAnalysisEngine, build_analysis_engine
+from .discovery import (
+    DiscoveryCandidate,
+    DiscoverySink,
+    DiscoveryUnavailable,
+    FileDiscoverySink,
+    get_discovery_sink,
+)
 from .models import (
     AnalysisBundle,
     AnalysisEvidence,
@@ -21,6 +28,10 @@ __all__ = [
     "AnalysisStep",
     "ArtifactCandidate",
     "CandidateSource",
+    "DiscoveryCandidate",
+    "DiscoverySink",
+    "DiscoveryUnavailable",
+    "FileDiscoverySink",
     "GuardianAnalysisEngine",
     "HttpArtifactPreparer",
     "QuarantineStore",
@@ -30,4 +41,5 @@ __all__ = [
     "WorkerCycle",
     "WorkerCycleStatus",
     "build_analysis_engine",
+    "get_discovery_sink",
 ]

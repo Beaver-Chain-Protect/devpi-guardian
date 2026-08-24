@@ -73,18 +73,23 @@ as ``HttpArtifactBytesSource``'s origin resolver.  This is enforced by the
 Discovery boundary
 ------------------
 
-F1/F2 currently hide unknown links without registering them.  Request-driven
-discovery should pass raw candidate metadata to an F5 discovery sink and do
-no download or analysis in the devpi request thread.  A poller may replay
+F1/F2 currently hide unknown links without registering them.  F5 provides
+``DiscoveryCandidate``, ``FileDiscoverySink``, and ``get_discovery_sink(xom)``
+for the request-driven handoff.  The sink writes immutable JSON metadata jobs
+under ``<guardian-db-parent>/discovery/pending`` and performs no download or
+analysis in the devpi request thread.  Distinct release mappings sharing one
+SHA-256 remain separate jobs, while an identical notification is idempotent.
+
+The discovery message intentionally omits size and version.  The F5 discovery
+consumer will resolve the relative link, parse the filename, download into
+content-addressed quarantine storage, and verify both SHA-256 and size before
+calling F4's existing ``discover_artifact`` method.  F4's immutable size
+contract therefore does not need to change.  F1/F2 still needs to call the
+registered sink for ``DecisionSource.MISSING`` results.  A poller may replay
 configured base Simple pages to recover missed notifications.
 
-Request-driven registration still requires F1/F2 and F4 to settle two details:
-
-* whether the discovery message may omit size until F5 verifies the bytes;
-* which non-blocking discovery sink F1/F2 calls from the Simple request path.
-
 Claim-time metadata lookup and same-release pairing are implemented.  Unknown
-links remain hidden while request-driven registration is being connected.
+links remain hidden while the F1/F2 call site is being connected.
 
 Lease and retry boundary
 ------------------------
