@@ -319,6 +319,74 @@ def test_reader_exposes_release_and_health_admin_apis(tmp_path) -> None:
     assert reader.health() == {"database": "ok", "schema_version": 6}
 
 
+@pytest.mark.parametrize("corruption", ["missing-verdict", "negative-size", "cooldown-window"])
+def test_list_quarantine_fails_closed_for_corrupt_state(tmp_path, corruption) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=None if corruption == "missing-verdict" else (Decision.REVIEW, "policy-1"),
+    )
+    with closing(factory.connect()) as connection, connection:
+        if corruption == "negative-size":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute("DROP TRIGGER artifacts_identity_immutable")
+            connection.execute(
+                "UPDATE artifacts SET size_bytes = -1 WHERE sha256 = ?",
+                (SHA_REVIEW,),
+            )
+        elif corruption == "cooldown-window":
+            connection.execute("DROP TRIGGER artifacts_cooldown_update_guard")
+            connection.execute(
+                "UPDATE artifacts SET cooldown_started_at = ? WHERE sha256 = ?",
+                (NOW.isoformat(), SHA_REVIEW),
+            )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(StoreUnavailable):
+        reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=10, offset=0)
+
+
+def test_quarantine_pagination_order_and_artifact_details_include_evidence(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    shas = ["d" * 64, "e" * 64, "f" * 64]
+    for sha256 in shas:
+        seed_artifact(
+            factory,
+            sha256,
+            ArtifactState.REVIEW,
+            automated=(Decision.REVIEW, "policy-1"),
+        )
+    with closing(factory.connect()) as connection, connection:
+        verdict_id = connection.execute(
+            "SELECT id FROM verdicts WHERE sha256 = ?",
+            (shas[0],),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO evidence(
+                verdict_id, rule_id, action, file_path, line, message, details_json
+            ) VALUES (?, 'rule-1', 'REVIEW', 'pkg/mod.py', 4, 'review', '{}')
+            """,
+            (verdict_id,),
+        )
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    page = reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=1, offset=1)
+
+    assert page.total == 3
+    assert page.limit == 1
+    assert page.offset == 1
+    assert [item.sha256 for item in page.items] == [shas[1]]
+    details = reader.get_artifact_details(shas[0])
+    assert details.summary.state is ArtifactState.REVIEW
+    assert details.evidence[0].rule_id == "rule-1"
+    assert details.evidence[0].message == "review"
+
+
 def test_list_allowed_releases_returns_all_mappings_in_deterministic_order(
     tmp_path,
 ) -> None:

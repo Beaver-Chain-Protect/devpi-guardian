@@ -84,11 +84,29 @@ def unchecked_verdict(**changes: Any) -> VerdictInput:
         "baseline_sha256": valid.baseline_sha256,
         "baseline_tier": valid.baseline_tier,
         "created_at": valid.created_at,
+        "cooldown_until": valid.cooldown_until,
     }
     values.update(changes)
     value = object.__new__(VerdictInput)
     for field_name, field_value in values.items():
         object.__setattr__(value, field_name, field_value)
+    return value
+
+
+def unchecked_verdict_without_cooldown_slot() -> VerdictInput:
+    valid = verdict()
+    value = object.__new__(VerdictInput)
+    for field_name in (
+        "sha256",
+        "decision",
+        "score",
+        "policy_version",
+        "analyzer_version",
+        "baseline_sha256",
+        "baseline_tier",
+        "created_at",
+    ):
+        object.__setattr__(value, field_name, getattr(valid, field_name))
     return value
 
 
@@ -811,6 +829,25 @@ def test_record_verdict_requires_exact_verdict_dto_before_connecting(
 
     with pytest.raises(ValueError, match="VerdictInput"):
         store.record_verdict(claim_input(), object(), ())
+
+
+def test_record_verdict_rejects_forged_dto_missing_cooldown_slot(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+
+    with pytest.raises(ValueError, match="VerdictInput missing required fields"):
+        store.record_verdict(
+            claim_input(),
+            unchecked_verdict_without_cooldown_slot(),
+            (),
+        )
+
+    assert audit_writer.events == []
 
 
 @pytest.mark.parametrize("bad_evidence", [None, "text", b"bytes", 123])

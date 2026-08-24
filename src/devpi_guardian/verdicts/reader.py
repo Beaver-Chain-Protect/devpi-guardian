@@ -93,12 +93,15 @@ class SQLiteVerdictReader:
             raise ValueError("offset must be non-negative")
         values = tuple(dict.fromkeys(state.value for state in states))
         placeholders = ", ".join("?" for _ in values)
+        as_of = require_utc(self._now(), "now")
         try:
             with self._read_transaction() as connection:
                 total = connection.execute(
                     f"SELECT COUNT(*) FROM artifacts WHERE state IN ({placeholders})",
                     values,
                 ).fetchone()[0]
+                if type(total) is not int or total < 0:
+                    raise PersistedStateCorruption("invalid quarantine total")
                 rows = connection.execute(
                     f"""
                     SELECT sha256, size_bytes, state, discovered_at, updated_at,
@@ -110,6 +113,8 @@ class SQLiteVerdictReader:
                     """,
                     (*values, limit, offset),
                 ).fetchall()
+                requested = [row["sha256"] for row in rows]
+                self._read_effective_decisions(connection, requested, as_of)
                 items = tuple(self._admin_summary(row) for row in rows)
         except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
             raise StoreUnavailable(str(self._factory.path)) from exc
@@ -187,11 +192,21 @@ class SQLiteVerdictReader:
 
     @classmethod
     def _admin_summary(cls, row: sqlite3.Row) -> ArtifactAdminSummary:
+        size_bytes = row["size_bytes"]
+        if type(size_bytes) is not int or not 0 <= size_bytes <= 2**63 - 1:
+            raise PersistedStateCorruption("invalid persisted artifact size")
+        state = ArtifactState(row["state"])
+        last_error = row["last_error"]
+        if state is ArtifactState.ERROR:
+            if type(last_error) is not str or len(last_error) > 4096 or "\x00" in last_error:
+                raise PersistedStateCorruption("invalid persisted last_error")
+        elif last_error is not None:
+            raise PersistedStateCorruption("invalid persisted last_error")
         cooldown = row["cooldown_until"]
         return ArtifactAdminSummary(
             sha256=validate_sha256(row["sha256"]),
-            size_bytes=row["size_bytes"],
-            state=ArtifactState(row["state"]),
+            size_bytes=size_bytes,
+            state=state,
             discovered_at=cls._timestamp(row["discovered_at"], "discovered_at"),
             updated_at=cls._timestamp(row["updated_at"], "updated_at"),
             cooldown_until=None if cooldown is None else cls._timestamp(cooldown, "cooldown_until"),

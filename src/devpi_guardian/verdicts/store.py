@@ -742,7 +742,7 @@ class SQLiteArtifactStore:
                 "created_at",
             )
             created_at = created_at_value.isoformat()
-            cooldown_until_value = getattr(verdict, "cooldown_until", None)
+            cooldown_until_value = verdict.cooldown_until
         except AttributeError:
             message = "VerdictInput missing required fields"
             raise ValueError(message) from None

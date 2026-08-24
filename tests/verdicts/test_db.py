@@ -155,6 +155,38 @@ def test_guardian_activation_row_is_immutable(tmp_path) -> None:
             connection.execute("DELETE FROM guardian_activation")
 
 
+def test_migrate_applied_v3_preserves_guardian_activation_row(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    with closing(sqlite3.connect(factory.path)) as connection, connection:
+        connection.executescript(
+            "\n".join(_packaged_migration_sql(version) for version in (1, 2, 3))
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, "2026-08-24T00:00:00+00:00") for version in (1, 2, 3)),
+        )
+        connection.execute(
+            """
+            INSERT INTO guardian_activation(
+                singleton, devpi_uuid, activated_at, activation_version
+            ) VALUES (1, 'v3-uuid', '2026-08-24T00:00:00+00:00', 1)
+            """
+        )
+
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        activation = connection.execute(
+            "SELECT singleton, devpi_uuid, activated_at, activation_version "
+            "FROM guardian_activation"
+        ).fetchone()
+    assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+    assert tuple(activation) == (1, "v3-uuid", "2026-08-24T00:00:00+00:00", 1)
+
+
 def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
     tmp_path,
     monkeypatch,
