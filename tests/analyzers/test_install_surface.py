@@ -48,6 +48,19 @@ def test_f8_corrupt_tar_compression_alias_returns_analyzer_error(
     assert [item.rule for item in findings] == ["analyzer_error"]
 
 
+def test_f8_unsupported_format_error_lists_all_tar_extensions(tmp_path: Path) -> None:
+    artifact = tmp_path / "unsupported.bin"
+    artifact.write_bytes(b"not an archive")
+
+    findings = scan_install_surface(str(artifact))
+
+    assert [item.rule for item in findings] == ["analyzer_error"]
+    assert (
+        "지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar/.tar.bz2/.tar.xz/.tbz2/.txz 입니다"
+        in findings[0].snippet
+    )
+
+
 def test_setup_py_subprocess_is_denied(make_sdist) -> None:
     artifact = make_sdist(
         {

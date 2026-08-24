@@ -36,6 +36,17 @@ from .types import Action, Finding, make_finding, sort_findings
 _NATIVE_SUFFIXES = (".so", ".dll", ".dylib", ".exe")
 _CMDCLASS_KEYS = frozenset({"install", "develop", "build_py"})
 _ArtifactKind = Literal["wheel", "sdist"]
+_SDIST_SUFFIXES = (
+    ".zip",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tbz2",
+    ".txz",
+)
+_SUPPORTED_SUFFIXES = (".whl", *_SDIST_SUFFIXES)
 _RECORD_CHUNK_SIZE = 1024 * 1024
 _RECORD_SIGNATURE_NAMES = frozenset({"RECORD.jws", "RECORD.p7s"})
 _RECORD_SIZE_RE = re.compile(r"[0-9]+\Z")
@@ -1002,9 +1013,9 @@ def _artifact_kind(path: Path) -> _ArtifactKind:
     name = path.name.lower()
     if name.endswith(".whl"):
         return "wheel"
-    if name.endswith((".zip", ".tar.gz", ".tgz", ".tar", ".tar.bz2", ".tar.xz", ".tbz2", ".txz")):
+    if name.endswith(_SDIST_SUFFIXES):
         return "sdist"
-    raise ValueError("지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar.bz2/.tar.xz/.tbz2/.txz 입니다")
+    raise ValueError(f"지원 형식은 {'/'.join(_SUPPORTED_SUFFIXES)} 입니다")
 
 
 def scan_install_surface(artifact_path: str) -> list[Finding]:

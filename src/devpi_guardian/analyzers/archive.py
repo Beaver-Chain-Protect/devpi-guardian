@@ -443,7 +443,7 @@ def extract_artifact(artifact_path: str | os.PathLike[str], destination: Path) -
                     _extract_tar_manually(archive, members, destination)
         else:
             raise ValueError(
-                "지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar.bz2/.tar.xz/.tbz2/.txz 입니다"
+                "지원 형식은 .whl/.zip/.tar.gz/.tgz/.tar/.tar.bz2/.tar.xz/.tbz2/.txz 입니다"
             )
 
         files = tuple(sorted(member.relative_path for member in members if not member.is_directory))
