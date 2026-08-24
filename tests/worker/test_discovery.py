@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -163,3 +165,54 @@ def test_sink_maps_storage_failure_to_discovery_unavailable(tmp_path) -> None:
 
     with pytest.raises(DiscoveryUnavailable):
         FileDiscoverySink(blocked).discover(candidate())
+
+
+def test_discovery_lease_token_fences_stale_same_worker_claim(tmp_path) -> None:
+    clock = [NOW]
+    sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])
+    sink.discover(candidate())
+    first = sink.claim_next("worker-1", NOW + timedelta(seconds=5))
+    assert first is not None
+
+    clock[0] += timedelta(seconds=6)
+    assert sink.recover_expired_claims() == 1
+    second = sink.claim_next("worker-1", clock[0] + timedelta(seconds=5))
+    assert second is not None
+    assert first.lease_token != second.lease_token
+
+    with pytest.raises(DiscoveryUnavailable):
+        sink.complete(first)
+    with pytest.raises(DiscoveryUnavailable):
+        sink.fail(first, "stale")
+    with pytest.raises(DiscoveryUnavailable):
+        sink.retry(first, "stale")
+
+    sink.complete(second)
+    assert sink.count("COMPLETED") == 1
+
+
+def test_discovery_lease_rejects_forged_worker_and_token(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+    assert claim is not None
+
+    forged_worker = replace(claim, worker_id="worker-2")
+    forged_token = replace(claim, lease_token="0" * 64)
+    with pytest.raises(DiscoveryUnavailable):
+        sink.complete(forged_worker)
+    with pytest.raises(DiscoveryUnavailable):
+        sink.complete(forged_token)
+    sink.complete(claim)
+
+
+def test_incompatible_preexisting_discovery_schema_fails_closed(tmp_path) -> None:
+    path = tmp_path / "discovery.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE discovery_jobs (job_id TEXT PRIMARY KEY, state TEXT NOT NULL)"
+        )
+        connection.commit()
+
+    with pytest.raises(DiscoveryUnavailable, match=r"incompatible.*lease_token"):
+        FileDiscoverySink(tmp_path)

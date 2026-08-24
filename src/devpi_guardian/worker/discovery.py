@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
@@ -17,6 +18,32 @@ from devpi_guardian.verdicts.models import require_utc, validate_sha256
 _DISCOVERY_SINK_XOM_ATTRIBUTE = "_devpi_guardian_discovery_sink"
 _ACTIVE_STATES = ("PENDING", "PROCESSING")
 _ALL_STATES = frozenset((*_ACTIVE_STATES, "COMPLETED", "FAILED"))
+_REQUIRED_DISCOVERY_COLUMNS = frozenset(
+    {
+        "job_id",
+        "candidate_json",
+        "state",
+        "attempt_count",
+        "available_at",
+        "lease_owner",
+        "lease_expires_at",
+        "lease_token",
+    }
+)
+
+
+def _validate_claim(claim: DiscoveryClaim) -> None:
+    if type(claim) is not DiscoveryClaim:
+        raise ValueError("claim must be a DiscoveryClaim")
+    if not isinstance(claim.worker_id, str) or not claim.worker_id.strip():
+        raise ValueError("claim worker_id must be a nonblank string")
+    token = claim.lease_token
+    if (
+        type(token) is not str
+        or len(token) != 64
+        or any(character not in "0123456789abcdef" for character in token)
+    ):
+        raise ValueError("claim lease_token must be a canonical token")
 
 
 class DiscoveryUnavailable(RuntimeError):
@@ -57,6 +84,7 @@ class DiscoveryClaim:
     worker_id: str
     attempt_count: int
     lease_expires_at: datetime
+    lease_token: str
 
 
 class DiscoverySink(Protocol):
@@ -105,6 +133,18 @@ class FileDiscoverySink:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'discovery_jobs'"
+                ).fetchone()
+                if existing is not None:
+                    columns = {
+                        row[1] for row in connection.execute("PRAGMA table_info(discovery_jobs)")
+                    }
+                    missing = sorted(_REQUIRED_DISCOVERY_COLUMNS - columns)
+                    if missing:
+                        raise DiscoveryUnavailable(
+                            "incompatible discovery schema; missing columns: " + ", ".join(missing)
+                        )
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS discovery_jobs (
@@ -118,21 +158,30 @@ class FileDiscoverySink:
                         available_at TEXT NOT NULL,
                         lease_owner TEXT,
                         lease_expires_at TEXT,
+                        lease_token TEXT,
                         last_error TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         CHECK(
                             (state = 'PROCESSING' AND lease_owner IS NOT NULL
-                             AND lease_expires_at IS NOT NULL)
+                             AND lease_expires_at IS NOT NULL AND lease_token IS NOT NULL)
                             OR
                             (state != 'PROCESSING' AND lease_owner IS NULL
-                             AND lease_expires_at IS NULL)
+                             AND lease_expires_at IS NULL AND lease_token IS NULL)
                         )
                     );
                     CREATE INDEX IF NOT EXISTS discovery_jobs_ready_idx
                     ON discovery_jobs(state, available_at, created_at, job_id);
                     """
                 )
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(discovery_jobs)")
+                }
+                missing = sorted(_REQUIRED_DISCOVERY_COLUMNS - columns)
+                if missing:
+                    raise DiscoveryUnavailable(
+                        "incompatible discovery schema; missing columns: " + ", ".join(missing)
+                    )
         except (OSError, sqlite3.Error) as exc:
             raise DiscoveryUnavailable(str(self.path)) from exc
 
@@ -194,7 +243,7 @@ class FileDiscoverySink:
                 """
                 UPDATE discovery_jobs
                 SET state = 'PENDING', available_at = ?, lease_owner = NULL,
-                    lease_expires_at = NULL, updated_at = ?,
+                    lease_expires_at = NULL, lease_token = NULL, updated_at = ?,
                     last_error = 'discovery worker lease expired'
                 WHERE state = 'PROCESSING' AND lease_expires_at <= ?
                 """,
@@ -212,6 +261,7 @@ class FileDiscoverySink:
             raise ValueError("lease_until must be in the future")
         now = now_value.isoformat()
         lease = lease_value.isoformat()
+        lease_token = secrets.token_hex(32)
         with self._write() as connection:
             row = connection.execute(
                 """
@@ -230,10 +280,10 @@ class FileDiscoverySink:
                 """
                 UPDATE discovery_jobs
                 SET state = 'PROCESSING', attempt_count = ?, lease_owner = ?,
-                    lease_expires_at = ?, last_error = NULL, updated_at = ?
+                    lease_expires_at = ?, lease_token = ?, last_error = NULL, updated_at = ?
                 WHERE job_id = ? AND state = 'PENDING'
                 """,
-                (attempt_count, worker_id, lease, now, row["job_id"]),
+                (attempt_count, worker_id, lease, lease_token, now, row["job_id"]),
             )
             if cursor.rowcount != 1:
                 raise DiscoveryUnavailable("discovery job could not be claimed")
@@ -244,6 +294,7 @@ class FileDiscoverySink:
                 worker_id=worker_id,
                 attempt_count=attempt_count,
                 lease_expires_at=lease_value,
+                lease_token=lease_token,
             )
 
     def complete(self, claim: DiscoveryClaim) -> None:
@@ -256,15 +307,18 @@ class FileDiscoverySink:
         if state not in ("COMPLETED", "FAILED"):
             raise ValueError("invalid terminal discovery state")
         now = require_utc(self._now(), "now").isoformat()
+        _validate_claim(claim)
         with self._write() as connection:
             cursor = connection.execute(
                 """
                 UPDATE discovery_jobs
                 SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                    lease_token = NULL,
                     last_error = ?, updated_at = ?
                 WHERE job_id = ? AND state = 'PROCESSING' AND lease_owner = ?
+                  AND lease_token = ?
                 """,
-                (state, error, now, claim.job_id, claim.worker_id),
+                (state, error, now, claim.job_id, claim.worker_id, claim.lease_token),
             )
             if cursor.rowcount != 1:
                 raise DiscoveryUnavailable("discovery claim is no longer owned")
@@ -282,6 +336,7 @@ class FileDiscoverySink:
         if type(max_attempts) is not int or max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
         now_value = require_utc(self._now(), "now")
+        _validate_claim(claim)
         terminal = claim.attempt_count >= max_attempts
         state = "FAILED" if terminal else "PENDING"
         available_at = (now_value + delay).isoformat()
@@ -290,8 +345,10 @@ class FileDiscoverySink:
                 """
                 UPDATE discovery_jobs
                 SET state = ?, available_at = ?, lease_owner = NULL,
-                    lease_expires_at = NULL, last_error = ?, updated_at = ?
+                    lease_expires_at = NULL, lease_token = NULL,
+                    last_error = ?, updated_at = ?
                 WHERE job_id = ? AND state = 'PROCESSING' AND lease_owner = ?
+                  AND lease_token = ?
                 """,
                 (
                     state,
@@ -300,6 +357,7 @@ class FileDiscoverySink:
                     now_value.isoformat(),
                     claim.job_id,
                     claim.worker_id,
+                    claim.lease_token,
                 ),
             )
             if cursor.rowcount != 1:

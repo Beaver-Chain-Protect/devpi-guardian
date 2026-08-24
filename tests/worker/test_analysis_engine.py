@@ -160,3 +160,101 @@ def test_verified_artifact_owns_stream_and_analysis_scope_rewinds_and_closes() -
     with artifact.open_for_analysis() as opened:
         assert opened.read() == b"artifact"
     assert stream.closed
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("stage", ""), ("sha256", "A" * 64), ("size_bytes", -1)],
+)
+def test_verified_artifact_validation_failure_closes_owned_stream(field, value) -> None:
+    stream = BytesIO(b"artifact")
+    values = {
+        "stage": "root/pypi",
+        "project": "demo",
+        "version": "1.0.0",
+        "filename": "demo-1.0.0.tar.gz",
+        "sha256": "a" * 64,
+        "size_bytes": 8,
+        "_stream": stream,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        VerifiedArtifact(**values)
+    assert stream.closed
+
+
+class NonSeekableBinary:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def read(self, size=-1):
+        return b"artifact"
+
+    def close(self):
+        self.closed = True
+
+
+class TextStream:
+    def __init__(self) -> None:
+        from io import StringIO
+
+        self._stream = StringIO("artifact")
+
+    @property
+    def closed(self):
+        return self._stream.closed
+
+    def read(self, size=-1):
+        return self._stream.read(size)
+
+    def seek(self, position):
+        return self._stream.seek(position)
+
+    def tell(self):
+        return self._stream.tell()
+
+    def close(self):
+        return self._stream.close()
+
+
+@pytest.mark.parametrize("stream", [NonSeekableBinary(), TextStream()])
+def test_verified_artifact_stream_validation_failure_closes_owned_stream(stream) -> None:
+    with pytest.raises(ValueError):
+        VerifiedArtifact(
+            stage="root/pypi",
+            project="demo",
+            version="1.0.0",
+            filename="demo-1.0.0.tar.gz",
+            sha256="a" * 64,
+            size_bytes=8,
+            _stream=stream,
+        )
+    assert stream.closed
+
+
+class CloseFailStream(BytesIO):
+    def __init__(self, value: bytes, message: str) -> None:
+        super().__init__(value)
+        self.message = message
+        self.close_attempts = 0
+
+    def close(self) -> None:
+        self.close_attempts += 1
+        raise RuntimeError(self.message)
+
+
+def test_verified_artifact_preserves_validation_error_when_cleanup_fails() -> None:
+    stream = CloseFailStream(b"artifact", "cleanup")
+    with pytest.raises(ValueError) as raised:
+        VerifiedArtifact(
+            stage="",
+            project="demo",
+            version="1.0.0",
+            filename="demo-1.0.0.tar.gz",
+            sha256="a" * 64,
+            size_bytes=8,
+            _stream=stream,
+        )
+    assert "stage" in str(raised.value)
+    assert stream.close_attempts == 1

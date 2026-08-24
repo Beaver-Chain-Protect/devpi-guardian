@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 
+import pytest
+
 from devpi_guardian.analyzers import Finding
 from devpi_guardian.verdicts.models import ClaimedArtifact, Decision, VerdictInput
 from devpi_guardian.worker.models import (
@@ -27,6 +29,12 @@ class TrackingStream(BytesIO):
     def close(self) -> None:
         self.close_calls += 1
         super().close()
+
+
+class FailingCloseStream(TrackingStream):
+    def close(self) -> None:
+        self.close_calls += 1
+        raise RuntimeError("close failed")
 
 
 def artifact(tmp_path: Path) -> VerifiedArtifact:
@@ -296,6 +304,84 @@ def test_analysis_bundle_closes_distinct_and_shared_streams_once() -> None:
     assert separate.close_calls == 1
     assert shared.closed
     assert separate.closed
+
+
+def test_analysis_bundle_attempts_all_closes_and_reraises_first_failure() -> None:
+    first = FailingCloseStream(b"first")
+    second = FailingCloseStream(b"second")
+    third = TrackingStream(b"third")
+    target = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.whl",
+        sha256=SHA256,
+        size_bytes=5,
+        _stream=first,
+    )
+    sdist = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.tar.gz",
+        sha256="b" * 64,
+        size_bytes=6,
+        _stream=second,
+    )
+    wheel = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo2.whl",
+        sha256="c" * 64,
+        size_bytes=5,
+        _stream=third,
+    )
+    bundle = AnalysisBundle(target=target, same_release_sdist=sdist, same_release_wheel=wheel)
+
+    with pytest.raises(RuntimeError, match="close failed") as raised:
+        bundle.close()
+    assert first.close_calls == 1
+    assert second.close_calls == 1
+    assert third.closed
+    assert len(raised.value.__notes__) == 1
+    bundle.close()
+    assert first.close_calls == 1
+    assert second.close_calls == 1
+
+
+def test_worker_finally_closes_all_bundle_streams_after_analyzer_failure(tmp_path) -> None:
+    now = datetime(2026, 8, 21, tzinfo=UTC)
+    target = artifact(tmp_path)
+    counterpart_stream = TrackingStream(b"other")
+    counterpart = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.tar.gz",
+        sha256="b" * 64,
+        size_bytes=5,
+        _stream=counterpart_stream,
+    )
+    bundle = AnalysisBundle(target=target, same_release_sdist=counterpart)
+    store = Store(make_claim(now))
+
+    class BrokenEngine:
+        def analyze(self, bundle):
+            raise RuntimeError("analyzer failed")
+
+    worker = QuarantineWorker(
+        store=store,
+        preparer=Preparer(bundle),
+        analysis_engine=BrokenEngine(),
+        policy_engine=Policy(),
+        worker_id="worker-1",
+        now=lambda: now,
+    )
+
+    assert worker.run_once().status is WorkerCycleStatus.ERROR
+    assert target._stream.closed
+    assert counterpart_stream.closed
 
 
 def test_worker_closes_bundle_when_analyzer_raises(tmp_path) -> None:

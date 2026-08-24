@@ -52,24 +52,38 @@ class VerifiedArtifact:
     _stream: BinaryIO = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        for field_name in ("stage", "project", "version", "filename"):
-            _required(getattr(self, field_name), field_name)
-        validate_sha256(self.sha256)
-        if type(self.size_bytes) is not int or self.size_bytes < 0:
-            raise ValueError("size_bytes must be a non-negative integer")
-        if not all(
-            callable(getattr(self._stream, name, None))
-            for name in ("read", "seek", "tell", "close")
-        ):
-            raise ValueError("_stream must be a seekable binary stream")
         try:
+            for field_name in ("stage", "project", "version", "filename"):
+                _required(getattr(self, field_name), field_name)
+            validate_sha256(self.sha256)
+            if type(self.size_bytes) is not int or self.size_bytes < 0:
+                raise ValueError("size_bytes must be a non-negative integer")
+            if not all(
+                callable(getattr(self._stream, name, None))
+                for name in ("read", "seek", "tell", "close")
+            ):
+                raise ValueError("_stream must be a seekable binary stream")
             position = self._stream.tell()
             sample = self._stream.read(0)
             self._stream.seek(position)
-        except (OSError, TypeError, ValueError) as exc:
-            raise ValueError("_stream must be a seekable binary stream") from exc
-        if not isinstance(sample, bytes):
-            raise ValueError("_stream must be a binary stream")
+            if not isinstance(sample, bytes):
+                raise ValueError("_stream must be a binary stream")
+        except BaseException as validation_error:
+            try:
+                close = getattr(self._stream, "close", None)
+            except BaseException as cleanup_error:
+                validation_error.add_note(
+                    f"stream cleanup lookup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                raise
+            if callable(close):
+                try:
+                    close()
+                except BaseException as cleanup_error:
+                    validation_error.add_note(
+                        f"stream cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise
 
     def open_for_analysis(self) -> AbstractContextManager[BinaryIO]:
         """Rewind the owned stream and close it when this read scope exits."""
@@ -101,12 +115,21 @@ class AnalysisBundle:
 
     def close(self) -> None:
         """Close every distinct owned stream exactly once."""
+        errors: list[BaseException] = []
         for artifact in (self.target, self.same_release_sdist, self.same_release_wheel):
             if artifact is None or id(artifact._stream) in self._closed_streams:
                 continue
             self._closed_streams.add(id(artifact._stream))
-            if not artifact._stream.closed:
-                artifact._stream.close()
+            if not getattr(artifact._stream, "closed", False):
+                try:
+                    artifact._stream.close()
+                except BaseException as error:
+                    errors.append(error)
+        if errors:
+            first, *additional = errors
+            for error in additional:
+                first.add_note(f"additional stream cleanup failed: {error}")
+            raise first
 
 
 @dataclass(frozen=True, slots=True)
