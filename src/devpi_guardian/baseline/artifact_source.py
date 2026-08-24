@@ -37,6 +37,8 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 _CHUNK_SIZE = 1024 * 1024
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
+_HASH_PREFIX_PATTERN = re.compile(r"[0-9a-f]{2,}", re.ASCII)
+_ARTIFACT_MARKERS = frozenset({"+f", "+e"})
 
 
 class ArtifactDownloadError(Exception):
@@ -89,7 +91,9 @@ class HttpArtifactBytesSource:
     Use it as a context manager so the downloaded files are removed when the
     comparison is done:
 
-        with HttpArtifactBytesSource(session, lookup) as source:
+        with HttpArtifactBytesSource(
+            session, lookup, trusted_origin="https://devpi.example"
+        ) as source:
             ...
 
     `close()` does the same for callers that manage the lifetime themselves.
@@ -100,6 +104,7 @@ class HttpArtifactBytesSource:
         session: HttpSession,
         resolver: OriginUrlResolver,
         *,
+        trusted_origin: str,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_bytes: int = MAX_ARTIFACT_BYTES,
     ) -> None:
@@ -107,6 +112,7 @@ class HttpArtifactBytesSource:
             raise ValueError("max_bytes must be positive")
         self._session = session
         self._resolver = resolver
+        self._trusted_origin = _canonical_origin(trusted_origin)
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._root: Path | None = None
@@ -185,17 +191,17 @@ class HttpArtifactBytesSource:
 
     def _url_for(self, digest: str) -> str:
         url = self._resolver.origin_url(digest)
-        scheme = urlsplit(url).scheme.lower()
-        if scheme not in _ALLOWED_SCHEMES:
-            # `file:` and friends would turn a recorded URL into a local open,
-            # which the F4 README explicitly forbids for F6.
-            raise ArtifactDownloadError(f"지원하지 않는 origin_url 스킴: {url}")
+        _validate_artifact_url(url, self._trusted_origin)
         return url
 
     def _expected_size_for(self, digest: str) -> int:
         size = self._resolver.expected_size(digest)
         if type(size) is not int or size < 0:
             raise ArtifactDownloadError(f"저장된 artifact 크기가 유효하지 않음: {size!r}")
+        if size > self._max_bytes:
+            raise ArtifactDownloadError(
+                f"저장된 artifact 크기가 한도 {self._max_bytes:,}바이트를 초과"
+            )
         return size
 
     def _download(self, url: str, target: Path, expected_size: int) -> str:
@@ -215,11 +221,16 @@ class HttpArtifactBytesSource:
                 for chunk in response.iter_content(_CHUNK_SIZE):
                     if not chunk:
                         continue
-                    written += len(chunk)
-                    if written > self._max_bytes:
+                    chunk_size = len(chunk)
+                    if written + chunk_size > self._max_bytes:
                         raise ArtifactDownloadError(
                             f"{url} 크기가 한도 {self._max_bytes:,}바이트를 초과"
                         )
+                    if written + chunk_size > expected_size:
+                        raise ArtifactDownloadError(
+                            f"{url} 크기가 저장값을 초과: 저장={expected_size}"
+                        )
+                    written += chunk_size
                     digest.update(chunk)
                     handle.write(chunk)
             if written != expected_size:
@@ -231,6 +242,95 @@ class HttpArtifactBytesSource:
             if callable(close):
                 close()
         return digest.hexdigest()
+
+
+def _canonical_origin(value: str) -> tuple[str, str, int]:
+    """Return the normalized origin tuple used for same-origin checks."""
+
+    if type(value) is not str:
+        raise ValueError("trusted_origin must be a URL string")
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid trusted_origin: {value!r}") from exc
+    if scheme not in _ALLOWED_SCHEMES or not hostname:
+        raise ValueError(f"invalid trusted_origin: {value!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("trusted_origin must not contain credentials")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("trusted_origin must contain only scheme, host, and port")
+    try:
+        host = _canonical_host(hostname)
+    except ValueError as exc:
+        raise ValueError(f"invalid trusted_origin: {value!r}") from exc
+    return scheme, host, port if port is not None else _default_port(scheme)
+
+
+def _canonical_host(hostname: str) -> str:
+    try:
+        host = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError(f"host 이름이 유효하지 않음: {hostname!r}") from exc
+    return host.removesuffix(".")
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def _validate_artifact_url(url: str, trusted_origin: tuple[str, str, int]) -> None:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ArtifactDownloadError(f"origin_url이 유효하지 않음: {url!r}") from exc
+    if scheme not in _ALLOWED_SCHEMES or not hostname:
+        raise ArtifactDownloadError(f"지원하지 않는 origin_url 스킴 또는 호스트: {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ArtifactDownloadError("origin_url에 credentials가 포함됨")
+    if parsed.query or parsed.fragment:
+        raise ArtifactDownloadError("origin_url에 query 또는 fragment가 포함됨")
+    try:
+        origin = (
+            scheme,
+            _canonical_host(hostname),
+            port if port is not None else _default_port(scheme),
+        )
+    except ValueError as exc:
+        raise ArtifactDownloadError(f"origin_url의 호스트가 유효하지 않음: {url}") from exc
+    if origin != trusted_origin:
+        raise ArtifactDownloadError(f"origin_url이 trusted origin과 다름: {url}")
+
+    path = parsed.path
+    if (
+        not path.startswith("/")
+        or "%" in path
+        or "\\" in path
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+    ):
+        raise ArtifactDownloadError(f"artifact 경로가 정규화되지 않음: {url}")
+    parts = path.split("/")[1:]
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        raise ArtifactDownloadError(f"artifact 경로가 완전하지 않음: {url}")
+    marker_indexes = [index for index, part in enumerate(parts) if part in _ARTIFACT_MARKERS]
+    if len(marker_indexes) != 1:
+        raise ArtifactDownloadError(f"artifact route marker가 모호함: {url}")
+    marker = marker_indexes[0]
+    if parts[marker] == "+f":
+        if marker + 3 != len(parts) or _HASH_PREFIX_PATTERN.fullmatch(parts[marker + 1]) is None:
+            raise ArtifactDownloadError(f"artifact route가 완전하지 않음: {url}")
+        filename = parts[marker + 2]
+    else:
+        if marker + 2 >= len(parts):
+            raise ArtifactDownloadError(f"artifact route가 완전하지 않음: {url}")
+        filename = parts[-1]
+    if filename in {".", ".."} or not filename.strip() or not filename.lstrip("."):
+        raise ArtifactDownloadError(f"artifact filename이 완전하지 않음: {url}")
 
 
 def _local_name(digest: str, url: str) -> str:

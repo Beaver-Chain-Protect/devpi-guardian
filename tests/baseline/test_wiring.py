@@ -88,9 +88,9 @@ def digest_of(path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def wire(factory, session):
+def wire(factory, session, trusted_origin):
     lookup = VerdictReaderReleaseLookup(SQLiteVerdictReader(factory, now=lambda: NOW))
-    return lookup, HttpArtifactBytesSource(session, lookup)
+    return lookup, HttpArtifactBytesSource(session, lookup, trusted_origin=trusted_origin)
 
 
 def target_record(sha256: str) -> ReleaseRecord:
@@ -109,7 +109,7 @@ def test_the_real_adapters_find_a_smuggled_flow_end_to_end(tmp_path, wheels):
     baseline_sha = digest_of(baseline)
     stale_sha = digest_of(stale)
 
-    with _Server({f"/+f/{BASELINE_NAME}": baseline.read_bytes()}) as server:
+    with _Server({f"/+f/aa/{BASELINE_NAME}": baseline.read_bytes()}) as server:
         factory = build_store(tmp_path)
         seed_allowed(
             factory,
@@ -117,7 +117,7 @@ def test_the_real_adapters_find_a_smuggled_flow_end_to_end(tmp_path, wheels):
             version="1.0.0",
             filename=BASELINE_NAME,
             size_bytes=baseline.stat().st_size,
-            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{BASELINE_NAME}",
         )
         # An older approved release exists too; F6 must not pick it.
         seed_allowed(
@@ -125,11 +125,11 @@ def test_the_real_adapters_find_a_smuggled_flow_end_to_end(tmp_path, wheels):
             stale_sha,
             version="0.9.0",
             filename=STALE_NAME,
-            origin_url=f"{server.base_url}/+f/{STALE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{STALE_NAME}",
         )
 
         with requests.Session() as session:
-            lookup, source = wire(factory, session)
+            lookup, source = wire(factory, session, server.base_url)
             with source:
                 result = compare_release_to_baseline(
                     target_record(digest_of(target)),
@@ -152,7 +152,7 @@ def test_the_real_adapters_find_a_smuggled_flow_end_to_end(tmp_path, wheels):
     assert result.findings[0][0].sink == "requests.post"
 
     # Only the selected baseline was fetched, from the URL F4 recorded.
-    assert server.requested == [f"/+f/{BASELINE_NAME}"]
+    assert server.requested == [f"/+f/aa/{BASELINE_NAME}"]
 
 
 def test_downloaded_baseline_files_are_gone_after_the_comparison(tmp_path, wheels):
@@ -160,7 +160,7 @@ def test_downloaded_baseline_files_are_gone_after_the_comparison(tmp_path, wheel
     baseline, _stale, target = wheels
     baseline_sha = digest_of(baseline)
 
-    with _Server({f"/+f/{BASELINE_NAME}": baseline.read_bytes()}) as server:
+    with _Server({f"/+f/aa/{BASELINE_NAME}": baseline.read_bytes()}) as server:
         factory = build_store(tmp_path)
         seed_allowed(
             factory,
@@ -168,10 +168,10 @@ def test_downloaded_baseline_files_are_gone_after_the_comparison(tmp_path, wheel
             version="1.0.0",
             filename=BASELINE_NAME,
             size_bytes=baseline.stat().st_size,
-            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{BASELINE_NAME}",
         )
         with requests.Session() as session:
-            lookup, source = wire(factory, session)
+            lookup, source = wire(factory, session, server.base_url)
             with source:
                 compare_release_to_baseline(
                     target_record(digest_of(target)),
@@ -190,7 +190,7 @@ def test_a_stored_baseline_size_mismatch_is_an_analyzer_error(tmp_path, wheels):
     baseline, _stale, target = wheels
     baseline_sha = digest_of(baseline)
 
-    with _Server({f"/+f/{BASELINE_NAME}": baseline.read_bytes()}) as server:
+    with _Server({f"/+f/aa/{BASELINE_NAME}": baseline.read_bytes()}) as server:
         factory = build_store(tmp_path)
         seed_allowed(
             factory,
@@ -198,10 +198,10 @@ def test_a_stored_baseline_size_mismatch_is_an_analyzer_error(tmp_path, wheels):
             version="1.0.0",
             filename=BASELINE_NAME,
             size_bytes=baseline.stat().st_size + 1,
-            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{BASELINE_NAME}",
         )
         with requests.Session() as session:
-            lookup, source = wire(factory, session)
+            lookup, source = wire(factory, session, server.base_url)
             with source:
                 result = compare_release_to_baseline(
                     target_record(digest_of(target)),
@@ -222,7 +222,7 @@ def test_a_project_with_no_approved_release_skips_the_diff(tmp_path, wheels):
 
     factory = build_store(tmp_path)
     with requests.Session() as session:
-        lookup, source = wire(factory, session)
+        lookup, source = wire(factory, session, "http://127.0.0.1")
         with source:
             result = compare_release_to_baseline(
                 target_record(digest_of(target)),
@@ -250,10 +250,10 @@ def test_an_undownloadable_baseline_is_an_analyzer_error_not_a_first_release(tmp
             version="1.0.0",
             filename=BASELINE_NAME,
             size_bytes=len(b"not the approved wheel"),
-            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{BASELINE_NAME}",
         )
         with requests.Session() as session:
-            lookup, source = wire(factory, session)
+            lookup, source = wire(factory, session, server.base_url)
             with source:
                 result = compare_release_to_baseline(
                     target_record(digest_of(target)),
@@ -276,7 +276,7 @@ def test_a_tampered_baseline_body_is_an_analyzer_error(tmp_path, wheels):
     baseline_sha = digest_of(baseline)
 
     # devpi answers with bytes that are not the approved artifact.
-    with _Server({f"/+f/{BASELINE_NAME}": b"not the approved wheel"}) as server:
+    with _Server({f"/+f/aa/{BASELINE_NAME}": b"not the approved wheel"}) as server:
         factory = build_store(tmp_path)
         seed_allowed(
             factory,
@@ -284,10 +284,10 @@ def test_a_tampered_baseline_body_is_an_analyzer_error(tmp_path, wheels):
             version="1.0.0",
             filename=BASELINE_NAME,
             size_bytes=len(b"not the approved wheel"),
-            origin_url=f"{server.base_url}/+f/{BASELINE_NAME}",
+            origin_url=f"{server.base_url}/+f/aa/{BASELINE_NAME}",
         )
         with requests.Session() as session:
-            lookup, source = wire(factory, session)
+            lookup, source = wire(factory, session, server.base_url)
             with source:
                 result = compare_release_to_baseline(
                     target_record(digest_of(target)),
@@ -313,7 +313,7 @@ def test_a_review_only_project_history_yields_no_baseline(tmp_path, wheels):
     seed_release(factory, digest_of(baseline), version="1.0.0", filename=BASELINE_NAME)
 
     with requests.Session() as session:
-        lookup, source = wire(factory, session)
+        lookup, source = wire(factory, session, "http://127.0.0.1")
         with source:
             result = compare_release_to_baseline(
                 target_record(digest_of(target)),

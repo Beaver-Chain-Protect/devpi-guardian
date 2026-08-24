@@ -94,7 +94,8 @@ class ReleaseRecord:
         if type(self.size_bytes) is not int or self.size_bytes < 0:
             raise ValueError("size_bytes must be a nonnegative integer")
         for name in ("project", "version", "filename"):
-            if not str(getattr(self, name)).strip():
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip():
                 raise ValueError(f"{name} must not be blank")
 
 

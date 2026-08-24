@@ -82,6 +82,7 @@ class FakeSession:
 
 
 def make_source(session=None, resolver=None, **kwargs) -> HttpArtifactBytesSource:
+    kwargs.setdefault("trusted_origin", "https://devpi.example")
     return HttpArtifactBytesSource(
         session if session is not None else FakeSession(),
         resolver if resolver is not None else DictResolver(),
@@ -178,25 +179,40 @@ def test_a_downloaded_file_is_extractable_by_the_analyzer(tmp_path):
         "https://devpi.example/",
         "https://devpi.example/root/dev/+f/aa/..",
         "https://devpi.example/root/dev/+f/aa/...",
+        "https://devpi.example/root/dev/+f/aa/",
+        "https://devpi.example/root/dev/+f/aa/%2e%2e%2fetc%2fpasswd",
     ],
 )
-def test_a_url_without_a_usable_filename_falls_back_to_the_digest(url):
-    with make_source(resolver=DictResolver({DIGEST: url})) as source:
-        assert source.open(DIGEST).name == DIGEST
+def test_a_stored_url_without_a_complete_artifact_route_is_rejected(url):
+    session = FakeSession()
+    with (
+        make_source(session, resolver=DictResolver({DIGEST: url})) as source,
+        pytest.raises(ArtifactDownloadError),
+    ):
+        source.open(DIGEST)
+    assert session.calls == []
 
 
-def test_a_trailing_slash_url_uses_the_last_path_segment():
-    url = "https://devpi.example/root/dev/+f/aa/"
-    with make_source(resolver=DictResolver({DIGEST: url})) as source:
-        assert source.open(DIGEST).name == f"{DIGEST}-aa"
-
-
-def test_a_hostile_filename_in_the_url_cannot_escape_the_directory():
-    url = "https://devpi.example/root/dev/+f/aa/%2e%2e%2f%2e%2e%2fetc%2fpasswd"
-    with make_source(resolver=DictResolver({DIGEST: url})) as source:
-        path = source.open(DIGEST)
-        assert path.parent == source._directory()
-        assert "/" not in path.name
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://other.example/root/dev/+f/aa/demo.whl",
+        "http://devpi.example/root/dev/+f/aa/demo.whl",
+        "https://user:secret@devpi.example/root/dev/+f/aa/demo.whl",
+        "https://devpi.example/root/dev/+f/aa/demo.whl#fragment",
+        "https://devpi.example/root/dev/+f/aa/./demo.whl",
+        "https://devpi.example/root/dev/+f/aa/../demo.whl",
+        "https://127.0.0.1/root/dev/+f/aa/demo.whl",
+    ],
+)
+def test_a_stored_url_outside_the_trusted_origin_is_rejected_before_request(url):
+    session = FakeSession()
+    with (
+        make_source(session, resolver=DictResolver({DIGEST: url})) as source,
+        pytest.raises(ArtifactDownloadError),
+    ):
+        source.open(DIGEST)
+    assert session.calls == []
 
 
 # --- authentication independence ------------------------------------------
@@ -360,6 +376,45 @@ def test_an_oversized_body_is_refused():
         assert list(source._directory().iterdir()) == []
 
 
+def test_expected_size_over_max_bytes_is_rejected_before_request():
+    session = FakeSession()
+    resolver = DictResolver(sizes={DIGEST: 11})
+    with (
+        make_source(session, resolver, max_bytes=10) as source,
+        pytest.raises(ArtifactDownloadError),
+    ):
+        source.open(DIGEST)
+    assert session.calls == []
+
+
+def test_a_chunk_over_expected_size_stops_streaming_immediately():
+    class CountingResponse(FakeResponse):
+        def __init__(self):
+            super().__init__(b"")
+            self.consumed = 0
+
+        def iter_content(self, chunk_size: int):
+            for chunk in (b"first", b"too-long", b"must-not-be-read"):
+                self.consumed += 1
+                yield chunk
+
+    class CountingSession(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.response = CountingResponse()
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            self.responses.append(self.response)
+            return self.response
+
+    session = CountingSession()
+    resolver = DictResolver(sizes={DIGEST: len(b"first")})
+    with make_source(session, resolver) as source, pytest.raises(ArtifactDownloadError):
+        source.open(DIGEST)
+    assert session.response.consumed == 2
+
+
 def test_max_bytes_must_be_positive():
     with pytest.raises(ValueError):
         make_source(max_bytes=0)
@@ -401,7 +456,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     payload = PAYLOAD
 
     def do_GET(self):
-        if self.path != "/artifact.whl":
+        if self.path != "/+f/aa/artifact.whl":
             self.send_error(404)
             return
         self.send_response(200)
@@ -428,18 +483,21 @@ def local_server():
 
 def test_a_real_requests_session_downloads_and_verifies(local_server):
     requests = pytest.importorskip("requests")
-    resolver = DictResolver({DIGEST: f"{local_server}/artifact.whl"})
+    resolver = DictResolver({DIGEST: f"{local_server}/+f/aa/artifact.whl"})
     # An ordinary session with no authentication configured at all.
-    with requests.Session() as session, make_source(session, resolver) as source:
+    with (
+        requests.Session() as session,
+        make_source(session, resolver, trusted_origin=local_server) as source,
+    ):
         assert source.open(DIGEST).read_bytes() == PAYLOAD
 
 
 def test_a_real_requests_session_reports_a_404_as_a_download_error(local_server):
     requests = pytest.importorskip("requests")
-    resolver = DictResolver({DIGEST: f"{local_server}/absent.whl"})
+    resolver = DictResolver({DIGEST: f"{local_server}/+f/aa/absent.whl"})
     with (
         requests.Session() as session,
-        make_source(session, resolver) as source,
+        make_source(session, resolver, trusted_origin=local_server) as source,
         pytest.raises(ArtifactDownloadError),
     ):
         source.open(DIGEST)
@@ -448,12 +506,12 @@ def test_a_real_requests_session_reports_a_404_as_a_download_error(local_server)
 def test_a_real_requests_session_rejects_a_tampered_body(local_server):
     requests = pytest.importorskip("requests")
     resolver = DictResolver(
-        {OTHER_DIGEST: f"{local_server}/artifact.whl"},
+        {OTHER_DIGEST: f"{local_server}/+f/aa/artifact.whl"},
         {OTHER_DIGEST: len(PAYLOAD)},
     )
     with (
         requests.Session() as session,
-        make_source(session, resolver) as source,
+        make_source(session, resolver, trusted_origin=local_server) as source,
         pytest.raises(ArtifactDigestMismatch),
     ):
         source.open(OTHER_DIGEST)
@@ -466,12 +524,12 @@ def test_a_real_requests_session_rejects_redirects_without_caching_the_target():
     class RedirectHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             requested.append(self.path)
-            if self.path == "/redirect.whl":
+            if self.path == "/+f/aa/redirect.whl":
                 self.send_response(302)
-                self.send_header("Location", "/artifact.whl")
+                self.send_header("Location", "/+f/aa/artifact.whl")
                 self.end_headers()
                 return
-            if self.path == "/artifact.whl":
+            if self.path == "/+f/aa/artifact.whl":
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(PAYLOAD)))
                 self.end_headers()
@@ -487,9 +545,16 @@ def test_a_real_requests_session_rejects_redirects_without_caching_the_target():
     thread.start()
     try:
         resolver = DictResolver(
-            {DIGEST: f"http://127.0.0.1:{server.server_address[1]}/redirect.whl"}
+            {DIGEST: (f"http://127.0.0.1:{server.server_address[1]}/+f/aa/redirect.whl")}
         )
-        with requests.Session() as session, make_source(session, resolver) as source:
+        with (
+            requests.Session() as session,
+            make_source(
+                session,
+                resolver,
+                trusted_origin=f"http://127.0.0.1:{server.server_address[1]}",
+            ) as source,
+        ):
             with pytest.raises(ArtifactDownloadError):
                 source.open(DIGEST)
             assert source._downloaded == {}
@@ -498,7 +563,7 @@ def test_a_real_requests_session_rejects_redirects_without_caching_the_target():
         server.server_close()
         thread.join(timeout=5)
 
-    assert requested == ["/redirect.whl"]
+    assert requested == ["/+f/aa/redirect.whl"]
 
 
 def test_an_authenticated_real_session_behaves_identically(local_server):
@@ -506,6 +571,6 @@ def test_an_authenticated_real_session_behaves_identically(local_server):
     session = requests.Session()
     session.headers["Authorization"] = "Bearer whatever-f5-decides"
     session.auth = ("user", "password")
-    resolver = DictResolver({DIGEST: f"{local_server}/artifact.whl"})
-    with session, make_source(session, resolver) as source:
+    resolver = DictResolver({DIGEST: f"{local_server}/+f/aa/artifact.whl"})
+    with session, make_source(session, resolver, trusted_origin=local_server) as source:
         assert source.open(DIGEST).read_bytes() == PAYLOAD

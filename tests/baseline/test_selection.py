@@ -93,6 +93,29 @@ def test_release_record_rejects_blank_identity(blank_field):
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project", 1),
+        ("project", True),
+        ("version", object()),
+        ("filename", " "),
+        ("filename", b"name"),
+    ],
+)
+def test_release_record_requires_builtin_nonblank_strings(field, value):
+    fields = {
+        "project": "acme",
+        "version": "1.0",
+        "filename": SDIST,
+        "sha256": digest("strict-string"),
+        "size_bytes": 0,
+    }
+    fields[field] = value
+    with pytest.raises(ValueError):
+        ReleaseRecord(**fields)
+
+
+@pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("Acme", "acme"),

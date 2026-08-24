@@ -633,7 +633,15 @@ def _compare(
         (finding, "diff_artifact") for finding in (*baseline.findings, *artifact.findings)
     ]
     if not baseline.usable or not artifact.usable:
-        return BaselineDiff(_ordered(findings, tier=tier), _EMPTY_FILES, (), (), (), False, tier)
+        return BaselineDiff(
+            findings=_ordered(findings, tier=tier),
+            files=_EMPTY_FILES,
+            surface=(),
+            carried_flows=(),
+            carried_evidence=(),
+            usable=False,
+            tier=tier,
+        )
 
     # The full maps still contain `.dist-info`; only the file comparison
     # below drops it. Entry point parsing needs what is inside it.
@@ -708,13 +716,13 @@ def _compare(
         )
     )
     return BaselineDiff(
-        _ordered(findings, tier=tier),
-        files,
-        tuple(surfaces),
-        ordered_flows,
-        ordered_carried,
-        True,
-        tier,
+        findings=_ordered(findings, tier=tier),
+        files=files,
+        surface=tuple(surfaces),
+        carried_flows=ordered_flows,
+        carried_evidence=ordered_carried,
+        usable=True,
+        tier=tier,
     )
 
 
@@ -738,12 +746,13 @@ def diff_against_baseline(
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         return BaselineDiff(
-            _ordered([(_error(artifact_name, exc), "diff_artifact")], tier=tier),
-            _EMPTY_FILES,
-            (),
-            (),
-            (),
-            False,
+            findings=_ordered([(_error(artifact_name, exc), "diff_artifact")], tier=tier),
+            files=_EMPTY_FILES,
+            surface=(),
+            carried_flows=(),
+            carried_evidence=(),
+            usable=False,
+            tier=tier,
         )
 
 

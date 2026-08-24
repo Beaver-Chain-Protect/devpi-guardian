@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import tempfile
 import zipfile
 
 import pytest
@@ -145,6 +146,21 @@ def test_every_finding_carries_origin_and_selected_tier(
     assert all(entry.origin == "diff_changed" for entry in result.findings)
     assert all(entry.tier == tier for entry in result.findings)
     assert all(entry.tier == tier for entry in result.diff.findings)
+
+
+def test_temporary_directory_failure_preserves_tier_on_diff_and_findings(tmp_path, monkeypatch):
+    baseline = build_wheel(tmp_path / "demo-1.0.0-py3-none-any.whl", {"pkg/a.py": CLEAN})
+    artifact = build_wheel(tmp_path / "demo-2.0.0-py3-none-any.whl", {"pkg/a.py": EXFILTRATE})
+
+    def fail(*args, **kwargs):
+        raise OSError("cannot create temporary directory")
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", fail)
+    result = diff_against_baseline(baseline, artifact, tier="sdist")
+
+    assert result.tier == "sdist"
+    assert result.findings
+    assert result.findings[0].tier == "sdist"
 
 
 # --- step 1: file comparison ----------------------------------------------
