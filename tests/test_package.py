@@ -377,39 +377,110 @@ def test_readme_documents_verdict_baseline_tier_contract() -> None:
         assert phrase in f10_section
 
 
+def _assert_exact_ci_workflow(workflow: str) -> None:
+    expected_workflow = (
+        "\n".join(
+            (
+                "name: CI",
+                "",
+                "on:",
+                "  pull_request:",
+                "  push:",
+                "    branches: [main]",
+                "",
+                "permissions:",
+                "  contents: read",
+                "",
+                "concurrency:",
+                "  group: ci-${{ github.workflow }}-${{ github.ref }}",
+                "  cancel-in-progress: true",
+                "",
+                "jobs:",
+                "  tests:",
+                "    name: tests (Python ${{ matrix.python-version }})",
+                "    runs-on: ubuntu-latest",
+                "    strategy:",
+                "      fail-fast: false",
+                "      matrix:",
+                '        python-version: ["3.11", "3.12", "3.13", "3.14"]',
+                "    steps:",
+                "".join(
+                    (
+                        "      - uses: actions/checkout@",
+                        "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+                    )
+                ),
+                "".join(
+                    (
+                        "      - uses: astral-sh/setup-uv@",
+                        "20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1",
+                    )
+                ),
+                "        with:",
+                "          python-version: ${{ matrix.python-version }}",
+                "          enable-cache: true",
+                "      - run: uv sync --locked --extra test",
+                "      - run: uv run pytest -v",
+                "",
+                "  quality:",
+                "    name: quality (Python 3.11)",
+                "    runs-on: ubuntu-latest",
+                "    steps:",
+                "".join(
+                    (
+                        "      - uses: actions/checkout@",
+                        "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+                    )
+                ),
+                "".join(
+                    (
+                        "      - uses: astral-sh/setup-uv@",
+                        "20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1",
+                    )
+                ),
+                "        with:",
+                '          python-version: "3.11"',
+                "          enable-cache: true",
+                "      - run: uv sync --locked --extra test",
+                "      - run: uv run ruff format --check .",
+                "      - run: uv run ruff check .",
+                "      - run: uv run flake8 src tests",
+                "      - run: uv run python -m build",
+            )
+        )
+        + "\n"
+    )
+    assert workflow == expected_workflow
+    for forbidden in (
+        "pull-requests:",
+        "contents: write",
+        "continue-on-error",
+        "pytest -m",
+        "pytest -k",
+        "pytest -m=",
+        "pytest -k=",
+        "--ignore",
+        "pytest tests/",
+    ):
+        assert forbidden not in workflow
+
+
 def test_ci_covers_supported_python_and_quality_gates() -> None:
     repo_root = Path(__file__).parents[1]
     workflow_path = repo_root.joinpath(".github/workflows/ci.yml")
     workflow = workflow_path.read_text(encoding="utf-8")
+    _assert_exact_ci_workflow(workflow)
 
-    for version in ('"3.11"', '"3.12"', '"3.13"', '"3.14"'):
-        assert version in workflow
-    for required in (
-        "contents: read",
-        "cancel-in-progress: true",
-        "uv sync --locked --extra test",
-        "uv run pytest -v",
-        "uv run ruff format --check .",
-        "uv run ruff check .",
-        "uv run flake8 src tests",
-        "uv run python -m build",
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-        "".join(
-            (
-                "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d ",
-                "# v10.0.1",
-            )
-        ),
-    ):
-        assert required in workflow
-    for forbidden in (
-        "pull-requests: write",
-        "contents: write",
-        "continue-on-error",
-        "-m 'not integration'",
-        '-m "not integration"',
-    ):
-        assert forbidden not in workflow
+
+def test_ci_contract_rejects_narrowed_or_mutated_workflow() -> None:
+    repo_root = Path(__file__).parents[1]
+    workflow_path = repo_root.joinpath(".github/workflows/ci.yml")
+    workflow = workflow_path.read_text(encoding="utf-8")
+    narrowed_command = "uv run pytest tests/test_package.py -v"
+    narrowed = workflow.replace("uv run pytest -v", narrowed_command)
+
+    with pytest.raises(AssertionError):
+        _assert_exact_ci_workflow(narrowed)
 
 
 def test_readme_documents_new_install_activation_boundary() -> None:
@@ -464,7 +535,8 @@ def test_readme_documents_f5_quarantine_contract() -> None:
             )
         ),
         "objects/sha256/<first-2>/<next-2>/<sha256>",
-        "Unapproved bytes never in SQLite/public +f/+e",
+        "Unapproved bytes never live in SQLite or",
+        "public `+f`/`+e` for unapproved worker input",
         "same filesystem",
         "Publish-before-discover ordering",
         "atomic no-overwrite publish",
@@ -473,9 +545,28 @@ def test_readme_documents_f5_quarantine_contract() -> None:
         "same-open-file digest verification",
         "only then parses",
         "Mismatch/missing/I/O/symlink failures are fail-closed",
-        "F5 alone reads unapproved path",
+        "F5 alone reads unapproved bytes from this path",
         "F6 still uses HTTP(S) canonical +f/+e after ALLOW",
         "no worker/public route bypass token",
         "cleanup/retention contract",
+        "verified FileEntry read stream",
+        "mirror discovery connector",
+        "upstream hash",
+        "origin_url",
+        "never fetch",
+        "local path",
+        "ClaimedArtifact",
+        "sha256",
+        "size_bytes",
+        "exclusive",
+        "expected owner/mode",
+        "openat",
+        "O_NOFOLLOW",
+        "fstat",
+        "rewind the descriptor",
+        "kept open for analysis",
+        "fenced claim",
+        "mark_analysis_error()",
+        "no verdict",
     ):
         assert phrase in quarantine_section

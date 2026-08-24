@@ -43,27 +43,40 @@ dedicated permission-restricted path outside public devpi storage/routes. Deploy
 must not expose it through HTTP. The content-addressed layout is exactly
 `objects/sha256/<first-2>/<next-2>/<sha256>`; SQLite, filenames, projects, versions,
 and URLs never choose a filesystem path. Unapproved bytes never live in SQLite or
-public `+f`/`+e` storage as a worker input. Unapproved bytes never in
-SQLite/public +f/+e.
+public `+f`/`+e` storage as a worker input. Devpi may store and serve approved
+artifacts, but F5 never uses public `+f`/`+e` for unapproved worker input.
 
-Writers create a temporary file under `.incoming` on the same filesystem, hash and
-size the stream, then fsync the file. A digest/size mismatch discards the temporary
-file without discovery. Publish-before-discover ordering is mandatory: publishing is
-an atomic no-overwrite publish, and an existing
-digest is accepted only after duplicate digest byte identity is verified; conflicting
-bytes, symlinks, hard links, non-regular files, unsafe permissions, and path escape
-are refused. After the final object is atomically published, fsync the parent before
-discoverable metadata is written by `discover_artifact()`.
+The private upload connector copies a verified FileEntry read stream into the
+quarantine writer. The mirror discovery connector downloads an upstream candidate
+and verifies its supplied upstream hash before publishing. Existing devpi data is
+not copied through this path; it is offline backfill-only work deferred beyond PR1.
 
-F5 opens the CAS using no-symlink/no traversal semantics from a pre-opened quarantine
-root, verifies regular-file type and claimed size, hashes the same open file
-descriptor, and only then parses that descriptor; this is same-open-file digest
-verification. Mismatch/missing/I/O/symlink failures are fail-closed and record
-analysis error without a verdict. F5 alone reads unapproved path. F6 still uses
-HTTP(S) canonical +f/+e after ALLOW. There is no worker/public route bypass token,
-header, query, or loopback exception. Orphan
-objects remain safe and are handled by a separate cleanup/retention contract; PR1
-does not silently delete them.
+Writers create an exclusive temporary file under `.incoming` on the same filesystem,
+hash and size the stream, and fsync the file. The final object must have the expected
+owner/mode; symlinks, hard links, non-regular files, unsafe permissions, and path
+escape are rejected. A digest/size mismatch discards the temporary file without
+discovery. Publish-before-discover ordering is mandatory: the publish operation is
+an atomic no-overwrite publish. An existing final digest
+is accepted only after duplicate digest byte identity is verified, and no existing
+object is overwritten. The final file and required parent directories are fsynced
+before `discover_artifact()` writes discoverable metadata.
+
+F5 derives the final path only from the fenced `ClaimedArtifact.sha256` and
+`size_bytes`. It never fetches `origin_url` or interprets it as a local path. The
+reader uses no-symlink/no traversal semantics, a pre-opened quarantine root fd, and
+component `openat` (or an equivalent safe API), `O_NOFOLLOW`, and `fstat` to verify
+each directory and regular file. It checks the claimed size and computes a streaming
+digest on the same open file descriptor. After hashing, rewind the descriptor and
+pass that same descriptor to the analyzer; it is kept open for analysis. This
+same-open-file digest verification means parsing occurs only after the digest matches.
+The reader only then parses the descriptor.
+
+Mismatch/missing/I/O/symlink failures are fail-closed, including permission, type,
+and size errors: F5 calls `mark_analysis_error()` with the same fenced claim and produces
+no verdict. F5 alone reads unapproved bytes from this path. F6 still uses HTTP(S)
+canonical +f/+e after ALLOW. There is no worker/public route bypass token, header, query, or
+loopback exception. Orphan objects remain safe under the cleanup/retention contract;
+PR1 does not silently delete them.
 
 ## Implemented features
 
