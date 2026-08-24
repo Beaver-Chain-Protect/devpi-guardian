@@ -78,6 +78,234 @@ def test_existing_marker_skips_inventory(tmp_path) -> None:
     assert second is False
 
 
+def test_matching_restart_skips_clock_and_inventory(tmp_path) -> None:
+    factory = _factory(tmp_path)
+    ensure_guardian_activation(
+        factory,
+        DEVPI_UUID,
+        lambda: None,
+        now=lambda: NOW,
+    )
+    calls = {"clock": 0, "inventory": 0}
+
+    def invalid_clock() -> datetime:
+        calls["clock"] += 1
+        raise AssertionError("clock must not run")
+
+    def unexpected_inventory() -> None:
+        calls["inventory"] += 1
+        raise AssertionError("inventory must not run")
+
+    assert (
+        ensure_guardian_activation(
+            factory,
+            DEVPI_UUID,
+            unexpected_inventory,
+            now=invalid_clock,
+        )
+        is False
+    )
+    assert calls == {"clock": 0, "inventory": 0}
+
+
+def test_uuid_mismatch_wins_before_clock_or_inventory(tmp_path) -> None:
+    factory = _factory(tmp_path)
+    ensure_guardian_activation(
+        factory,
+        DEVPI_UUID,
+        lambda: None,
+        now=lambda: NOW,
+    )
+    calls = {"clock": 0, "inventory": 0}
+
+    def invalid_clock() -> datetime:
+        calls["clock"] += 1
+        raise AssertionError("clock must not run")
+
+    def unexpected_inventory() -> None:
+        calls["inventory"] += 1
+        raise AssertionError("inventory must not run")
+
+    with pytest.raises(GuardianActivationError) as error:
+        ensure_guardian_activation(
+            factory,
+            "other-devpi",
+            unexpected_inventory,
+            now=invalid_clock,
+        )
+    assert error.value.category is ActivationFailureCategory.UUID_MISMATCH
+    assert calls == {"clock": 0, "inventory": 0}
+    assert _count(factory) == 1
+
+
+@pytest.mark.parametrize("corrupt", ["timestamp", "version"])
+def test_marker_corruption_wins_before_clock_or_inventory(
+    tmp_path,
+    corrupt,
+) -> None:
+    factory = _factory(tmp_path)
+    with closing(factory.connect()) as connection, connection:
+        activated_at = NOW.isoformat()
+        if corrupt == "timestamp":
+            activated_at = "not-a-timestamp"
+        version = 2 if corrupt == "version" else 1
+        if corrupt == "timestamp":
+            connection.execute(
+                "INSERT INTO guardian_activation "
+                "(singleton, devpi_uuid, activated_at, activation_version) "
+                "VALUES (1, ?, ?, ?)",
+                (DEVPI_UUID, activated_at, version),
+            )
+        if corrupt == "version":
+            connection.execute("PRAGMA writable_schema = ON")
+            connection.execute(
+                "UPDATE sqlite_master SET sql = replace(sql, "
+                "'activation_version = 1', 'activation_version >= 1') "
+                "WHERE name = 'guardian_activation'"
+            )
+            connection.execute("PRAGMA writable_schema = OFF")
+            connection.execute("VACUUM")
+            connection.execute(
+                "INSERT INTO guardian_activation "
+                "(singleton, devpi_uuid, activated_at, activation_version) "
+                "VALUES (1, ?, ?, ?)",
+                (DEVPI_UUID, NOW.isoformat(), version),
+            )
+    calls = {"clock": 0, "inventory": 0}
+
+    def invalid_clock() -> datetime:
+        calls["clock"] += 1
+        raise AssertionError("clock must not run")
+
+    def unexpected_inventory() -> None:
+        calls["inventory"] += 1
+        raise AssertionError("inventory must not run")
+
+    with pytest.raises(GuardianActivationError) as error:
+        ensure_guardian_activation(
+            factory,
+            DEVPI_UUID,
+            unexpected_inventory,
+            now=invalid_clock,
+        )
+    assert error.value.category is ActivationFailureCategory.MARKER_CORRUPT
+    assert calls == {"clock": 0, "inventory": 0}
+    assert _count(factory) == 1
+
+
+def test_invalid_missing_row_clock_preserves_value_error(tmp_path) -> None:
+    factory = _factory(tmp_path)
+    calls = {"clock": 0, "inventory": 0}
+
+    def invalid_clock() -> datetime:
+        calls["clock"] += 1
+        raise ValueError("clock secret")
+
+    def inventory() -> None:
+        calls["inventory"] += 1
+
+    with pytest.raises(ValueError, match="invalid activation clock") as error:
+        ensure_guardian_activation(
+            factory,
+            DEVPI_UUID,
+            inventory,
+            now=invalid_clock,
+        )
+    assert "clock secret" not in str(error.value)
+    assert calls == {"clock": 1, "inventory": 0}
+    assert _count(factory) == 0
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchmany(self, size):
+        assert size == 2
+        return self.rows
+
+
+class _FakeConnection:
+    def __init__(self, rows):
+        self.cursor = _FakeCursor(rows)
+        self.statements = []
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.close_calls = 0
+
+    def execute(self, statement, *parameters):
+        self.statements.append(statement)
+        if statement.startswith("SELECT"):
+            return self.cursor
+        return self
+
+    def commit(self):
+        self.commit_calls += 1
+
+    def rollback(self):
+        self.rollback_calls += 1
+
+    def close(self):
+        self.close_calls += 1
+
+
+class _FakeFactory:
+    def __init__(self, connection):
+        self.connection = connection
+        self.connect_calls = 0
+
+    def connect(self):
+        self.connect_calls += 1
+        return self.connection
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            (1, DEVPI_UUID, NOW.isoformat(), 1),
+            (1, DEVPI_UUID, NOW.isoformat(), 1),
+        ],
+        [(True, DEVPI_UUID, NOW.isoformat(), 1)],
+        [(1, DEVPI_UUID, NOW.isoformat(), "1")],
+        [(1, _StringSubclass(DEVPI_UUID), NOW.isoformat(), 1)],
+    ],
+    ids=["duplicate", "bool-singleton", "string-version", "string-subclass"],
+)
+def test_marker_row_shape_and_types_fail_closed_without_clock(
+    rows,
+) -> None:
+    connection = _FakeConnection(rows)
+    factory = _FakeFactory(connection)
+    calls = {"clock": 0, "inventory": 0}
+
+    def invalid_clock() -> datetime:
+        calls["clock"] += 1
+        raise AssertionError("clock must not run")
+
+    def unexpected_inventory() -> None:
+        calls["inventory"] += 1
+        raise AssertionError("inventory must not run")
+
+    with pytest.raises(GuardianActivationError) as error:
+        ensure_guardian_activation(
+            factory,
+            DEVPI_UUID,
+            unexpected_inventory,
+            now=invalid_clock,
+        )
+    assert error.value.category is ActivationFailureCategory.MARKER_CORRUPT
+    assert calls == {"clock": 0, "inventory": 0}
+    assert factory.connect_calls == 1
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 1
+    assert connection.close_calls == 1
+
+
 def test_candidate_refuses_without_persisting_marker(tmp_path) -> None:
     factory = _factory(tmp_path)
 
@@ -181,8 +409,11 @@ def test_unknown_activation_version_fails_closed(tmp_path) -> None:
 def test_inventory_exception_is_sanitized(tmp_path) -> None:
     factory = _factory(tmp_path)
     secret = "inventory secret / candidate"
+    calls = 0
 
     def inventory() -> None:
+        nonlocal calls
+        calls += 1
         raise RuntimeError(secret)
 
     with pytest.raises(GuardianActivationError) as error:
@@ -196,6 +427,7 @@ def test_inventory_exception_is_sanitized(tmp_path) -> None:
     assert category is ActivationFailureCategory.INVENTORY_UNAVAILABLE
     assert secret not in str(error.value)
     assert DEVPI_UUID not in str(error.value)
+    assert calls == 1
     assert _count(factory) == 0
 
 
@@ -203,16 +435,23 @@ def test_sqlite_error_is_sanitized(tmp_path) -> None:
     factory = _factory(tmp_path)
     with closing(factory.connect()) as connection, connection:
         connection.execute("DROP TABLE guardian_activation")
+    calls = 0
+
+    def inventory() -> None:
+        nonlocal calls
+        calls += 1
+
     with pytest.raises(GuardianActivationError) as error:
         ensure_guardian_activation(
             factory,
             DEVPI_UUID,
-            lambda: None,
+            inventory,
             now=lambda: NOW,
         )
     assert error.value.category is ActivationFailureCategory.STORE_UNAVAILABLE
     assert str(factory.path) not in str(error.value)
     assert "guardian_activation" not in str(error.value)
+    assert calls == 0
 
 
 @pytest.mark.parametrize(

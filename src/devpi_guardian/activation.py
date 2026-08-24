@@ -11,6 +11,10 @@ ACTIVATION_VERSION = 1
 _MAX_BOUNDARY_STRING = 4096
 
 
+class _InvalidActivationClock(ValueError):
+    pass
+
+
 class ActivationFailureCategory(StrEnum):
     EXISTING_ARTIFACTS = "existing_artifacts"
     INVENTORY_UNAVAILABLE = "inventory_unavailable"
@@ -46,16 +50,21 @@ def _serialize_clock(now: Callable[[], datetime]) -> str:
     try:
         value = now()
     except Exception:
-        raise ValueError("invalid activation clock") from None
+        raise _InvalidActivationClock("invalid activation clock") from None
     if type(value) is not datetime:
-        raise ValueError("invalid activation clock")
+        raise _InvalidActivationClock("invalid activation clock")
     try:
         offset = value.utcoffset()
     except Exception:
-        raise ValueError("invalid activation clock") from None
-    if value.tzinfo is None or offset != timedelta(0):
-        raise ValueError("invalid activation clock")
-    return value.isoformat()
+        raise _InvalidActivationClock("invalid activation clock") from None
+    try:
+        if value.tzinfo is None or offset != timedelta(0):
+            raise _InvalidActivationClock("invalid activation clock")
+        return value.isoformat()
+    except _InvalidActivationClock:
+        raise
+    except Exception:
+        raise _InvalidActivationClock("invalid activation clock") from None
 
 
 def _valid_canonical_timestamp(value: object) -> bool:
@@ -102,12 +111,12 @@ def ensure_guardian_activation(
     """Create or validate the immutable activation marker."""
     if not _valid_boundary_string(devpi_uuid):
         raise ValueError("invalid devpi UUID")
-    activated_at = _serialize_clock(now)
 
     connection = None
     transaction_started = False
     committed = False
     result = False
+    activated_at = ""
     primary: BaseException | None = None
 
     try:
@@ -138,6 +147,11 @@ def ensure_guardian_activation(
                 result = False
             else:
                 try:
+                    activated_at = _serialize_clock(now)
+                except _InvalidActivationClock as exc:
+                    primary = ValueError(str(exc))
+                    raise
+                try:
                     candidate = find_candidate()
                 except Exception:
                     raise GuardianActivationError(
@@ -161,6 +175,8 @@ def ensure_guardian_activation(
                 result = True
             connection.commit()
             committed = True
+        except _InvalidActivationClock:
+            pass
         except GuardianActivationError as exc:
             primary = exc
         except Exception:
