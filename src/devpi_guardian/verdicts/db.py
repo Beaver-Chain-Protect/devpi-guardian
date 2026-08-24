@@ -134,6 +134,8 @@ def _validate_catalog(
 
 def migrate(factory: ConnectionFactory) -> None:
     connection = factory.connect()
+    primary: MigrationError | None = None
+    cause: BaseException | None = None
     try:
         journal_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
         if journal_mode is None or journal_mode[0] != "wal":
@@ -173,13 +175,24 @@ def migrate(factory: ConnectionFactory) -> None:
                 factory.path,
             )
             connection.commit()
-    except MigrationError:
-        if connection.in_transaction:
-            connection.rollback()
-        raise
+    except MigrationError as exc:
+        primary = exc
     except (ImportError, OSError, UnicodeError, sqlite3.Error) as exc:
-        if connection.in_transaction:
-            connection.rollback()
-        raise MigrationError(str(factory.path)) from exc
+        primary = MigrationError(str(factory.path))
+        cause = exc
     finally:
-        connection.close()
+        if primary is not None:
+            with suppress(Exception):
+                if connection.in_transaction:
+                    connection.rollback()
+        try:
+            connection.close()
+        except Exception as exc:
+            if primary is None:
+                primary = MigrationError(str(factory.path))
+                cause = exc
+
+    if primary is not None:
+        if cause is not None:
+            raise primary from cause
+        raise primary

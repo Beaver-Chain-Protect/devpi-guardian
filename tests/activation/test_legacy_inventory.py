@@ -76,6 +76,39 @@ class UnderreportedSequence(Sequence[object]):
         return 1
 
 
+class EarlyIndexErrorSequence(Sequence[object]):
+    def __getitem__(self, index: int | slice) -> object:
+        if index == 0:
+            raise IndexError("declared item missing")
+        raise AssertionError("probe must not run after declared failure")
+
+    def __len__(self) -> int:
+        return 1
+
+
+class InfiniteTombstoneTransaction:
+    at_serial = 73
+
+    def __init__(self) -> None:
+        self.consumed_rows = 0
+        self.iter_calls: list[tuple[tuple[str, ...], int]] = []
+
+    def iter_relpaths_at(
+        self,
+        keys: Sequence[FakeKey],
+        serial: int,
+    ) -> Iterator[object]:
+        names = tuple(key.keyname for key in keys)
+        self.iter_calls.append((names, serial))
+        if names != ("PROJSIMPLELINKS", "PROJVERSION"):
+            return
+        index = 0
+        while True:
+            self.consumed_rows += 1
+            yield info("PROJVERSION", f"root/dev/demo/{index}/.config", None)
+            index += 1
+
+
 class ZeroLengthLinksMapping(Mapping[str, object]):
     def __getitem__(self, key: str) -> object:
         if key == "links":
@@ -119,6 +152,7 @@ class FakeTransaction:
         self.error = error
         self.raise_after_first_file = raise_after_first_file
         self.iter_calls: list[tuple[tuple[str, ...], int]] = []
+        self.consumed_rows = 0
 
     def iter_relpaths_at(
         self,
@@ -131,6 +165,7 @@ class FakeTransaction:
             raise self.error
         for name in names:
             for row in self.rows.get(name, ()):
+                self.consumed_rows += 1
                 yield row
                 file_group = ("STAGEFILE", "PYPIFILE_NOMD5")
                 if self.raise_after_first_file and names == file_group:
@@ -374,6 +409,22 @@ def test_underreported_sequence_is_unclassified_after_probe() -> None:
     assert sequence.indexes == [0, 1]
 
 
+def test_declared_sequence_index_error_is_unclassified() -> None:
+    xom = FakeXom(
+        {
+            "PROJVERSION": [
+                info(
+                    "PROJVERSION",
+                    "root/dev/demo/1.0/.config",
+                    {"+elinks": EarlyIndexErrorSequence()},
+                )
+            ]
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+
+
 def test_links_are_checked_before_zero_length_mapping_report() -> None:
     xom = FakeXom(
         {
@@ -449,6 +500,84 @@ def test_live_file_candidate_returns_before_later_iterator_failure() -> None:
     )
 
     assert find_existing_artifact_candidate(xom) == "file_entry"
+    assert xom.keyfs.transaction.consumed_rows == 1
+
+
+def test_snapshot_row_budget_is_shared_across_scans() -> None:
+    rows = [
+        info(
+            "PROJVERSION",
+            f"root/dev/demo/{index}/.config",
+            None,
+        )
+        for index in range(4096)
+    ]
+    xom = FakeXom(
+        {
+            "PROJVERSION": rows,
+            "STAGEFILE": [info("STAGEFILE", "root/dev/+f/a.whl", {"size": 1})],
+        }
+    )
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert xom.keyfs.transaction.consumed_rows == 4097
+
+
+def test_snapshot_row_budget_bounds_valid_toxresult_rows() -> None:
+    rows = [
+        info(
+            "PROJVERSION",
+            f"root/dev/demo/{index}/.config",
+            {
+                "+elinks": (
+                    {
+                        "rel": "toxresult",
+                        "entrypath": f"root/dev/+f/{index}/demo.whl",
+                    },
+                )
+            },
+        )
+        for index in range(5000)
+    ]
+    xom = FakeXom({"PROJVERSION": rows})
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert xom.keyfs.transaction.consumed_rows == 4097
+
+
+def test_nested_relation_budget_is_cumulative_across_rows() -> None:
+    rows = [
+        info(
+            "PROJVERSION",
+            f"root/dev/demo/{index}/.config",
+            {
+                "+elinks": (
+                    {
+                        "rel": "toxresult",
+                        "entrypath": f"root/dev/+f/{index}-a/demo.whl",
+                    },
+                    {
+                        "rel": "toxresult",
+                        "entrypath": f"root/dev/+f/{index}-b/demo.whl",
+                    },
+                )
+            },
+        )
+        for index in range(2050)
+    ]
+    xom = FakeXom({"PROJVERSION": rows})
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert xom.keyfs.transaction.consumed_rows < len(rows)
+
+
+def test_nonterminating_tombstone_iterator_is_bounded() -> None:
+    xom = FakeXom({})
+    transaction = InfiniteTombstoneTransaction()
+    xom.keyfs.transaction = transaction
+
+    assert find_existing_artifact_candidate(xom) == "unclassified"
+    assert transaction.consumed_rows <= 4097
 
 
 @pytest.mark.parametrize("keyname", ["STAGEFILE", "PYPIFILE_NOMD5"])

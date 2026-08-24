@@ -48,6 +48,40 @@ class PragmaConnection:
             raise self.close_error
 
 
+class CloseFailingMigrationConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.rollback_calls = 0
+        self.close_calls = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.connection, name)
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.connection.close()
+        raise sqlite3.OperationalError(
+            "close secret",
+        )
+
+
+class MigrationConnectionFactory:
+    def __init__(
+        self,
+        path: Path,
+        connection: CloseFailingMigrationConnection,
+    ):
+        self.path = path
+        self.connection = connection
+
+    def connect(self) -> CloseFailingMigrationConnection:
+        return self.connection
+
+
 def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
@@ -156,6 +190,53 @@ def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
     assert [version[0] for version in versions] == [1, 2, 3]
+
+
+def test_migrate_close_failure_does_not_mask_primary_migration_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "guardian.db"
+    _seed_version_two_schema(path)
+    connection = CloseFailingMigrationConnection(
+        ConnectionFactory(path).connect(),
+    )
+    factory = MigrationConnectionFactory(path, connection)
+    primary = MigrationError(str(path))
+    real_validate_catalog = db._validate_catalog
+    calls = 0
+
+    def fail_after_current_catalog(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise primary
+        real_validate_catalog(*args, **kwargs)
+
+    monkeypatch.setattr(db, "_validate_catalog", fail_after_current_catalog)
+    with pytest.raises(MigrationError) as error:
+        migrate(factory)
+
+    assert error.value is primary
+    assert str(error.value) == str(path)
+    assert "close secret" not in str(error.value)
+    assert connection.rollback_calls == 1
+    assert connection.close_calls == 1
+
+
+def test_standalone_migration_close_failure_is_sanitized(tmp_path) -> None:
+    path = tmp_path / "guardian.db"
+    underlying = ConnectionFactory(path).connect()
+    connection = CloseFailingMigrationConnection(underlying)
+    factory = MigrationConnectionFactory(path, connection)
+
+    with pytest.raises(MigrationError) as error:
+        migrate(factory)
+
+    assert str(error.value) == str(path)
+    assert "close secret" not in str(error.value)
+    assert isinstance(error.value.__cause__, sqlite3.OperationalError)
+    assert connection.close_calls == 1
 
 
 def test_connection_enables_required_pragmas(tmp_path) -> None:

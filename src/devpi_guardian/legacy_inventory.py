@@ -28,10 +28,28 @@ _RELEASEFILE = "releasefile"
 _MISSING = object()
 # Keep persisted relation collections bounded during startup inventory.
 _MAX_SEQUENCE_ITEMS = 4096
+_MAX_SNAPSHOT_ROWS = 4096
+_MAX_NESTED_ITEMS = 4096
 
 
 class _MalformedInventory(Exception):
     """Internal bounded failure; no persisted value is attached."""
+
+
+class _InventoryBudget:
+    def __init__(self) -> None:
+        self.snapshot_rows = 0
+        self.nested_items = 0
+
+    def consume_snapshot_row(self) -> None:
+        self.snapshot_rows += 1
+        if self.snapshot_rows > _MAX_SNAPSHOT_ROWS:
+            raise _MalformedInventory
+
+    def consume_nested_item(self) -> None:
+        self.nested_items += 1
+        if self.nested_items > _MAX_NESTED_ITEMS:
+            raise _MalformedInventory
 
 
 def _candidate(candidate: ExistingArtifactCandidate) -> str:
@@ -97,8 +115,13 @@ def _as_sequence(value: object) -> list[object]:
         raise _MalformedInventory from exc
     if type(length) is not int or length < 0 or length > _MAX_SEQUENCE_ITEMS:
         raise _MalformedInventory
+    items = []
+    for index in range(length):
+        try:
+            items.append(value[index])
+        except Exception as exc:
+            raise _MalformedInventory from exc
     try:
-        items = [value[index] for index in range(length)]
         value[length]
     except IndexError:
         return items
@@ -106,6 +129,7 @@ def _as_sequence(value: object) -> list[object]:
         raise _MalformedInventory from exc
     except Exception as exc:
         raise _MalformedInventory from exc
+    raise _MalformedInventory
 
 
 def _info_fields(info: object) -> tuple[str, str, object]:
@@ -140,12 +164,13 @@ def _simple_link_path(item: object) -> str:
     return path
 
 
-def _check_simple_value(value: object) -> bool:
+def _check_simple_value(value: object, budget: _InventoryBudget) -> bool:
     mapping = _as_mapping(value)
     links = _mapping_value(mapping, "links")
     if links is not _MISSING:
         items = _as_sequence(links)
         for item in items:
+            budget.consume_nested_item()
             _simple_link_path(item)
         return bool(items)
     try:
@@ -161,6 +186,7 @@ def _check_version_value(
     value: object,
     known_non_artifacts: set[str],
     relation_paths: dict[str, set[str]],
+    budget: _InventoryBudget,
 ) -> bool:
     mapping = _as_mapping(value)
     elinks = _mapping_value(mapping, "+elinks")
@@ -169,6 +195,7 @@ def _check_version_value(
     items = _as_sequence(elinks)
     has_release = False
     for item in items:
+        budget.consume_nested_item()
         item_mapping = _as_mapping(item)
         relation = _mapping_value(item_mapping, "rel")
         entrypath = _mapping_value(item_mapping, "entrypath")
@@ -204,6 +231,7 @@ def _scan_snapshot(
 ) -> str | None:
     known_non_artifacts: set[str] = set()
     relation_paths: dict[str, set[str]] = {}
+    budget = _InventoryBudget()
 
     relation_infos = _iter_infos(
         tx,
@@ -211,15 +239,21 @@ def _scan_snapshot(
         serial,
     )
     for info in relation_infos:
+        budget.consume_snapshot_row()
         keyname, _relpath, value = _info_fields(info)
         if keyname not in {_PROJSIMPLELINKS, _PROJVERSION}:
             raise _MalformedInventory
         if value is None:
             continue
         if keyname == _PROJSIMPLELINKS:
-            if _check_simple_value(value):
+            if _check_simple_value(value, budget):
                 return _candidate(ExistingArtifactCandidate.RELEASE_LINK)
-        elif _check_version_value(value, known_non_artifacts, relation_paths):
+        elif _check_version_value(
+            value,
+            known_non_artifacts,
+            relation_paths,
+            budget,
+        ):
             return _candidate(ExistingArtifactCandidate.RELEASE_LINK)
 
     file_infos = _iter_infos(
@@ -228,6 +262,7 @@ def _scan_snapshot(
         serial,
     )
     for info in file_infos:
+        budget.consume_snapshot_row()
         keyname, relpath, value = _info_fields(info)
         if keyname not in {_STAGEFILE, _PYPIFILE_NOMD5}:
             raise _MalformedInventory
