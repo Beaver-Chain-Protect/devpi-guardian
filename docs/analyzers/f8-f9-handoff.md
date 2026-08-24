@@ -50,9 +50,7 @@ from devpi_guardian.analyzers import (
 
 # F5 and any worker handling untrusted artifacts MUST use the isolated APIs.
 limits = AnalysisLimits(timeout_seconds=20, memory_limit_mb=512)
-f8_findings = scan_install_surface_isolated(
-    "dist/demo-1.0.1-py3-none-any.whl", limits=limits
-)
+f8_findings = scan_install_surface_isolated("dist/demo-1.0.1-py3-none-any.whl", limits=limits)
 f9_findings = compare_sdist_wheel_isolated(
     "dist/demo-1.0.1.tar.gz",
     "dist/demo-1.0.1-py3-none-any.whl",
@@ -61,9 +59,7 @@ f9_findings = compare_sdist_wheel_isolated(
 
 # Direct APIs are for trusted offline tooling and unit tests only.
 trusted_f8 = scan_install_surface("dist/demo-1.0.1-py3-none-any.whl")
-trusted_f9 = compare_sdist_wheel(
-    "dist/demo-1.0.1.tar.gz", "dist/demo-1.0.1-py3-none-any.whl"
-)
+trusted_f9 = compare_sdist_wheel("dist/demo-1.0.1.tar.gz", "dist/demo-1.0.1-py3-none-any.whl")
 
 for finding in [*f8_findings, *f9_findings]:
     location = f"{finding.file}:{finding.line}" if finding.line else finding.file
