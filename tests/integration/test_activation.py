@@ -140,39 +140,51 @@ def test_guardian_cleanup_rejects_database_outside_owned_root(
 def test_guardian_cleanup_rejects_symlinked_guardian_directory(
     tmp_path: Path,
 ) -> None:
-    external = tmp_path.parent / "external-guardian"
-    external.mkdir()
-    outside = external / "guardian.db"
-    outside.write_bytes(b"must survive")
-    (tmp_path / "guardian").symlink_to(external, target_is_directory=True)
+    real_container = tmp_path / "real-container"
+    real_guardian = real_container / "guardian"
+    real_guardian.mkdir(parents=True)
+    database = real_guardian / "guardian.db"
+    sidecars = (
+        real_guardian / "guardian.db-wal",
+        real_guardian / "guardian.db-shm",
+    )
+    for path in (database, *sidecars):
+        path.write_bytes(b"must survive")
+    linked_guardian = tmp_path / "guardian"
+    linked_guardian.symlink_to(real_guardian, target_is_directory=True)
 
     with pytest.raises(ValueError):
         integration_conftest._remove_temporary_guardian_db(
-            tmp_path / "guardian" / "guardian.db",
+            linked_guardian / "guardian.db",
             tmp_path,
         )
 
-    assert outside.read_bytes() == b"must survive"
+    preserved = (database, *sidecars)
+    assert all(path.read_bytes() == b"must survive" for path in preserved)
 
 
-def test_guardian_cleanup_rejects_symlinked_database_and_sidecar(
+def test_guardian_cleanup_rejects_symlinked_database(
     tmp_path: Path,
 ) -> None:
     guardian = tmp_path / "guardian"
     guardian.mkdir()
-    external = tmp_path.parent / "external-db"
-    external.write_bytes(b"must survive")
+    real_database = tmp_path / "real-database"
+    real_database.write_bytes(b"must survive")
     database = guardian / "guardian.db"
-    database.symlink_to(external)
-    sidecar = guardian / "guardian.db-wal"
-    sidecar.write_bytes(b"must survive")
-    (guardian / "guardian.db-shm").symlink_to(external)
+    database.symlink_to(real_database)
+    sidecars = (
+        guardian / "guardian.db-wal",
+        guardian / "guardian.db-shm",
+    )
+    for path in sidecars:
+        path.write_bytes(b"must survive")
 
     with pytest.raises(ValueError):
         integration_conftest._remove_temporary_guardian_db(database, tmp_path)
 
-    assert external.read_bytes() == b"must survive"
-    assert sidecar.read_bytes() == b"must survive"
+    assert real_database.read_bytes() == b"must survive"
+    assert database.is_symlink()
+    assert all(path.read_bytes() == b"must survive" for path in sidecars)
 
 
 def test_guardian_cleanup_rejects_symlinked_sidecar_without_deleting_database(
@@ -182,16 +194,47 @@ def test_guardian_cleanup_rejects_symlinked_sidecar_without_deleting_database(
     guardian.mkdir()
     database = guardian / "guardian.db"
     database.write_bytes(b"must survive")
-    external = tmp_path.parent / "external-sidecar"
-    external.write_bytes(b"must survive")
-    (guardian / "guardian.db-wal").symlink_to(external)
-    (guardian / "guardian.db-shm").write_bytes(b"must survive")
+    real_sidecar = tmp_path / "real-sidecar"
+    real_sidecar.write_bytes(b"must survive")
+    sidecar = guardian / "guardian.db-wal"
+    sidecar.symlink_to(real_sidecar)
+    other_sidecar = guardian / "guardian.db-shm"
+    other_sidecar.write_bytes(b"must survive")
 
     with pytest.raises(ValueError):
         integration_conftest._remove_temporary_guardian_db(database, tmp_path)
 
     assert database.read_bytes() == b"must survive"
-    assert external.read_bytes() == b"must survive"
+    assert real_sidecar.read_bytes() == b"must survive"
+    assert sidecar.is_symlink()
+    assert other_sidecar.read_bytes() == b"must survive"
+
+
+def test_guardian_cleanup_rejects_symlinked_allowed_root(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-root"
+    real_root.mkdir()
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    guardian = real_root / "guardian"
+    guardian.mkdir()
+    database = guardian / "guardian.db"
+    sidecars = (
+        guardian / "guardian.db-wal",
+        guardian / "guardian.db-shm",
+    )
+    for path in (database, *sidecars):
+        path.write_bytes(b"must survive")
+
+    with pytest.raises(ValueError):
+        integration_conftest._remove_temporary_guardian_db(
+            linked_root / "guardian" / "guardian.db",
+            linked_root,
+        )
+
+    preserved = (database, *sidecars)
+    assert all(path.read_bytes() == b"must survive" for path in preserved)
 
 
 def test_activation_marker_survives_restart_and_legacy_reset_fails_closed(
