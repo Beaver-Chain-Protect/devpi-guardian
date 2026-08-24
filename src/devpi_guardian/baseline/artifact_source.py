@@ -28,7 +28,7 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 #: Matches `analyzers.archive.MAX_UNCOMPRESSED_SIZE`, so a download can never
 #: hand the extractor more bytes than the extractor would accept.
@@ -37,8 +37,9 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 _CHUNK_SIZE = 1024 * 1024
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
-_HASH_PREFIX_PATTERN = re.compile(r"[0-9a-f]{2,}", re.ASCII)
-_ARTIFACT_MARKERS = frozenset({"+f", "+e"})
+_HASH_PREFIX_PATTERN = re.compile(r"[0-9a-f]{3}", re.ASCII)
+_HASH_SUFFIX_PATTERN = re.compile(r"[0-9a-f]{13}", re.ASCII)
+_SAFE_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*", re.ASCII)
 
 
 class ArtifactDownloadError(Exception):
@@ -92,7 +93,7 @@ class HttpArtifactBytesSource:
     comparison is done:
 
         with HttpArtifactBytesSource(
-            session, lookup, trusted_origin="https://devpi.example"
+            session, lookup, trusted_devpi_url="https://devpi.example"
         ) as source:
             ...
 
@@ -104,7 +105,7 @@ class HttpArtifactBytesSource:
         session: HttpSession,
         resolver: OriginUrlResolver,
         *,
-        trusted_origin: str,
+        trusted_devpi_url: str,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_bytes: int = MAX_ARTIFACT_BYTES,
     ) -> None:
@@ -112,7 +113,7 @@ class HttpArtifactBytesSource:
             raise ValueError("max_bytes must be positive")
         self._session = session
         self._resolver = resolver
-        self._trusted_origin = _canonical_origin(trusted_origin)
+        self._trusted_base = _canonical_devpi_base(trusted_devpi_url)
         self._timeout = timeout
         self._max_bytes = max_bytes
         self._root: Path | None = None
@@ -191,8 +192,7 @@ class HttpArtifactBytesSource:
 
     def _url_for(self, digest: str) -> str:
         url = self._resolver.origin_url(digest)
-        _validate_artifact_url(url, self._trusted_origin)
-        return url
+        return _validate_artifact_url(url, digest, self._trusted_base)
 
     def _expected_size_for(self, digest: str) -> int:
         size = self._resolver.expected_size(digest)
@@ -244,44 +244,41 @@ class HttpArtifactBytesSource:
         return digest.hexdigest()
 
 
-def _canonical_origin(value: str) -> tuple[str, str, int]:
-    """Return the normalized origin tuple used for same-origin checks."""
+def _canonical_devpi_base(value: str) -> tuple[str, str, int, str]:
+    """Return the normalized scheme, host, port, and mount path."""
 
     if type(value) is not str:
-        raise ValueError("trusted_origin must be a URL string")
+        raise ValueError("trusted_devpi_url must be a URL string")
+    if _has_control(value):
+        raise ValueError("trusted_devpi_url contains control characters")
     try:
         parsed = urlsplit(value)
         scheme = parsed.scheme.lower()
         hostname = parsed.hostname
         port = parsed.port
     except ValueError as exc:
-        raise ValueError(f"invalid trusted_origin: {value!r}") from exc
+        raise ValueError(f"invalid trusted_devpi_url: {value!r}") from exc
     if scheme not in _ALLOWED_SCHEMES or not hostname:
-        raise ValueError(f"invalid trusted_origin: {value!r}")
+        raise ValueError(f"invalid trusted_devpi_url: {value!r}")
+    if not hostname.isascii() or "%" in parsed.netloc:
+        raise ValueError("trusted_devpi_url host must be ASCII and unencoded")
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("trusted_origin must not contain credentials")
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        raise ValueError("trusted_origin must contain only scheme, host, and port")
-    try:
-        host = _canonical_host(hostname)
-    except ValueError as exc:
-        raise ValueError(f"invalid trusted_origin: {value!r}") from exc
-    return scheme, host, port if port is not None else _default_port(scheme)
-
-
-def _canonical_host(hostname: str) -> str:
-    try:
-        host = hostname.encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise ValueError(f"host 이름이 유효하지 않음: {hostname!r}") from exc
-    return host.removesuffix(".")
+        raise ValueError("trusted_devpi_url must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("trusted_devpi_url must not contain query or fragment")
+    base_path = _validated_base_path(parsed.path)
+    host = hostname.lower()
+    if host.endswith("."):
+        raise ValueError("trusted_devpi_url host has ambiguous trailing dot")
+    effective_port = port if port is not None else _default_port(scheme)
+    return scheme, host, effective_port, base_path
 
 
 def _default_port(scheme: str) -> int:
     return 443 if scheme == "https" else 80
 
 
-def _validate_artifact_url(url: str, trusted_origin: tuple[str, str, int]) -> None:
+def _validate_artifact_url(url: str, digest: str, trusted_base: tuple[str, str, int, str]) -> str:
     try:
         parsed = urlsplit(url)
         scheme = parsed.scheme.lower()
@@ -291,46 +288,87 @@ def _validate_artifact_url(url: str, trusted_origin: tuple[str, str, int]) -> No
         raise ArtifactDownloadError(f"origin_url이 유효하지 않음: {url!r}") from exc
     if scheme not in _ALLOWED_SCHEMES or not hostname:
         raise ArtifactDownloadError(f"지원하지 않는 origin_url 스킴 또는 호스트: {url}")
+    if not hostname.isascii() or "%" in parsed.netloc:
+        raise ArtifactDownloadError(f"origin_url 호스트가 ASCII가 아니거나 인코딩됨: {url}")
     if parsed.username is not None or parsed.password is not None:
         raise ArtifactDownloadError("origin_url에 credentials가 포함됨")
     if parsed.query or parsed.fragment:
         raise ArtifactDownloadError("origin_url에 query 또는 fragment가 포함됨")
-    try:
-        origin = (
-            scheme,
-            _canonical_host(hostname),
-            port if port is not None else _default_port(scheme),
-        )
-    except ValueError as exc:
-        raise ArtifactDownloadError(f"origin_url의 호스트가 유효하지 않음: {url}") from exc
-    if origin != trusted_origin:
-        raise ArtifactDownloadError(f"origin_url이 trusted origin과 다름: {url}")
+    trusted_scheme, trusted_host, trusted_port, base_path = trusted_base
+    stored_host = hostname.lower()
+    if stored_host.endswith("."):
+        raise ArtifactDownloadError(f"origin_url 호스트의 trailing dot이 모호함: {url}")
+    stored_port = port if port is not None else _default_port(scheme)
+    if (scheme, stored_host, stored_port) != (trusted_scheme, trusted_host, trusted_port):
+        raise ArtifactDownloadError(f"origin_url이 trusted devpi URL과 다름: {url}")
 
     path = parsed.path
     if (
         not path.startswith("/")
+        or path.startswith("//")
         or "%" in path
         or "\\" in path
-        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+        or _has_control(path)
     ):
         raise ArtifactDownloadError(f"artifact 경로가 정규화되지 않음: {url}")
-    parts = path.split("/")[1:]
+    if base_path:
+        prefix = f"{base_path}/"
+        if not path.startswith(prefix):
+            raise ArtifactDownloadError(f"artifact 경로가 trusted mount 밖에 있음: {url}")
+        prefix_length = len(prefix)
+        relative_path = path[prefix_length:]
+    else:
+        relative_path = path.lstrip("/")
+    parts = relative_path.split("/")
     if not parts or any(not part or part in {".", ".."} for part in parts):
         raise ArtifactDownloadError(f"artifact 경로가 완전하지 않음: {url}")
-    marker_indexes = [index for index, part in enumerate(parts) if part in _ARTIFACT_MARKERS]
-    if len(marker_indexes) != 1:
-        raise ArtifactDownloadError(f"artifact route marker가 모호함: {url}")
-    marker = marker_indexes[0]
-    if parts[marker] == "+f":
-        if marker + 3 != len(parts) or _HASH_PREFIX_PATTERN.fullmatch(parts[marker + 1]) is None:
-            raise ArtifactDownloadError(f"artifact route가 완전하지 않음: {url}")
-        filename = parts[marker + 2]
+    if len(parts) < 3 or not all(_is_safe_component(part) for part in parts[:2]):
+        raise ArtifactDownloadError(f"devpi stage 경로가 유효하지 않음: {url}")
+    marker = parts[2]
+    if marker == "+f":
+        if len(parts) != 6:
+            raise ArtifactDownloadError(f"+f artifact route가 완전하지 않음: {url}")
+        first, second, filename = parts[3:]
+        if (
+            _HASH_PREFIX_PATTERN.fullmatch(first) is None
+            or _HASH_SUFFIX_PATTERN.fullmatch(second) is None
+            or first + second != digest[:16]
+            or not _is_safe_component(filename)
+        ):
+            raise ArtifactDownloadError(f"+f artifact route가 digest와 일치하지 않음: {url}")
+    elif marker == "+e":
+        if len(parts) != 5 or not all(_is_safe_component(part) for part in parts[3:]):
+            raise ArtifactDownloadError(f"+e artifact route가 완전하지 않음: {url}")
     else:
-        if marker + 2 >= len(parts):
-            raise ArtifactDownloadError(f"artifact route가 완전하지 않음: {url}")
-        filename = parts[-1]
-    if filename in {".", ".."} or not filename.strip() or not filename.lstrip("."):
-        raise ArtifactDownloadError(f"artifact filename이 완전하지 않음: {url}")
+        raise ArtifactDownloadError(f"artifact route marker가 유효하지 않음: {url}")
+    canonical_path = f"{base_path}/{relative_path}" if base_path else f"/{relative_path}"
+    return urlunsplit((scheme, _render_netloc(stored_host, stored_port), canonical_path, "", ""))
+
+
+def _validated_base_path(path: str) -> str:
+    if not path or path == "/":
+        return ""
+    if not path.startswith("/") or path.endswith("/"):
+        raise ValueError("trusted_devpi_url base path is not normalized")
+    if "%" in path or "\\" in path or _has_control(path):
+        raise ValueError("trusted_devpi_url base path is not safe")
+    parts = path[1:].split("/")
+    if not parts or not all(_is_safe_component(part) for part in parts):
+        raise ValueError("trusted_devpi_url base path is not safe")
+    return "/" + "/".join(parts)
+
+
+def _is_safe_component(value: str) -> bool:
+    return value not in {".", ".."} and _SAFE_COMPONENT_PATTERN.fullmatch(value) is not None
+
+
+def _has_control(value: str) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+
+
+def _render_netloc(host: str, port: int) -> str:
+    rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{rendered_host}:{port}"
 
 
 def _local_name(digest: str, url: str) -> str:

@@ -249,13 +249,17 @@ def test_the_origin_url_of_a_returned_release_is_resolvable(tmp_path):
         SHA_OLD,
         version="1.0.0",
         filename="demo_package-1.0.0-py3-none-any.whl",
-        origin_url="https://devpi.example/root/dev/+f/aa/demo_package-1.0.0-py3-none-any.whl",
+        origin_url=(
+            f"https://devpi.example/root/dev/+f/{SHA_OLD[:3]}"
+            f"/{SHA_OLD[3:16]}/demo_package-1.0.0-py3-none-any.whl"
+        ),
     )
 
     lookup = build_lookup(factory)
     lookup.allowed_releases("demo-package")
     assert lookup.origin_url(SHA_OLD) == (
-        "https://devpi.example/root/dev/+f/aa/demo_package-1.0.0-py3-none-any.whl"
+        f"https://devpi.example/root/dev/+f/{SHA_OLD[:3]}"
+        f"/{SHA_OLD[3:16]}/demo_package-1.0.0-py3-none-any.whl"
     )
     assert lookup.expected_size(SHA_OLD) == 1
 

@@ -69,7 +69,7 @@ def seed_release(
     filename: str = "demo_package-1.0.0-py3-none-any.whl",
     origin_url: str | None = None,
 ) -> None:
-    default_origin = f"https://devpi.example/{stage}/+f/{sha256[:2]}/{filename}"
+    default_origin = f"https://devpi.example/{stage}/+f/{sha256[:3]}/{sha256[3:16]}/{filename}"
     with closing(factory.connect()) as connection, connection:
         connection.execute(
             """
