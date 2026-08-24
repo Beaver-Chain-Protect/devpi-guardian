@@ -7,8 +7,12 @@ This file applies to the entire repository.
 - Approved design: `docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md`
 - Approved baseline-tier extension:
   `docs/superpowers/specs/2026-08-21-verdict-baseline-tier-design.md`
+- Approved PR #1 hardening addendum:
+  `docs/superpowers/specs/2026-08-24-pr1-safe-activation-f5-quarantine-design.md`
 - Execution plan: `docs/superpowers/plans/2026-08-17-f3-f4-enforcement-verdict-store.md`
 - The baseline-tier extension takes precedence only for the `baseline_tier` contract.
+- For activation support, F5 Artifact bytes, CI, and PR review status, the hardening
+  addendum takes precedence over the base design.
 - If code, plan, and design disagree, stop implementation and resolve the disagreement before proceeding.
 
 ## Agent roles

@@ -6,6 +6,11 @@
 - 범위: F3 직접 URL 차단, F4 Artifact 판정 저장소
 - 구현 저장소: `devpi-guardian`
 
+> **2026-08-24 activation/F5/CI 보완:** 기존 devpi 활성화 정책, F5 미승인
+> Artifact 읽기 경로, CI와 독립 리뷰 조건은
+> [`2026-08-24-pr1-safe-activation-f5-quarantine-design.md`](./2026-08-24-pr1-safe-activation-f5-quarantine-design.md)가
+> 이 문서를 보완하며, 해당 항목에서는 새 문서가 우선한다.
+
 > **2026-08-18 final resolver/metrics/fixture correction:** Protected
 > `GET`/`HEAD` requests require at least one of `REQUEST_URI`, `RAW_URI`, or
 > `RAW_PATH_INFO`; every present key must match the decoded identity. Literal
