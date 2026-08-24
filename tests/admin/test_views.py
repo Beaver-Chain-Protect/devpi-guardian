@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+from devpi_guardian.admin.service import AdminFeatureUnavailable, GuardianAdminService
+from devpi_guardian.admin.views import (
+    ADMIN_SERVICE_REGISTRY_KEY,
+    add_baseline,
+    approve_artifact,
+    artifact_diff,
+    import_baselines,
+    inspect_artifact,
+    list_audit,
+    list_baselines,
+    list_quarantine,
+    policy_simulate,
+    policy_validate,
+    remove_baseline,
+)
+from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+from devpi_guardian.verdicts.errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
+from devpi_guardian.verdicts.models import (
+    ArtifactInput,
+    ArtifactState,
+    Decision,
+    ReleaseInput,
+    VerdictInput,
+)
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
+from devpi_guardian.verdicts.store import SQLiteArtifactStore
+
+SHA256 = "a" * 64
+
+
+class Service:
+    def list_quarantine(self, *, states, limit, offset):
+        self.list_call = states, limit, offset
+        return SimpleNamespace(items=(), total=0, limit=limit, offset=offset)
+
+    def inspect(self, sha256):
+        self.inspect_call = sha256
+        if sha256 == "b" * 64:
+            raise ArtifactNotFound(sha256)
+        return SimpleNamespace(summary=SimpleNamespace(sha256=sha256))
+
+    def approve(self, sha256, *, actor, reason):
+        self.approve_call = sha256, actor, reason
+        if reason == "conflict":
+            raise TransitionConflict(sha256)
+
+    def artifact_diff(self, sha256):
+        return {"sha256": sha256, "files": {"added": ["pkg/new.py"]}}
+
+    def list_audit(self, *, sha256, actor, action, limit, offset):
+        self.audit_call = sha256, actor, action, limit, offset
+        return {"items": [], "total": 0}
+
+    def list_baselines(self, project):
+        self.baseline_list_call = project
+        return ({"project": project, "sha256": SHA256},)
+
+    def add_baseline(self, sha256, *, actor, reason):
+        self.baseline_add_call = sha256, actor, reason
+
+    def remove_baseline(self, sha256, *, actor, reason):
+        self.baseline_remove_call = sha256, actor, reason
+
+    def import_baselines(self, records, *, actor, reason):
+        self.baseline_import_call = records, actor, reason
+        return {"imported": len(records)}
+
+    def validate_policy(self, policy):
+        self.policy_validate_call = policy
+        return {"valid": True}
+
+    def simulate_policy(self, policy, *, sha256):
+        self.policy_simulate_call = policy, sha256
+        return {"decision": "REVIEW", "sha256": sha256}
+
+
+def request(service, *, sha256=SHA256, params=None, body=None, actor="root"):
+    return SimpleNamespace(
+        registry={ADMIN_SERVICE_REGISTRY_KEY: service},
+        matchdict={"sha256": sha256},
+        params=params or {},
+        json_body=body or {},
+        authenticated_userid=actor,
+    )
+
+
+def test_list_quarantine_validates_filters_and_serializes_page() -> None:
+    service = Service()
+    response = list_quarantine(
+        request(
+            service,
+            params={"state": "REVIEW,DENY", "limit": "20", "offset": "5"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.json_body == {"items": [], "total": 0, "limit": 20, "offset": 5}
+    assert service.list_call == (
+        (ArtifactState.REVIEW, ArtifactState.DENY),
+        20,
+        5,
+    )
+
+
+def test_inspect_maps_missing_artifact_to_stable_404() -> None:
+    response = inspect_artifact(request(Service(), sha256="b" * 64))
+
+    assert response.status_code == 404
+    assert response.json_body["error"]["code"] == "artifact_not_found"
+
+
+def test_approve_uses_authenticated_actor_and_requires_reason() -> None:
+    service = Service()
+    response = approve_artifact(
+        request(service, body={"reason": "reviewed"}, actor="guardian-admin")
+    )
+
+    assert response.status_code == 200
+    assert service.approve_call == (SHA256, "guardian-admin", "reviewed")
+
+    invalid = approve_artifact(request(service, body={"reason": ""}))
+    assert invalid.status_code == 400
+    assert invalid.json_body["error"]["code"] == "invalid_request"
+
+
+def test_approve_maps_state_conflict_to_409() -> None:
+    response = approve_artifact(request(Service(), body={"reason": "conflict"}))
+
+    assert response.status_code == 409
+    assert response.json_body["error"]["code"] == "transition_conflict"
+
+
+def test_diff_audit_and_baseline_reads_have_stable_responses() -> None:
+    service = Service()
+
+    diff = artifact_diff(request(service))
+    audit = list_audit(
+        request(
+            service,
+            params={
+                "sha256": SHA256,
+                "actor": "root",
+                "action": "artifact.approve",
+                "limit": "20",
+                "offset": "5",
+            },
+        )
+    )
+    baselines = list_baselines(request(service, params={"project": "Demo_Pkg"}))
+
+    assert diff.json_body["diff"]["sha256"] == SHA256
+    assert audit.json_body == {"items": [], "total": 0, "limit": 20, "offset": 5}
+    assert service.audit_call == (SHA256, "root", "artifact.approve", 20, 5)
+    assert baselines.json_body["items"][0]["project"] == "Demo_Pkg"
+
+
+def test_baseline_mutations_use_authenticated_actor_and_reason() -> None:
+    service = Service()
+    add = add_baseline(request(service, body={"sha256": SHA256, "reason": "trusted"}))
+    remove = remove_baseline(request(service, body={"reason": "revoked"}))
+    imported = import_baselines(
+        request(
+            service,
+            body={"records": [{"sha256": SHA256}], "reason": "bootstrap"},
+        )
+    )
+
+    assert add.status_code == 200
+    assert remove.status_code == 200
+    assert imported.json_body["imported"] == 1
+    assert service.baseline_add_call == (SHA256, "root", "trusted")
+    assert service.baseline_remove_call == (SHA256, "root", "revoked")
+    assert service.baseline_import_call == (({"sha256": SHA256},), "root", "bootstrap")
+
+
+def test_policy_validate_and_simulate_require_policy_object() -> None:
+    service = Service()
+    valid = policy_validate(request(service, body={"policy": {"revision": "2"}}))
+    simulated = policy_simulate(
+        request(
+            service,
+            body={"policy": {"revision": "2"}, "sha256": SHA256},
+        )
+    )
+
+    assert valid.json_body == {"valid": True}
+    assert simulated.json_body["decision"] == "REVIEW"
+    assert service.policy_validate_call == {"revision": "2"}
+    assert service.policy_simulate_call == ({"revision": "2"}, SHA256)
+
+
+def test_unconnected_feature_returns_specific_retryable_503() -> None:
+    class UnavailableService(Service):
+        def artifact_diff(self, sha256):
+            raise AdminFeatureUnavailable("artifact_diff")
+
+    response = artifact_diff(request(UnavailableService()))
+
+    assert response.status_code == 503
+    assert response.json_body == {
+        "error": {
+            "code": "artifact_diff_unavailable",
+            "message": "artifact_diff provider is unavailable",
+        }
+    }
+
+
+def test_admin_view_maps_audit_failure_to_503_and_rolls_back(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+
+    class FailingAuditWriter:
+        def append_in_transaction(self, _connection, _event) -> None:
+            raise StoreUnavailable("forced audit failure")
+
+    class WorkingAuditWriter:
+        def append_in_transaction(self, connection, event) -> None:
+            from devpi_guardian.audit import SQLiteAuditWriter
+
+            SQLiteAuditWriter().append_in_transaction(connection, event)
+
+    store = SQLiteArtifactStore(factory, WorkingAuditWriter(), now=lambda: now)
+    sha256 = "a" * 64
+    store.discover_artifact(
+        ArtifactInput(sha256=sha256, size_bytes=12, discovered_at=now),
+        ReleaseInput(
+            stage="root/pypi",
+            project="demo",
+            version="1.0",
+            filename="demo-1.0.tar.gz",
+            sha256=sha256,
+            origin_url="https://example.test/demo-1.0.tar.gz",
+            discovered_at=now,
+        ),
+    )
+    claim = store.claim_next("worker", now + timedelta(minutes=5))
+    assert claim is not None
+    store.record_verdict(
+        claim,
+        VerdictInput(
+            sha256=sha256,
+            decision=Decision.REVIEW,
+            score=50,
+            policy_version="policy-1",
+            analyzer_version="analyzer-1",
+            baseline_sha256=None,
+            baseline_tier=None,
+            created_at=now,
+        ),
+        (),
+    )
+    store._audit_writer = FailingAuditWriter()
+    service = GuardianAdminService(
+        reader=SQLiteVerdictReader(factory, now=lambda: now),
+        store=store,
+        now=lambda: now,
+    )
+
+    response = approve_artifact(
+        request(service, sha256=sha256, body={"reason": "forced failure"}, actor="admin")
+    )
+
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "store_unavailable"
+    with factory.connect() as connection:
+        artifact = connection.execute(
+            "SELECT state FROM artifacts WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        overrides = connection.execute(
+            "SELECT COUNT(*) FROM manual_overrides WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+    assert artifact[0] == "REVIEW"
+    assert overrides[0] == 0

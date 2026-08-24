@@ -2,16 +2,24 @@
 # Keep devpi's no-section, from-first style in this integration-facing test.
 # ruff: noqa: I001
 from devpi_guardian import plugin
+from devpi_guardian.admin.views import ADMIN_SERVICE_REGISTRY_KEY
 from devpi_guardian.enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from devpi_guardian.enforcement.metrics import InMemoryBlockMetricRecorder
 from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
 from devpi_guardian.plugin import devpiserver_add_parser_options
 from devpi_guardian.plugin import devpiserver_pyramid_configure
+from devpi_guardian.audit import SQLiteAuditWriter
+from devpi_guardian.audit import verify_audit_chain
 from devpi_guardian.worker.discovery import FileDiscoverySink
 from devpi_guardian.worker.discovery import get_discovery_sink
 from devpi_guardian.verdicts.errors import StoreUnavailable
+from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+from devpi_guardian.verdicts.models import AuditEventInput, ArtifactInput, Decision
+from devpi_guardian.verdicts.models import ReleaseInput, VerdictInput
+from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from devpi_server.model import BaseStageCustomizer
 from devpi_server.model import InvalidIndexconfig
+from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,9 +43,17 @@ class FakePyramidConfig:
         self.xom = SimpleNamespace()
         self.registry = {"xom": self.xom}
         self.tweens = []
+        self.routes = []
+        self.views = []
 
     def add_tween(self, name, **kwargs):
         self.tweens.append((name, kwargs))
+
+    def add_route(self, name, path):
+        self.routes.append((name, path))
+
+    def add_view(self, view, **kwargs):
+        self.views.append((view, kwargs))
 
 
 def test_package_exposes_devpi_server_entry_point() -> None:
@@ -165,6 +181,32 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     metrics = pyramid.registry[BLOCK_METRIC_REGISTRY_KEY]
     assert isinstance(metrics, InMemoryBlockMetricRecorder)
     assert metrics.snapshot() == {}
+    assert pyramid.registry[ADMIN_SERVICE_REGISTRY_KEY].health() == {
+        "database": "ok",
+        "schema_version": 4,
+        "mutations_ready": True,
+        "worker": {"status": "unavailable"},
+        "features": {
+            "audit": False,
+            "artifact_diff": False,
+            "baseline": False,
+            "policy": False,
+        },
+    }
+    assert len(pyramid.routes) == 14
+    assert len(pyramid.views) == 15
+    assert len({path for _, path in pyramid.routes}) == len(pyramid.routes)
+    assert all(options["permission"] == "user_modify" for _, options in pyramid.views)
+    baseline_methods = {
+        options["request_method"]
+        for _, options in pyramid.views
+        if options["route_name"] == "guardian_baselines"
+    }
+    assert baseline_methods == {"GET", "POST"}
+    route_names = [name for name, _ in pyramid.routes]
+    assert route_names.index("guardian_baseline_import") < route_names.index(
+        "guardian_baseline_remove"
+    )
     discovery_sink = get_discovery_sink(pyramid.xom)
     assert isinstance(discovery_sink, FileDiscoverySink)
     assert discovery_sink.root == tmp_path / "discovery"
@@ -180,10 +222,173 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert (tmp_path / "guardian.db").exists()
     with sqlite3.connect(tmp_path / "guardian.db") as connection:
         migration_query = "SELECT MAX(version) FROM schema_migrations"
-        assert connection.execute(migration_query).fetchone() == (3,)
+        assert connection.execute(migration_query).fetchone() == (4,)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("restrict_modify", "allowed_principals"),
+    [
+        (None, {"root"}),
+        (("guardian-admin", "root"), {"guardian-admin", "root"}),
+    ],
+)
+def test_guardian_admin_routes_use_devpi_root_or_restrict_modify_admins(
+    restrict_modify,
+    allowed_principals,
+) -> None:
+    from devpi_server.view_auth import RootFactory
+    from pyramid.authorization import Allow
+
+    hook = SimpleNamespace(devpiserver_auth_denials=lambda **_kwargs: [])
+    xom = SimpleNamespace(
+        config=SimpleNamespace(restrict_modify=restrict_modify, hook=hook),
+        model=SimpleNamespace(),
+    )
+    request = SimpleNamespace(
+        registry={"xom": xom},
+        matchdict={"sha256": "a" * 64},
+    )
+
+    acl = RootFactory(request).__acl__
+    user_modify_principals = {
+        principal
+        for action, principal, permission in acl
+        if action is Allow and permission == "user_modify"
+    }
+
+    assert user_modify_principals == allowed_principals
+
+
+def test_pyramid_hook_rejects_corrupted_audit_chain_before_side_effects(tmp_path) -> None:
+    db_path = tmp_path / "guardian.db"
+    factory = ConnectionFactory(db_path)
+    migrate(factory)
+    writer = SQLiteAuditWriter()
+    event = AuditEventInput(
+        actor="seed",
+        action="seed.event",
+        sha256="a" * 64,
+        previous_decision=Decision.DENY,
+        new_decision=Decision.REVIEW,
+        reason="seed event",
+        policy_version=None,
+        analyzer_version=None,
+        occurred_at=datetime(2026, 8, 24, tzinfo=UTC),
+    )
+    with factory.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                sha256, size_bytes, state, discovered_at, updated_at
+            ) VALUES (?, ?, 'DISCOVERED', ?, ?)
+            """,
+            ("a" * 64, 1, "2026-08-24T00:00:00+00:00", "2026-08-24T00:00:00+00:00"),
+        )
+        writer.append_in_transaction(connection, event)
+        connection.commit()
+        connection.execute(
+            """
+            INSERT INTO audit_events(
+                id, event_version, canonicalization_version, occurred_at,
+                actor, action, sha256, previous_decision, new_decision,
+                reason, policy_version, analyzer_version, previous_hash,
+                event_hash
+            )
+            SELECT 2, event_version, canonicalization_version, occurred_at,
+                   actor, action, sha256, previous_decision, new_decision,
+                   reason, policy_version, analyzer_version, event_hash, ?
+            FROM audit_events WHERE id = 1
+            """,
+            ("f" * 64,),
+        )
+
+    pyramid = FakePyramidConfig()
+    pyramid.registry["sentinel"] = object()
+    pyramid.xom.sentinel = object()
+    config = SimpleNamespace(
+        args=SimpleNamespace(guardian_db=str(db_path)),
+        server_path=tmp_path / "server",
+    )
+
+    with pytest.raises(StoreUnavailable):
+        devpiserver_pyramid_configure(config, pyramid)
+
+    assert pyramid.registry == {"xom": pyramid.xom, "sentinel": pyramid.registry["sentinel"]}
+    assert pyramid.xom.sentinel is not None
+    assert not hasattr(pyramid.xom, "_devpi_guardian_verdict_reader")
+    assert pyramid.routes == []
+    assert pyramid.views == []
+    assert pyramid.tweens == []
+
+
+def test_plugin_created_admin_service_audits_admin_transitions(tmp_path) -> None:
+    pyramid = FakePyramidConfig()
+    now = datetime(2026, 8, 24, tzinfo=UTC)
+    config = SimpleNamespace(
+        args=SimpleNamespace(guardian_db=str(tmp_path / "guardian.db")),
+        server_path=tmp_path / "server",
+    )
+
+    devpiserver_pyramid_configure(config, pyramid)
+    service = pyramid.registry[ADMIN_SERVICE_REGISTRY_KEY]
+    store = service._store
+    assert isinstance(store, SQLiteArtifactStore)
+    store._now = lambda: now
+    sha256 = "a" * 64
+    store.discover_artifact(
+        ArtifactInput(sha256=sha256, size_bytes=12, discovered_at=now),
+        ReleaseInput(
+            stage="root/pypi",
+            project="demo",
+            version="1.0",
+            filename="demo-1.0.tar.gz",
+            sha256=sha256,
+            origin_url="https://example.test/demo-1.0.tar.gz",
+            discovered_at=now,
+        ),
+    )
+    claim = store.claim_next("worker", now + timedelta(minutes=5))
+    assert claim is not None
+    store.record_verdict(
+        claim,
+        VerdictInput(
+            sha256=sha256,
+            decision=Decision.REVIEW,
+            score=50,
+            policy_version="policy-1",
+            analyzer_version="analyzer-1",
+            baseline_sha256=None,
+            baseline_tier=None,
+            created_at=now,
+        ),
+        (),
+    )
+
+    service.approve(sha256, actor="alice", reason="manual review passed")
+    service.block(sha256, actor="bob", reason="new concern")
+    service.rescan(sha256, actor="carol", reason="policy updated")
+
+    with ConnectionFactory(tmp_path / "guardian.db").connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT action, actor, reason, previous_decision, new_decision
+            FROM audit_events
+            WHERE action IN (
+                'artifact.override_set', 'artifact.rescan_requested'
+            )
+            ORDER BY id
+            """
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("artifact.override_set", "alice", "manual review passed", "DENY", "ALLOW"),
+        ("artifact.override_set", "bob", "new concern", "ALLOW", "DENY"),
+        ("artifact.rescan_requested", "carol", "policy updated", "DENY", "DENY"),
+    ]
+    assert verify_audit_chain(ConnectionFactory(tmp_path / "guardian.db")).valid
 
 
 def test_pyramid_hook_uses_deterministic_default_path(tmp_path) -> None:

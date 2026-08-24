@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from .db import ConnectionFactory
-from .errors import StoreUnavailable
+from .errors import ArtifactNotFound, StoreUnavailable
 from .invariants import (
     PersistedStateContext,
     PersistedStateCorruption,
@@ -15,10 +16,14 @@ from .invariants import (
 )
 from .models import (
     AllowedRelease,
+    ArtifactAdminDetails,
+    ArtifactAdminSummary,
     ArtifactState,
     Decision,
     DecisionSource,
     EnforcementDecision,
+    EvidenceRecord,
+    QuarantinePage,
     ReleaseArtifact,
     require_utc,
     validate_sha256,
@@ -68,6 +73,169 @@ class SQLiteVerdictReader:
             raise StoreUnavailable(str(self._factory.path)) from exc
 
         return results
+
+    def list_quarantine(
+        self,
+        *,
+        states: tuple[ArtifactState, ...],
+        limit: int,
+        offset: int,
+    ) -> QuarantinePage:
+        if not states or any(
+            type(state) is not ArtifactState
+            or state in (ArtifactState.ALLOW, ArtifactState.MISSING)
+            for state in states
+        ):
+            raise ValueError("invalid quarantine states")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be non-negative")
+        values = tuple(dict.fromkeys(state.value for state in states))
+        placeholders = ", ".join("?" for _ in values)
+        try:
+            with self._read_transaction() as connection:
+                total = connection.execute(
+                    f"SELECT COUNT(*) FROM artifacts WHERE state IN ({placeholders})",
+                    values,
+                ).fetchone()[0]
+                rows = connection.execute(
+                    f"""
+                    SELECT sha256, size_bytes, state, discovered_at, updated_at,
+                           cooldown_until, last_error
+                    FROM artifacts
+                    WHERE state IN ({placeholders})
+                    ORDER BY discovered_at DESC, sha256
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*values, limit, offset),
+                ).fetchall()
+                items = tuple(self._admin_summary(row) for row in rows)
+        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+            raise StoreUnavailable(str(self._factory.path)) from exc
+        return QuarantinePage(items=items, total=total, limit=limit, offset=offset)
+
+    def get_artifact_details(self, sha256: str) -> ArtifactAdminDetails:
+        canonical = validate_sha256(sha256)
+        as_of = require_utc(self._now(), "now")
+        try:
+            with self._read_transaction() as connection:
+                artifact = connection.execute(
+                    "SELECT * FROM artifacts WHERE sha256 = ?",
+                    (canonical,),
+                ).fetchone()
+                if artifact is None:
+                    raise ArtifactNotFound(canonical)
+                verdict_rows = connection.execute(
+                    "SELECT * FROM verdicts WHERE sha256 = ? AND is_current = 1",
+                    (canonical,),
+                ).fetchall()
+                override_rows = connection.execute(
+                    "SELECT * FROM manual_overrides WHERE sha256 = ? AND is_current = 1",
+                    (canonical,),
+                ).fetchall()
+                verdict = self._one_current_per_artifact(verdict_rows, "verdict").get(canonical)
+                override = self._one_current_per_artifact(override_rows, "override").get(canonical)
+                context = validate_persisted_state(artifact, verdict, override, as_of)
+                effective = self._from_context(canonical, context)
+                release_rows = connection.execute(
+                    """
+                    SELECT r.id, r.stage, r.project, r.version, r.filename,
+                           r.sha256, r.origin_url, r.discovered_at, a.size_bytes
+                    FROM release_mappings AS r
+                    JOIN artifacts AS a ON a.sha256 = r.sha256
+                    WHERE r.sha256 = ?
+                    ORDER BY r.stage, r.project, r.version, r.filename, r.origin_url
+                    """,
+                    (canonical,),
+                ).fetchall()
+                releases = tuple(self._release_from_row(row) for row in release_rows)
+                evidence = () if verdict is None else self._read_evidence(connection, verdict["id"])
+                return ArtifactAdminDetails(
+                    summary=self._admin_summary(artifact),
+                    allowed=effective.allowed,
+                    effective_decision=effective.effective_decision,
+                    decision_source=effective.source,
+                    policy_version=effective.policy_version,
+                    analyzer_version=None if verdict is None else verdict["analyzer_version"],
+                    baseline_sha256=None if verdict is None else verdict["baseline_sha256"],
+                    baseline_tier=None if verdict is None else verdict["baseline_tier"],
+                    releases=releases,
+                    evidence=evidence,
+                )
+        except ArtifactNotFound:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+            raise StoreUnavailable(str(self._factory.path)) from exc
+
+    def health(self) -> dict[str, object]:
+        try:
+            with self._read_transaction() as connection:
+                version = connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0]
+                connection.execute("SELECT 1 FROM artifacts LIMIT 1").fetchone()
+        except (sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+            raise StoreUnavailable(str(self._factory.path)) from exc
+        return {"database": "ok", "schema_version": version}
+
+    @staticmethod
+    def _timestamp(value: object, field_name: str) -> datetime:
+        if type(value) is not str:
+            raise ValueError(f"invalid {field_name}")
+        return require_utc(datetime.fromisoformat(value), field_name)
+
+    @classmethod
+    def _admin_summary(cls, row: sqlite3.Row) -> ArtifactAdminSummary:
+        cooldown = row["cooldown_until"]
+        return ArtifactAdminSummary(
+            sha256=validate_sha256(row["sha256"]),
+            size_bytes=row["size_bytes"],
+            state=ArtifactState(row["state"]),
+            discovered_at=cls._timestamp(row["discovered_at"], "discovered_at"),
+            updated_at=cls._timestamp(row["updated_at"], "updated_at"),
+            cooldown_until=(
+                None if cooldown is None else cls._timestamp(cooldown, "cooldown_until")
+            ),
+            last_error=row["last_error"],
+        )
+
+    @staticmethod
+    def _release_from_row(row: sqlite3.Row) -> ReleaseArtifact:
+        release = validate_persisted_release_mapping(row)
+        return ReleaseArtifact(
+            stage=release.stage,
+            project=release.project,
+            version=release.version,
+            filename=release.filename,
+            sha256=release.sha256,
+            origin_url=release.origin_url,
+            size_bytes=row["size_bytes"],
+        )
+
+    @staticmethod
+    def _read_evidence(
+        connection: sqlite3.Connection,
+        verdict_id: int,
+    ) -> tuple[EvidenceRecord, ...]:
+        rows = connection.execute(
+            """
+            SELECT rule_id, action, file_path, line, message, details_json
+            FROM evidence WHERE verdict_id = ? ORDER BY id
+            """,
+            (verdict_id,),
+        ).fetchall()
+        return tuple(
+            EvidenceRecord(
+                rule_id=row["rule_id"],
+                action=Decision(row["action"]),
+                file_path=row["file_path"],
+                line=row["line"],
+                message=row["message"],
+                details=json.loads(row["details_json"]),
+            )
+            for row in rows
+        )
 
     def _read_effective_decisions(
         self,

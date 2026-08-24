@@ -7,12 +7,15 @@ from typing import Protocol
 
 from .models import (
     AllowedRelease,
+    ArtifactAdminDetails,
     ArtifactInput,
+    ArtifactState,
     AuditEventInput,
     ClaimedArtifact,
     EnforcementDecision,
     EvidenceInput,
     ManualOverrideInput,
+    QuarantinePage,
     ReleaseArtifact,
     ReleaseInput,
     VerdictInput,
@@ -38,6 +41,18 @@ class VerdictReader(Protocol):
         project: str,
         version: str,
     ) -> tuple[ReleaseArtifact, ...]: ...
+
+    def list_quarantine(
+        self,
+        *,
+        states: tuple[ArtifactState, ...],
+        limit: int,
+        offset: int,
+    ) -> QuarantinePage: ...
+
+    def get_artifact_details(self, sha256: str) -> ArtifactAdminDetails: ...
+
+    def health(self) -> dict[str, object]: ...
 
 
 class AuditWriter(Protocol):

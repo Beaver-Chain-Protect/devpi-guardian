@@ -2,6 +2,11 @@
 
 from __future__ import annotations  # noqa: I001 - use devpi order
 
+from .admin.service import GuardianAdminService
+from .admin.views import ADMIN_SERVICE_REGISTRY_KEY
+from .admin.views import configure_admin_routes
+from .audit import SQLiteAuditWriter
+from .audit import verify_audit_chain
 from .enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from .enforcement.metrics import InMemoryBlockMetricRecorder
 from .enforcement.tween import VERDICT_READER_REGISTRY_KEY
@@ -12,6 +17,7 @@ from .verdicts.errors import StoreUnavailable
 from .verdicts.models import validate_sha256
 from .verdicts.models import DecisionSource
 from .verdicts.reader import SQLiteVerdictReader
+from .verdicts.store import SQLiteArtifactStore
 from .worker.discovery import DiscoveryCandidate
 from .worker.discovery import DiscoveryUnavailable
 from .worker.discovery import FileDiscoverySink
@@ -116,6 +122,11 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
     )
     factory = ConnectionFactory(db_path)
     migrate(factory)
+    verification = verify_audit_chain(factory)
+    if not verification.valid:
+        raise StoreUnavailable(f"{db_path}: audit chain verification failed")
+    audit_writer = SQLiteAuditWriter()
+    store = SQLiteArtifactStore(factory, audit_writer)
     reader = SQLiteVerdictReader(factory)
     discovery_sink = FileDiscoverySink(db_path.parent / "discovery")
     block_metrics = InMemoryBlockMetricRecorder()
@@ -127,6 +138,11 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
     set_discovery_sink(pyramid_config.registry["xom"], discovery_sink)
     pyramid_config.registry[VERDICT_READER_REGISTRY_KEY] = reader
     pyramid_config.registry[BLOCK_METRIC_REGISTRY_KEY] = block_metrics
+    pyramid_config.registry[ADMIN_SERVICE_REGISTRY_KEY] = GuardianAdminService(
+        reader=reader,
+        store=store,
+    )
+    configure_admin_routes(pyramid_config)
     pyramid_config.add_tween(
         "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
         under="devpi_server.views.tween_keyfs_transaction",
