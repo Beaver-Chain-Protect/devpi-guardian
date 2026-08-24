@@ -273,6 +273,32 @@ def test_activation_failures_are_fatal_before_registry_mutation(
     assert pyramid.tweens == []
 
 
+def test_non_guardian_startup_exception_is_not_downgraded(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    pyramid = FakePyramidConfig()
+    config = _config(tmp_path)
+    failure = f"{tmp_path / 'guardian.db'} devpi-test-uuid activation-secret"
+    expected = RuntimeError(failure)
+    monkeypatch.setattr("devpi_guardian.plugin.migrate", lambda factory: None)
+
+    def activate(factory, devpi_uuid, find_candidate, *, now):
+        raise expected
+
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.ensure_guardian_activation",
+        activate,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        devpiserver_pyramid_configure(config, pyramid)
+
+    assert error.value is expected
+    assert pyramid.registry == {"xom": pyramid.xom}
+    assert pyramid.tweens == []
+
+
 def test_real_devpi_plugin_manager_recognizes_guardian_hooks() -> None:
     from devpi_server.config import get_pluginmanager
 

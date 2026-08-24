@@ -243,7 +243,7 @@ class RunningDevpi:
         _terminate(self._server)
         self._server = None
 
-    def reset_guardian_db_and_expect_failure(self) -> str:
+    def reset_guardian_db_and_expect_failure(self) -> StartupFailure:
         """Remove this test DB and return the bounded startup diagnostic."""
         server = self._server
         log_dir = self._log_dir
@@ -261,8 +261,8 @@ class RunningDevpi:
                 preferred_port=server.port,
                 log_label="expected-activation-failure",
             )
-        except RuntimeError as error:
-            return str(error)
+        except _ServerReadinessError as error:
+            return StartupFailure(str(error), error.log_path)
         raise AssertionError("devpi-server unexpectedly became ready")
 
 
@@ -272,6 +272,18 @@ class _ServerProcess:
     base_url: str
     port: int
     log_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class StartupFailure:
+    diagnostic: str
+    raw_log_path: Path
+
+
+class _ServerReadinessError(RuntimeError):
+    def __init__(self, message: str, log_path: Path) -> None:
+        super().__init__(message)
+        self.log_path = log_path
 
 
 class _FirstLink(html.parser.HTMLParser):
@@ -432,7 +444,7 @@ def _start_server(
             continue
         message = "devpi-server failed readiness"
         message = f"{message} {attempt}/{_START_ATTEMPTS}\n{diagnostic}"
-        raise RuntimeError(message)
+        raise _ServerReadinessError(message, log_path)
     raise AssertionError("unreachable")
 
 
