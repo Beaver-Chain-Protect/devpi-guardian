@@ -72,14 +72,13 @@ def test_migrate_activation_database_to_schema_v6(tmp_path):
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
     with factory.connect() as connection:
-        assert [row[0] for row in connection.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )] == [1, 2, 3, 4, 5, 6]
+        assert [
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ] == [1, 2, 3, 4, 5, 6]
         names = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert {"guardian_activation", "audit_events", "baseline_overrides"} <= names
 ```
@@ -231,6 +230,7 @@ already on main rather than replacing analyzer code. Preserve these public bound
 ```python
 class ArtifactBytesSource(Protocol):
     def open(self, sha256: str) -> Path: ...
+
 
 class ReleaseLookup(Protocol):
     def allowed_releases(self, project: str) -> list[ReleaseRecord]: ...
