@@ -97,7 +97,7 @@ def test_pyramid_hook_migrates_and_registers_reader_and_tween(
     assert (tmp_path / "guardian.db").exists()
     with sqlite3.connect(tmp_path / "guardian.db") as connection:
         migration_query = "SELECT MAX(version) FROM schema_migrations"
-        assert connection.execute(migration_query).fetchone() == (2,)
+        assert connection.execute(migration_query).fetchone() == (3,)
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() == (1,)

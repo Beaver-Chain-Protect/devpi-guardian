@@ -65,6 +65,7 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "verdicts",
         "evidence",
         "manual_overrides",
+        "guardian_activation",
     }
     expected_triggers = {
         "artifacts_identity_immutable",
@@ -82,10 +83,68 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "manual_overrides_history_insert_guard",
         "manual_overrides_history_update_guard",
         "manual_overrides_history_delete_guard",
+        "guardian_activation_immutable_update_guard",
+        "guardian_activation_immutable_delete_guard",
     }
     assert expected_tables <= tables
     assert triggers == expected_triggers
-    assert version == 2
+    assert version == 3
+
+
+def test_guardian_activation_row_is_immutable(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+
+    with closing(factory.connect()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO guardian_activation(
+                singleton, devpi_uuid, activated_at, activation_version
+            ) VALUES (1, 'devpi-uuid', '2026-08-24T00:00:00+00:00', 1)
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                UPDATE guardian_activation SET devpi_uuid = 'changed'
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM guardian_activation")
+
+
+def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    _seed_version_two_schema(factory.path)
+
+    real_read_migration = db._read_migration
+
+    def failing_read_migration(version: int) -> str:
+        if version == 3:
+            return "THIS IS INVALID SQL;"
+        return real_read_migration(version)
+
+    monkeypatch.setattr(db, "_read_migration", failing_read_migration)
+    with pytest.raises(MigrationError):
+        migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+    assert [version[0] for version in versions] == [1, 2]
+
+    monkeypatch.setattr(db, "_read_migration", real_read_migration)
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version",
+        ).fetchall()
+    assert [version[0] for version in versions] == [1, 2, 3]
 
 
 def test_connection_enables_required_pragmas(tmp_path) -> None:
@@ -430,7 +489,11 @@ def test_migrate_rejects_incomplete(tmp_path, corruption_sql: str) -> None:
 
 
 def _packaged_migration_sql(version: int = 1) -> str:
-    names = {1: "001_initial.sql", 2: "002_baseline_tier.sql"}
+    names = {
+        1: "001_initial.sql",
+        2: "002_baseline_tier.sql",
+        3: "003_guardian_activation.sql",
+    }
     return (
         db.resources.files("devpi_guardian.verdicts.sql")
         .joinpath(names[version])
@@ -444,6 +507,17 @@ def _seed_version_one_schema(path: Path, sql: str) -> None:
         connection.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (1, "2026-08-17T00:00:00Z"),
+        )
+
+
+def _seed_version_two_schema(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.executescript(
+            "\n".join((_packaged_migration_sql(1), _packaged_migration_sql(2)))
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((1, "2026-08-17T00:00:00Z"), (2, "2026-08-17T00:00:00Z")),
         )
 
 
@@ -592,7 +666,7 @@ def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -643,7 +717,7 @@ def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -708,7 +782,7 @@ def test_migrate_upgrades_v1_and_preserves_unclassified_legacy_baseline(
             "SELECT baseline_sha256, baseline_tier FROM verdicts",
         ).fetchone()
 
-    assert [version[0] for version in versions] == [1, 2]
+    assert [version[0] for version in versions] == [1, 2, 3]
     assert tuple(row) == ("b" * 64, None)
 
 
