@@ -1667,17 +1667,10 @@ class _OrderedTaintAnalyzer:
         self.sink_origins: dict[int, tuple[_TaintOrigin, ...]] = {}
         self.return_origins: list[tuple[_TaintOrigin, ...]] = []
         self.call_snapshots: dict[int, _TaintState] = {}
+        self.call_argument_origins: dict[int, list[frozenset[_TaintOrigin]]] = {}
 
-    def _direct_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
-        return frozenset(item for item in self.scope_sources if _contains_node(node, item.node))
-
-    def _name_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
-        return frozenset(
-            origin for name in _loaded_names(node) for origin in self.state.get(name, frozenset())
-        )
-
-    def _node_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
-        return self._direct_origins(node) | self._name_origins(node)
+    def _exact_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
+        return frozenset(item for item in self.scope_sources if item.node is node)
 
     def _assign(self, targets: Iterable[ast.AST], origins: frozenset[_TaintOrigin]) -> None:
         for target in targets:
@@ -1696,9 +1689,24 @@ class _OrderedTaintAnalyzer:
         self.state = previous
         return result
 
+    def _run_expression(
+        self, node: ast.AST, initial: _TaintState
+    ) -> tuple[frozenset[_TaintOrigin], _TaintState]:
+        previous = self.state
+        self.state = _copy_taint_state(initial)
+        origins = self._expression(node)
+        result = _copy_taint_state(self.state)
+        self.state = previous
+        return origins, result
+
     def _expression(self, node: ast.AST) -> frozenset[_TaintOrigin]:
         if isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            return self._node_origins(node)
+            return self._exact_origins(node)
+        if isinstance(node, ast.Name):
+            origins = self._exact_origins(node)
+            if isinstance(node.ctx, ast.Load):
+                origins |= self.state.get(node.id, frozenset())
+            return origins
         if isinstance(node, ast.Call):
             self.call_snapshots[id(node)] = _copy_taint_state(self.state)
             origins = self._expression(node.func)
@@ -1707,19 +1715,75 @@ class _OrderedTaintAnalyzer:
                 argument_origins.append(self._expression(argument))
             for keyword in node.keywords:
                 argument_origins.append(self._expression(keyword.value))
+            self.call_argument_origins[id(node)] = argument_origins
             payload_origins = (
                 frozenset().union(*argument_origins) if argument_origins else frozenset()
             )
-            origins = origins | payload_origins | self._direct_origins(node)
+            origins = origins | payload_origins | self._exact_origins(node)
             call = self.network_calls.get(id(node))
             if call is not None:
                 self.sink_origins[id(node)] = _ordered_origins(payload_origins)
             return origins
         if isinstance(node, ast.NamedExpr):
-            origins = self._expression(node.value) | self._direct_origins(node.value)
+            origins = self._expression(node.value)
             self._assign([node.target], origins)
             return origins
-        origins = self._direct_origins(node) | self._name_origins(node)
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            origins = self._exact_origins(node)
+            incoming = _copy_taint_state(self.state)
+            current = incoming
+            possible_states = [incoming]
+            for generator in node.generators:
+                self.state = current
+                iterable_origins = self._expression(generator.iter)
+                origins |= iterable_origins
+                after_iter = _copy_taint_state(self.state)
+                possible_states.append(after_iter)
+                self._assign([generator.target], iterable_origins)
+                for condition in generator.ifs:
+                    origins |= self._expression(condition)
+                current = _copy_taint_state(self.state)
+            self.state = current
+            if isinstance(node, ast.DictComp):
+                origins |= self._expression(node.key)
+                origins |= self._expression(node.value)
+            else:
+                origins |= self._expression(node.elt)
+            possible_states.append(_copy_taint_state(self.state))
+            self.state = _join_taint_states(*possible_states)
+            return origins
+        if isinstance(node, ast.BoolOp):
+            origins = frozenset()
+            first = self._expression(node.values[0])
+            origins |= first
+            paths = [_copy_taint_state(self.state)]
+            current = _copy_taint_state(self.state)
+            for value in node.values[1:]:
+                value_origins, value_state = self._run_expression(value, current)
+                origins |= value_origins
+                paths.append(value_state)
+                current = value_state
+            self.state = _join_taint_states(*paths)
+            return origins
+        if isinstance(node, ast.IfExp):
+            origins = self._expression(node.test)
+            branch_entry = _copy_taint_state(self.state)
+            body_origins, body_state = self._run_expression(node.body, branch_entry)
+            else_origins, else_state = self._run_expression(node.orelse, branch_entry)
+            self.state = _join_taint_states(body_state, else_state)
+            return origins | body_origins | else_origins
+        if isinstance(node, ast.Compare):
+            origins = self._expression(node.left)
+            paths = [_copy_taint_state(self.state)]
+            current = _copy_taint_state(self.state)
+            for comparator in node.comparators:
+                comparator_origins, comparator_state = self._run_expression(comparator, current)
+                origins |= comparator_origins
+                paths.append(comparator_state)
+                current = comparator_state
+            self.state = _join_taint_states(*paths)
+            return origins
+        origins = self._exact_origins(node)
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
@@ -1837,27 +1901,6 @@ class _OrderedTaintAnalyzer:
     def run(self, body: Iterable[ast.stmt]) -> None:
         for statement in body:
             self._statement(statement)
-
-
-def _payload_origins(
-    payload_nodes: list[ast.AST],
-    scope_sources: list[CredentialAccess],
-    state: _TaintState,
-) -> tuple[CredentialAccess, ...]:
-    origins = frozenset(
-        item
-        for item in scope_sources
-        if any(_contains_node(payload, item.node) for payload in payload_nodes)
-    )
-    origins |= frozenset(
-        origin
-        for payload in payload_nodes
-        for name in _loaded_names(payload)
-        for origin in state.get(name, frozenset())
-    )
-    return tuple(
-        origin for origin in _ordered_origins(origins) if isinstance(origin, CredentialAccess)
-    )
 
 
 def _function_parameter_sinks(
@@ -1995,8 +2038,20 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
                         argument = keyword.value
                 if argument is None:
                     continue
-                snapshot = module_analyzer.call_snapshots.get(id(call.node), {})
-                for origin in _payload_origins([argument], module_sources, snapshot):
+                argument_index = position
+                if argument_index is None:
+                    for index, keyword in enumerate(call.node.keywords, start=len(call.node.args)):
+                        if keyword.arg == parameter_name:
+                            argument_index = index
+                            break
+                argument_origins = module_analyzer.call_argument_origins.get(id(call.node), [])
+                if argument_index is not None and argument_index < len(argument_origins):
+                    evaluated_origins = argument_origins[argument_index]
+                else:
+                    evaluated_origins = frozenset()
+                for origin in _ordered_origins(evaluated_origins):
+                    if not isinstance(origin, CredentialAccess):
+                        continue
                     flows.append(
                         CredentialFlow(
                             origin,

