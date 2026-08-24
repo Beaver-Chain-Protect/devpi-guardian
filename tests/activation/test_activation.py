@@ -606,7 +606,7 @@ class _Factory:
         return self.connection
 
 
-def test_primary_inventory_failure_survives_rollback_and_close_failure(
+def test_precommit_close_failure_overrides_inventory_and_rollback_failure(
     tmp_path,
 ) -> None:
     factory = _factory(tmp_path)
@@ -623,8 +623,11 @@ def test_primary_inventory_failure_survives_rollback_and_close_failure(
             now=lambda: NOW,
         )
     category = error.value.category
-    assert category is ActivationFailureCategory.INVENTORY_UNAVAILABLE
-    assert "primary secret" not in str(error.value)
+    assert category is ActivationFailureCategory.STORE_UNAVAILABLE
+    message = str(error.value)
+    assert "primary secret" not in message
+    assert "rollback secret" not in message
+    assert "close secret" not in message
     assert wrapper is not None and wrapper.rollback_calls == 1
 
 

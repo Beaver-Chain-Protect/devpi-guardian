@@ -192,7 +192,7 @@ def ensure_guardian_activation(
             try:
                 connection.close()
             except Exception:
-                if primary is None and not committed:
+                if not committed:
                     primary = _store_failure()
 
     if primary is not None:
