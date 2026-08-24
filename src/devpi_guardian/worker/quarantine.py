@@ -100,6 +100,29 @@ class QuarantineStore:
             local_path=final,
         )
 
+    def get_verified(self, candidate: ArtifactCandidate) -> VerifiedArtifact | None:
+        """Return an already verified blob without downloading it again."""
+
+        suffix = _safe_suffix(candidate.filename)
+        path = self._root / "sha256" / candidate.sha256[:2] / f"{candidate.sha256}{suffix}"
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        expected = candidate.expected_size_bytes
+        if expected is not None and size != expected:
+            raise QuarantineError("existing quarantine file has an unexpected size")
+        if not self._verified_existing(path, candidate.sha256, size):
+            raise QuarantineError("existing quarantine file failed identity verification")
+        return VerifiedArtifact(
+            stage=candidate.stage,
+            project=candidate.project,
+            version=candidate.version,
+            filename=candidate.filename,
+            sha256=candidate.sha256,
+            size_bytes=size,
+            local_path=path,
+        )
+
     @staticmethod
     def _verified_existing(path: Path, sha256: str, size: int) -> bool:
         if path.stat().st_size != size:
