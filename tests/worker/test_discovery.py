@@ -322,7 +322,7 @@ def test_recovery_quarantines_corrupt_processing_rows(tmp_path, column) -> None:
     claim = sink.claim_next("worker-1", NOW + timedelta(seconds=5))
     assert claim is not None
     values = {
-        "job_id": None,
+        "job_id": "z" * 64,
         "candidate_json": "not-json",
         "lease_expires_at": "not-a-time",
         "lease_owner": "",
@@ -402,6 +402,26 @@ def test_discovery_catalog_has_ready_and_unique_lease_indexes(tmp_path) -> None:
     assert "discovery_jobs_ready_idx" in names
     assert "discovery_jobs_processing_lease_idx" in names
     assert any(row[2] == 1 for row in indexes if row[1] == "discovery_jobs_processing_lease_idx")
+
+
+def test_discovery_job_id_is_nonnull_primary_key_and_scrub_range_is_indexed(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    with sqlite3.connect(sink.path) as connection:
+        columns = {
+            row[1]: (row[3], row[5])
+            for row in connection.execute("PRAGMA table_info(discovery_jobs)")
+        }
+        assert columns["job_id"] == (1, 1)
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT rowid FROM discovery_jobs
+            WHERE state = 'PENDING' AND job_id > ?
+            ORDER BY job_id LIMIT 32
+            """,
+            ("0" * 64,),
+        ).fetchall()
+    assert any("state=? AND job_id>?" in row[3] for row in plan)
 
 
 @pytest.mark.parametrize(

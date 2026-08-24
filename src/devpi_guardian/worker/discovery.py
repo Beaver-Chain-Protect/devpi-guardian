@@ -35,7 +35,7 @@ _REQUIRED_DISCOVERY_COLUMNS = frozenset(
     }
 )
 _DISCOVERY_COLUMN_TYPES = {
-    "job_id": ("TEXT", 0, 1),
+    "job_id": ("TEXT", 1, 1),
     "candidate_json": ("TEXT", 1, 0),
     "state": ("TEXT", 1, 0),
     "attempt_count": ("INTEGER", 1, 0),
@@ -150,7 +150,7 @@ def _validate_catalog(connection: sqlite3.Connection) -> None:
         raise DiscoveryUnavailable("incompatible discovery schema: attempt_count default")
     sql = "" if table is None or table[0] is None else " ".join(table[0].upper().split())
     required_fragments = (
-        "PRIMARY KEY",
+        "JOB_ID TEXT PRIMARY KEY NOT NULL",
         "CANDIDATE_JSON TEXT NOT NULL",
         "STATE TEXT NOT NULL CHECK",
         "ATTEMPT_COUNT INTEGER NOT NULL DEFAULT 0 CHECK",
@@ -396,7 +396,7 @@ class FileDiscoverySink:
         self.path = self.root / "discovery.db"
         self._max_active_jobs = max_active_jobs
         self._now = now if now is not None else lambda: datetime.now(UTC)
-        self._scrub_cursor: tuple[str | None, int] | None = None
+        self._scrub_cursor: str | None = None
         self._initialize()
 
     def _initialize(self) -> None:
@@ -418,7 +418,7 @@ class FileDiscoverySink:
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS discovery_jobs (
-                        job_id TEXT PRIMARY KEY,
+                        job_id TEXT PRIMARY KEY NOT NULL,
                         candidate_json TEXT NOT NULL,
                         state TEXT NOT NULL CHECK(
                             state IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')
@@ -524,26 +524,22 @@ class FileDiscoverySink:
                 """
                 SELECT rowid AS _rowid, * FROM discovery_jobs
                 WHERE state = 'PENDING'
-                ORDER BY job_id, rowid
+                ORDER BY job_id
                 LIMIT ?
                 """,
                 (_SCRUB_BATCH_SIZE,),
             ).fetchall()
         else:
-            last_job_id, last_rowid = cursor
+            last_job_id = cursor
             rows = connection.execute(
                 """
                 SELECT rowid AS _rowid, * FROM discovery_jobs
                 WHERE state = 'PENDING'
-                  AND (
-                      job_id > ?
-                      OR (job_id = ? AND rowid > ?)
-                      OR (job_id IS NULL AND ? IS NULL AND rowid > ?)
-                  )
-                ORDER BY job_id, rowid
+                  AND job_id > ?
+                ORDER BY job_id
                 LIMIT ?
                 """,
-                (last_job_id, last_job_id, last_rowid, last_job_id, last_rowid, _SCRUB_BATCH_SIZE),
+                (last_job_id, _SCRUB_BATCH_SIZE),
             ).fetchall()
         for row in rows:
             try:
@@ -560,10 +556,10 @@ class FileDiscoverySink:
                     """,
                     (diagnostic, now, row["_rowid"]),
                 )
-        if len(rows) < _SCRUB_BATCH_SIZE:
+        if not rows:
             self._scrub_cursor = None
         else:
-            self._scrub_cursor = (rows[-1]["job_id"], rows[-1]["_rowid"])
+            self._scrub_cursor = rows[-1]["job_id"]
 
     def recover_expired_claims(self) -> int:
         with self._write() as connection:
