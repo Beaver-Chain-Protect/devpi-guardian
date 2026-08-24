@@ -1666,7 +1666,6 @@ class _OrderedTaintAnalyzer:
         self.state: _TaintState = _copy_taint_state(initial_state or {})
         self.sink_origins: dict[int, tuple[_TaintOrigin, ...]] = {}
         self.return_origins: list[tuple[_TaintOrigin, ...]] = []
-        self.call_snapshots: dict[int, _TaintState] = {}
         self.call_argument_origins: dict[int, list[frozenset[_TaintOrigin]]] = {}
 
     def _exact_origins(self, node: ast.AST) -> frozenset[_TaintOrigin]:
@@ -1708,7 +1707,6 @@ class _OrderedTaintAnalyzer:
                 origins |= self.state.get(node.id, frozenset())
             return origins
         if isinstance(node, ast.Call):
-            self.call_snapshots[id(node)] = _copy_taint_state(self.state)
             origins = self._expression(node.func)
             argument_origins: list[frozenset[_TaintOrigin]] = []
             for argument in node.args:
@@ -2039,11 +2037,10 @@ def find_credential_network_flows(tree: ast.Module, source: str) -> list[Credent
                 if argument is None:
                     continue
                 argument_index = position
-                if argument_index is None:
-                    for index, keyword in enumerate(call.node.keywords, start=len(call.node.args)):
-                        if keyword.arg == parameter_name:
-                            argument_index = index
-                            break
+                for keyword_index, keyword in enumerate(call.node.keywords):
+                    if keyword.arg == parameter_name:
+                        argument_index = len(call.node.args) + keyword_index
+                        break
                 argument_origins = module_analyzer.call_argument_origins.get(id(call.node), [])
                 if argument_index is not None and argument_index < len(argument_origins):
                     evaluated_origins = argument_origins[argument_index]

