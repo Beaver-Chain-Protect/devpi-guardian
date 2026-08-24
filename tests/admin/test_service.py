@@ -49,7 +49,7 @@ class Reader:
         return self.details
 
     def health(self):
-        return {"database": "ok", "schema_version": 3}
+        return {"database": "ok", "schema_version": 4}
 
 
 class Store:
