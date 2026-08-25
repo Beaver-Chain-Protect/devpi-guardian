@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, tzinfo
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,117 @@ from devpi_guardian.activation import (
     ensure_guardian_activation,
 )
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+
+
+def _plugin_config(tmp_path, *, quarantine_root=None):
+    args = SimpleNamespace(
+        guardian_db=str(tmp_path / "guardian.db"),
+        guardian_quarantine_root=None if quarantine_root is None else str(quarantine_root),
+        guardian_base_url="http://127.0.0.1:3141",
+        guardian_cooldown_hours=24.0,
+        guardian_worker_poll_interval=0.25,
+    )
+    return SimpleNamespace(
+        args=args,
+        server_path=str(tmp_path / "server"),
+        nodeinfo={"uuid": "plugin-test"},
+    )
+
+
+def test_primary_rejects_missing_quarantine_before_migration_or_publication(tmp_path, monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal, match="quarantine root"):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    assert xom.thread_pool.registered == []
+    assert plugin.VERDICT_READER_REGISTRY_KEY not in pyramid.registry
+    assert pyramid.tweens == []
+
+
+def test_upload_hook_replica_is_noop_but_primary_requires_connector():
+    import devpi_guardian.plugin as plugin
+
+    replica = SimpleNamespace(is_replica=lambda: True)
+    plugin.devpiserver_on_upload(SimpleNamespace(xom=replica), "demo", "1.0", object())
+
+    primary = SimpleNamespace(is_replica=lambda: False)
+    with pytest.raises(RuntimeError, match="connector"):
+        plugin.devpiserver_on_upload(SimpleNamespace(xom=primary), "demo", "1.0", object())
+
+
+def test_upload_hook_forwards_exact_arguments():
+    import devpi_guardian.plugin as plugin
+
+    calls = []
+
+    class Connector:
+        def capture(self, **kwargs):
+            calls.append(kwargs)
+
+    xom = SimpleNamespace(is_replica=lambda: False)
+    xom._devpi_guardian_upload_connector = Connector()
+    stage = SimpleNamespace(xom=xom)
+    link = object()
+    plugin.devpiserver_on_upload(stage, "demo", "1.0", link)
+
+    assert calls == [{"stage": stage, "project": "demo", "version": "1.0", "link": link}]
+
+
+def test_publish_failure_rolls_back_registry_xom_and_thread_registration(monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    class Pool:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, worker):
+            self.registered.append(worker)
+
+    pool = Pool()
+    xom = SimpleNamespace(thread_pool=pool)
+    registry = {}
+    pyramid = SimpleNamespace(registry=registry, routes=[], views=[], tweens=[])
+    worker = object()
+
+    class Queue:
+        def discover(self, _candidate):
+            return None
+
+        def discover_many(self, _candidates):
+            return None
+
+    components = SimpleNamespace(
+        queue=Queue(),
+        reader=object(),
+        block_metrics=object(),
+        admin_service=object(),
+        upload_connector=object(),
+        worker=worker,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "configure_admin_routes",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("route failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="route failure"):
+        plugin._publish_components(components, pyramid, xom)
+
+    assert pool.registered == []
+    assert registry == {}
+    assert not hasattr(xom, "_devpi_guardian_verdict_reader")
+    assert not hasattr(xom, "_devpi_guardian_discovery_sink")
+    assert not hasattr(xom, "_devpi_guardian_upload_connector")
+    assert pyramid.routes == []
+    assert pyramid.views == []
+    assert pyramid.tweens == []
+
 
 NOW = datetime(2026, 8, 24, tzinfo=UTC)
 DEVPI_UUID = "devpi-test-uuid"

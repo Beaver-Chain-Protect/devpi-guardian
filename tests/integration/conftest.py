@@ -402,6 +402,9 @@ def _start_server(
     preferred_port: int | None = None,
     log_label: str = "initial",
 ) -> _ServerProcess:
+    quarantine_root = server_dir.parent / f".{server_dir.name}-guardian-quarantine"
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(quarantine_root, 0o700)
     for attempt in range(1, _START_ATTEMPTS + 1):
         port = preferred_port if preferred_port is not None else _free_port()
         base_url = f"http://{_HOST}:{port}"
@@ -424,7 +427,16 @@ def _start_server(
         ]
         if offline:
             args.append("--offline-mode")
-        args.extend(("--guardian-db", str(guardian_db)))
+        args.extend(
+            (
+                "--guardian-db",
+                str(guardian_db),
+                "--guardian-quarantine-root",
+                str(quarantine_root),
+                "--guardian-base-url",
+                base_url,
+            )
+        )
         environment = _loopback_environment()
         environment["PYTHONUNBUFFERED"] = "1"
         with log_path.open("wb") as log:

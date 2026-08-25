@@ -1,0 +1,195 @@
+"""Runtime composition for discovery and analysis worker cycles."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from threading import Lock
+
+from .adapters import VerdictReaderCandidateSource
+from .analysis import build_analysis_engine
+from .devpi_source import DevpiArtifactBytesSource
+from .discovery import FileDiscoverySink, get_discovery_sink
+from .discovery_consumer import DiscoveryConsumer, DiscoveryCycleStatus, SimpleLinkResolver
+from .pipeline import QuarantineWorker, WorkerCycleStatus
+from .preparer import QuarantineArtifactPreparer
+from .quarantine import QuarantineStore
+
+
+class CoordinatorStatus(StrEnum):
+    IDLE = "IDLE"
+    DISCOVERY = "DISCOVERY"
+    ANALYSIS = "ANALYSIS"
+
+
+@dataclass(frozen=True, slots=True)
+class CoordinatorCycle:
+    status: CoordinatorStatus
+    sha256: str | None
+
+
+class WorkerCoordinator:
+    """Drain discovery first so same-release files reach F4 before analysis."""
+
+    def __init__(self, *, discovery, analysis) -> None:
+        self._discovery = discovery
+        self._analysis = analysis
+
+    def recover_expired_claims(self) -> int:
+        return self._discovery.recover_expired_claims() + self._analysis.recover_expired_claims()
+
+    def run_once(self) -> CoordinatorCycle:
+        discovery = self._discovery.run_once()
+        if discovery.status is not DiscoveryCycleStatus.IDLE:
+            return CoordinatorCycle(CoordinatorStatus.DISCOVERY, discovery.sha256)
+        analysis = self._analysis.run_once()
+        if analysis.status is not WorkerCycleStatus.IDLE:
+            return CoordinatorCycle(CoordinatorStatus.ANALYSIS, analysis.sha256)
+        return CoordinatorCycle(CoordinatorStatus.IDLE, None)
+
+
+class GuardianWorkerThread:
+    """devpi ThreadPool-compatible polling runner."""
+
+    def __init__(
+        self,
+        coordinator: WorkerCoordinator,
+        *,
+        poll_interval: float = 0.25,
+        shutdown: Callable[[], None] | None = None,
+    ) -> None:
+        if type(poll_interval) not in (int, float) or poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        self._coordinator = coordinator
+        self._poll_interval = poll_interval
+        self._shutdown = shutdown
+        self._health_lock = Lock()
+        self._started_at: datetime | None = None
+        self._last_cycle_at: datetime | None = None
+        self._last_error: str | None = None
+        self._cycles = 0
+        self._completed = 0
+
+    def worker_health(self) -> dict[str, object]:
+        with self._health_lock:
+            thread = getattr(self, "thread", None)
+            alive = bool(thread is not None and getattr(thread, "is_alive", lambda: False)())
+            return {
+                "status": "running" if alive else "registered",
+                "started_at": self._started_at,
+                "last_cycle_at": self._last_cycle_at,
+                "last_error": self._last_error,
+                "cycles": self._cycles,
+                "completed": self._completed,
+            }
+
+    def thread_run(self) -> None:
+        with self._health_lock:
+            self._started_at = datetime.now(UTC)
+        self._coordinator.recover_expired_claims()
+        while True:
+            try:
+                cycle = self._coordinator.run_once()
+            except Exception as exc:
+                with self._health_lock:
+                    self._last_cycle_at = datetime.now(UTC)
+                    self._last_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+                    self._cycles += 1
+                self.thread.sleep(self._poll_interval)
+                continue
+            with self._health_lock:
+                self._last_cycle_at = datetime.now(UTC)
+                self._last_error = None
+                self._cycles += 1
+                if cycle.status is not CoordinatorStatus.IDLE:
+                    self._completed += 1
+            if cycle.status is CoordinatorStatus.IDLE:
+                self.thread.sleep(self._poll_interval)
+
+    def thread_shutdown(self) -> None:
+        if self._shutdown is not None:
+            self._shutdown()
+
+
+def _close_resources(session, quarantine: QuarantineStore, primary: BaseException) -> None:
+    for resource, label in ((session, "requests session"), (quarantine, "quarantine")):
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as cleanup:
+            primary.add_note(f"{label} cleanup failed: {type(cleanup).__name__}: {cleanup}")
+
+
+def _shutdown_resources(session, quarantine: QuarantineStore) -> None:
+    first: BaseException | None = None
+    for resource, label in ((session, "requests session"), (quarantine, "quarantine")):
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except BaseException as error:
+            if first is None:
+                first = error
+            else:
+                first.add_note(f"{label} cleanup failed: {type(error).__name__}: {error}")
+    if first is not None:
+        raise first
+
+
+def build_worker_thread(
+    *,
+    xom,
+    store,
+    reader,
+    policy_engine,
+    baseline_http_session,
+    base_url: str,
+    quarantine: QuarantineStore,
+    discovery_queue: FileDiscoverySink | None = None,
+    analyzer_version: str,
+    worker_id: str,
+    cooldown_duration: timedelta = timedelta(hours=24),
+    poll_interval: float = 0.25,
+) -> GuardianWorkerThread:
+    """Build F5 from validated F4/F10 components and an owned quarantine store."""
+    if not isinstance(quarantine, QuarantineStore):
+        raise TypeError("quarantine must be a validated QuarantineStore")
+    try:
+        queue = discovery_queue if discovery_queue is not None else get_discovery_sink(xom)
+        if not isinstance(queue, FileDiscoverySink):
+            raise TypeError("registered discovery sink must be a FileDiscoverySink")
+        discovery = DiscoveryConsumer(
+            queue=queue,
+            resolver=SimpleLinkResolver(base_url),
+            bytes_source=DevpiArtifactBytesSource(xom, base_url=base_url),
+            quarantine=quarantine,
+            store=store,
+            worker_id=f"{worker_id}-discovery",
+        )
+        source = VerdictReaderCandidateSource(reader)
+        analysis = QuarantineWorker(
+            store=store,
+            preparer=QuarantineArtifactPreparer(source=source, quarantine=quarantine),
+            analysis_engine=build_analysis_engine(
+                reader=reader,
+                session=baseline_http_session,
+                analyzer_version=analyzer_version,
+                trusted_devpi_url=base_url,
+            ),
+            policy_engine=policy_engine,
+            worker_id=f"{worker_id}-analysis",
+            cooldown_duration=cooldown_duration,
+        )
+        return GuardianWorkerThread(
+            WorkerCoordinator(discovery=discovery, analysis=analysis),
+            poll_interval=poll_interval,
+            shutdown=lambda: _shutdown_resources(baseline_http_session, quarantine),
+        )
+    except BaseException as primary:
+        _close_resources(baseline_http_session, quarantine, primary)
+        raise
