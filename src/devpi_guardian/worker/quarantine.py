@@ -53,6 +53,32 @@ def _close_fd(fd: int, primary: BaseException | None = None) -> None:
         _note_cleanup(primary, "descriptor", error)
 
 
+def close_owned(stream, label: str, primary: BaseException | None = None) -> None:
+    """Close an owned stream, retrying once when the first close fails."""
+
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+        return
+    except BaseException as first:
+        try:
+            closed = bool(stream.closed)
+        except BaseException as state_error:
+            first.add_note(f"{label} closed-state check failed: {state_error}")
+            closed = False
+        if not closed:
+            try:
+                close()
+            except BaseException as second:
+                first.add_note(f"{label} second close failed: {type(second).__name__}: {second}")
+        if primary is not None:
+            _note_cleanup(primary, label, first)
+            return
+        raise QuarantineError(f"{label} close failed") from first
+
+
 class QuarantineStore:
     """Secure CAS rooted at an absolute, private directory."""
 
@@ -91,7 +117,6 @@ class QuarantineStore:
         for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd"):
             fd = getattr(self, name, None)
             if fd is not None:
-                setattr(self, name, None)
                 try:
                     os.close(fd)
                 except BaseException as error:
@@ -99,6 +124,8 @@ class QuarantineStore:
                         first_error = error
                     else:
                         _note_cleanup(first_error, "descriptor", error)
+                else:
+                    setattr(self, name, None)
         if first_error is not None:
             raise first_error
 
@@ -106,7 +133,13 @@ class QuarantineStore:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
-        self.close()
+        if exc_value is not None:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                exc_value.add_note(f"quarantine close failed: {type(cleanup).__name__}: {cleanup}")
+        else:
+            self.close()
         return False
 
     @staticmethod

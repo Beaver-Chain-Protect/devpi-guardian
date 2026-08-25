@@ -8,7 +8,7 @@ from devpi_guardian.baseline import artifact_kind
 from devpi_guardian.verdicts.models import ClaimedArtifact
 
 from .models import AnalysisBundle, ArtifactCandidate, VerifiedArtifact
-from .quarantine import QuarantineError, QuarantineStore
+from .quarantine import QuarantineError, QuarantineStore, close_owned
 
 
 class CandidateSource(Protocol):
@@ -25,10 +25,7 @@ def _close_artifacts(primary: BaseException, *artifacts: VerifiedArtifact | None
         if artifact is None or id(artifact._stream) in seen:
             continue
         seen.add(id(artifact._stream))
-        try:
-            artifact._stream.close()
-        except BaseException as cleanup:
-            primary.add_note(f"artifact cleanup failed: {type(cleanup).__name__}: {cleanup}")
+        close_owned(artifact._stream, "artifact cleanup", primary)
 
 
 class QuarantineArtifactPreparer:

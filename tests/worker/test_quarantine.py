@@ -34,6 +34,7 @@ def test_store_uses_absolute_digest_path_and_verified_descriptor(tmp_path: Path)
     with item.open_for_analysis() as stream:
         assert stream.read() == payload
     assert getattr(item, "local_path", None) is None
+    store.close()
 
 
 def test_relative_root_and_symlink_root_rejected(tmp_path: Path) -> None:
@@ -62,8 +63,36 @@ def test_preexisting_component_with_unsafe_mode_rejected(tmp_path: Path) -> None
         QuarantineStore(root, max_size_bytes=100)
 
 
+@pytest.mark.parametrize("component", ["objects", "sha256"])
+def test_internal_component_symlink_rejected(tmp_path: Path, component: str) -> None:
+    root = tmp_path / "q"
+    root.mkdir(mode=0o700)
+    target = tmp_path / f"{component}-target"
+    target.mkdir(mode=0o700)
+    if component == "sha256":
+        (root / "objects").mkdir(mode=0o700)
+        (root / "objects" / component).symlink_to(target, target_is_directory=True)
+    else:
+        (root / component).symlink_to(target, target_is_directory=True)
+    with pytest.raises(QuarantineError):
+        QuarantineStore(root, max_size_bytes=100)
+
+
+def test_internal_prefix_symlink_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    digest = hashlib.sha256(b"prefix").hexdigest()
+    first = root / "objects" / "sha256" / digest[:2]
+    first_target = tmp_path / "prefix-target"
+    first_target.mkdir(mode=0o700)
+    first.symlink_to(first_target, target_is_directory=True)
+    with pytest.raises(QuarantineError):
+        store.get_verified(candidate(b"prefix"))
+    store.close()
+
+
 def test_new_directories_are_exactly_private_under_restrictive_umask(tmp_path: Path) -> None:
-    original = os.umask(0o777)
+    original = os.umask(0o077)
     try:
         store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     finally:
@@ -91,10 +120,31 @@ def test_close_attempts_all_descriptors_and_preserves_first_error(
     with pytest.raises(OSError, match="incoming close failed"):
         store.close()
     assert len(calls) == 4
-    assert all(
-        getattr(store, name) is None
-        for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd")
-    )
+    assert store._incoming_fd == incoming_fd
+    assert store._sha256_fd is None
+    assert store._objects_fd is None
+    assert store._root_fd is None
+    monkeypatch.undo()
+    store.close()
+
+
+def test_context_exit_preserves_active_body_error_when_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    real_close = os.close
+
+    def close(fd: int) -> None:
+        if fd == store._incoming_fd:
+            raise OSError("close cleanup failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(ValueError, match="body failed") as raised, store:
+        raise ValueError("body failed")
+    assert any("quarantine close failed" in note for note in raised.value.__notes__)
+    monkeypatch.undo()
+    store.close()
 
 
 def test_root_and_object_modes_are_restricted(tmp_path: Path) -> None:
@@ -106,6 +156,7 @@ def test_root_and_object_modes_are_restricted(tmp_path: Path) -> None:
     assert (path.stat().st_mode & 0o777) == 0o600
     assert path.stat().st_nlink == 1
     assert path.stat().st_uid == os.geteuid()
+    item._stream.close()
 
 
 def test_mismatch_cleans_incoming(tmp_path: Path) -> None:
@@ -115,17 +166,22 @@ def test_mismatch_cleans_incoming(tmp_path: Path) -> None:
         store.persist(item, [b"actual"])
     incoming = store.root_path / ".incoming"
     assert not incoming.exists() or not list(incoming.iterdir())
+    store.close()
 
 
 def test_corrupt_existing_object_fails_closed(tmp_path: Path) -> None:
     payload = b"correct"
     store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     item = candidate(payload)
-    store.persist(item, [payload])
+    item_verified = store.persist(item, [payload])
     path = store.root_path / store.object_relative_path(item.sha256)
+    # The returned descriptor is owned by the caller, even when the test then
+    # mutates the path to exercise fail-closed verification.
+    item_verified._stream.close()
     path.write_bytes(b"corrupt")
     with pytest.raises(QuarantineError):
         store.persist(item, [payload])
+    store.close()
 
 
 def test_identical_concurrent_publishers_are_idempotent(tmp_path: Path) -> None:
@@ -148,6 +204,7 @@ def test_identical_concurrent_publishers_are_idempotent(tmp_path: Path) -> None:
     for result in results:
         with result.open_for_analysis() as stream:
             assert stream.read() == payload
+    store.close()
 
 
 def test_verified_descriptor_is_bound_when_cas_name_is_replaced(tmp_path: Path) -> None:
@@ -161,6 +218,7 @@ def test_verified_descriptor_is_bound_when_cas_name_is_replaced(tmp_path: Path) 
     os.replace(replacement, path)
     with verified.open_for_analysis() as stream:
         assert stream.read() == payload
+    store.close()
 
 
 def test_hard_linked_object_is_rejected(tmp_path: Path) -> None:
@@ -172,6 +230,20 @@ def test_hard_linked_object_is_rejected(tmp_path: Path) -> None:
     os.link(path, tmp_path / "hard-link")
     with pytest.raises(QuarantineError):
         store.get_verified(item)
+    store.close()
+
+
+def test_final_object_unsafe_mode_is_rejected(tmp_path: Path) -> None:
+    payload = b"unsafe mode"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    verified = store.persist(item, [payload])
+    verified._stream.close()
+    path = store.root_path / store.object_relative_path(item.sha256)
+    path.chmod(0o644)
+    with pytest.raises(QuarantineError):
+        store.get_verified(item)
+    store.close()
 
 
 def test_nonregular_fifo_object_is_rejected_without_blocking(tmp_path: Path) -> None:
@@ -185,3 +257,4 @@ def test_nonregular_fifo_object_is_rejected_without_blocking(tmp_path: Path) -> 
     os.mkfifo(leaf / digest, 0o600)
     with pytest.raises(QuarantineError):
         store.get_verified(item)
+    store.close()

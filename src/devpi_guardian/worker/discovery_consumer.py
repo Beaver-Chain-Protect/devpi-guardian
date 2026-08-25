@@ -18,7 +18,7 @@ from devpi_guardian.verdicts.models import ArtifactInput, ReleaseInput
 
 from .discovery import DiscoveryCandidate, FileDiscoverySink
 from .models import ArtifactCandidate
-from .quarantine import QuarantineError, QuarantineStore
+from .quarantine import QuarantineError, QuarantineStore, close_owned
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +49,9 @@ class SimpleLinkResolver:
             or parsed.fragment
             or parsed.path not in ("", "/")
             or any(char in base_url for char in "\\\x00\n\r\t")
+            or not parsed.hostname.isascii()
+            or any(char.isspace() or char in "/?#\\" for char in parsed.hostname)
+            or "%" in parsed.netloc
             or "%" in parsed.path
         ):
             raise ValueError("base_url must not contain user information")
@@ -171,10 +174,7 @@ class DiscoveryConsumer:
                 verified = self._quarantine.persist(
                     candidate, self._bytes_source.iter_chunks(resolved)
                 )
-            try:
-                verified._stream.close()
-            except BaseException as error:
-                raise QuarantineError("verified discovery descriptor close failed") from error
+            close_owned(verified._stream, "verified discovery descriptor")
             discovered_at = self._now()
             self._store.discover_artifact(
                 ArtifactInput(verified.sha256, verified.size_bytes, discovered_at),

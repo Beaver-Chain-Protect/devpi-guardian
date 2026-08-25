@@ -5,13 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePath
+from urllib.parse import urlsplit, urlunsplit
 
 from devpi_common.metadata import normalize_name, splitbasename
 
 from devpi_guardian.verdicts.models import ArtifactInput, ReleaseInput, validate_sha256
 
 from .models import ArtifactCandidate, VerifiedArtifact
-from .quarantine import QuarantineError, QuarantineStore
+from .quarantine import QuarantineError, QuarantineStore, close_owned
 
 _CHUNK_SIZE = 1024 * 1024
 
@@ -22,10 +23,12 @@ class PrivateUploadConnector:
         *,
         quarantine: QuarantineStore,
         store,
+        base_url: str,
         event: Callable[[str], None] | None = None,
     ) -> None:
         self._quarantine = quarantine
         self._store = store
+        self._base_url = self._validate_base_url(base_url)
         self._event = event
 
     def capture(self, *, stage, project: str, version: str, link) -> None:
@@ -35,9 +38,12 @@ class PrivateUploadConnector:
             raise QuarantineError("private upload link has no file reader")
         filename = self._filename(link, entry)
         hashes = getattr(entry, "hashes", None)
-        if not isinstance(hashes, Mapping) or not isinstance(hashes.get("sha256"), str):
+        if not isinstance(hashes, Mapping):
             raise QuarantineError("private upload has no SHA-256 metadata")
-        digest = validate_sha256(hashes["sha256"])
+        hashes_snapshot = dict(hashes)
+        if not isinstance(hashes_snapshot.get("sha256"), str):
+            raise QuarantineError("private upload has no SHA-256 metadata")
+        digest = validate_sha256(hashes_snapshot["sha256"])
         size_value = getattr(entry, "file_size", None)
         if not callable(size_value):
             raise QuarantineError("private upload has no callable file_size")
@@ -46,7 +52,11 @@ class PrivateUploadConnector:
             raise QuarantineError("private upload has invalid size metadata")
         stage_name = self._stage_name(stage)
         self._validate_metadata(filename, project, version)
-        origin = f"private-upload://{digest}"
+        relpath_value = getattr(entry, "relpath", None)
+        if not isinstance(relpath_value, str):
+            raise QuarantineError("private upload has no canonical relpath")
+        relpath = self._validate_relpath(relpath_value, stage_name, filename)
+        origin = urlunsplit((self._base_url[0], self._base_url[1], "/" + relpath, "", ""))
         candidate = ArtifactCandidate(
             stage=stage_name,
             project=project,
@@ -61,35 +71,17 @@ class PrivateUploadConnector:
         try:
             verified = self._quarantine.persist(candidate, self._chunks(stream))
         except BaseException as primary:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException as cleanup:
-                    primary.add_note(
-                        f"input stream cleanup failed: {type(cleanup).__name__}: {cleanup}"
-                    )
+            close_owned(stream, "input stream", primary)
             raise
         else:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException as cleanup:
-                    try:
-                        verified._stream.close()
-                    except BaseException as descriptor_cleanup:
-                        cleanup.add_note(
-                            "verified stream cleanup failed: "
-                            f"{type(descriptor_cleanup).__name__}: {descriptor_cleanup}"
-                        )
-                    raise QuarantineError("private upload input close failed") from cleanup
+            try:
+                close_owned(stream, "input stream")
+            except BaseException as cleanup:
+                close_owned(verified._stream, "verified stream", cleanup)
+                raise
         # Publish notification and discovery happen only after the verified
         # descriptor is closed, so no consumer can observe an unpersisted blob.
-        try:
-            verified._stream.close()
-        except BaseException as error:
-            raise QuarantineError("verified upload descriptor close failed") from error
+        close_owned(verified._stream, "verified upload descriptor")
         if self._event is not None:
             self._event("quarantine_published")
         now = datetime.now(UTC)
@@ -132,6 +124,63 @@ class PrivateUploadConnector:
             raise QuarantineError("private upload filename is not a valid artifact") from error
         if normalize_name(parsed_project) != normalize_name(project) or parsed_version != version:
             raise QuarantineError("private upload metadata does not match filename")
+
+    @staticmethod
+    def _validate_base_url(base_url: str) -> tuple[str, str]:
+        if not isinstance(base_url, str) or any(ord(char) < 0x20 for char in base_url):
+            raise ValueError("base_url must be a canonical HTTP(S) URL")
+        try:
+            parsed = urlsplit(base_url)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("base_url must be a canonical HTTP(S) URL") from error
+        host = parsed.hostname
+        if (
+            parsed.scheme.lower() not in ("http", "https")
+            or not host
+            or not host.isascii()
+            or any(char.isspace() or char in "/?#\\" for char in host)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+            or "%" in parsed.path
+            or "%" in parsed.netloc
+            or "\\" in parsed.path
+            or "//" in parsed.path
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("base_url must be a canonical HTTP(S) URL")
+        host = host.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        authority = host if port is None else f"{host}:{port}"
+        return parsed.scheme.lower(), authority
+
+    @staticmethod
+    def _validate_relpath(relpath: str, stage: str, filename: str) -> str:
+        if (
+            not relpath
+            or relpath.startswith("/")
+            or "//" in relpath
+            or "%" in relpath
+            or "\\" in relpath
+            or "?" in relpath
+            or "#" in relpath
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in relpath)
+        ):
+            raise QuarantineError("private upload relpath is not canonical")
+        parts = relpath.split("/")
+        if (
+            any(part in ("", ".", "..") for part in parts)
+            or len(parts) < 5
+            or "/".join(parts[:2]) != stage
+            or parts[2] not in ("+f", "+e")
+            or parts[-1] != filename
+        ):
+            raise QuarantineError("private upload relpath is not canonical")
+        return relpath
 
     @staticmethod
     def _stage_name(stage) -> str:

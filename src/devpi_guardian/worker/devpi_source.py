@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable
-from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 
 from devpi_guardian.verdicts.models import validate_sha256
 
@@ -35,11 +35,7 @@ class DevpiArtifactBytesSource:
 
     def iter_chunks(self, resolved: ResolvedDiscovery) -> Iterable[bytes]:
         validate_sha256(resolved.sha256)
-        parts = PurePosixPath(resolved.relpath).parts
-        if any(part in ("", ".", "..") for part in parts) or len(parts) < 5:
-            raise DevpiArtifactUnavailable("invalid devpi file path")
-        if "/".join(parts[:2]) != resolved.source_stage or parts[-1] != resolved.filename:
-            raise DevpiArtifactUnavailable("devpi path metadata does not match discovery")
+        self._validate_relpath(resolved.relpath, resolved.source_stage, resolved.filename)
 
         stream = None
         upstream = None
@@ -51,12 +47,20 @@ class DevpiArtifactBytesSource:
                     raise DevpiArtifactUnavailable("devpi file entry is missing")
                 entry_user = entry.user
                 entry_index = entry.index
-                hashes = entry.hashes
+                hashes = dict(entry.hashes)
                 advertised = hashes.get("sha256")
-                if f"{entry_user}/{entry_index}" != resolved.source_stage:
+                if (
+                    not isinstance(entry_user, str)
+                    or not isinstance(entry_index, str)
+                    or f"{entry_user}/{entry_index}" != resolved.source_stage
+                ):
                     raise DevpiArtifactUnavailable("devpi file entry belongs to another stage")
                 if advertised != resolved.sha256:
                     raise DevpiArtifactUnavailable("devpi file entry SHA-256 does not match")
+                entry_relpath = entry.relpath
+                self._validate_relpath(entry_relpath, resolved.source_stage, resolved.filename)
+                if entry_relpath != resolved.relpath:
+                    raise DevpiArtifactUnavailable("devpi file entry relpath does not match")
                 exists = entry.file_exists()
                 if exists:
                     stream = entry.file_open_read()
@@ -85,19 +89,93 @@ class DevpiArtifactBytesSource:
             raise DevpiArtifactUnavailable("uncached devpi file has no upstream URL")
         if stage is None:
             raise DevpiArtifactUnavailable("source stage no longer exists")
-        with contextlib.ExitStack() as stack:
+        self._validate_upstream_url(upstream, resolved)
+        stack = contextlib.ExitStack()
+        try:
             response = stage.http.stream(stack, "GET", upstream, allow_redirects=False)
+            status = getattr(response, "status_code", None)
+            if status != 200:
+                raise DevpiArtifactUnavailable(f"upstream returned HTTP {status}")
+            for chunk in response.iter_raw(_CHUNK_SIZE):
+                if chunk:
+                    if not isinstance(chunk, bytes):
+                        raise DevpiArtifactUnavailable("upstream returned non-bytes")
+                    yield chunk
+        except BaseException as primary:
             try:
-                status = getattr(response, "status_code", None)
-                if status != 200:
-                    raise DevpiArtifactUnavailable(f"upstream returned HTTP {status}")
-                for chunk in response.iter_raw(_CHUNK_SIZE):
-                    if chunk:
-                        if not isinstance(chunk, bytes):
-                            raise DevpiArtifactUnavailable("upstream returned non-bytes")
-                        yield chunk
-            except BaseException as primary:
-                _close_with_primary(response, primary)
-                raise
-            else:
-                _close_with_primary(response, None)
+                stack.close()
+            except BaseException as cleanup:
+                primary.add_note(
+                    f"upstream response cleanup failed: {type(cleanup).__name__}: {cleanup}"
+                )
+            raise
+        else:
+            try:
+                stack.close()
+            except BaseException as cleanup:
+                raise DevpiArtifactUnavailable("upstream response close failed") from cleanup
+
+    @staticmethod
+    def _validate_relpath(relpath: str, source_stage: str, filename: str) -> list[str]:
+        if (
+            not isinstance(relpath, str)
+            or not relpath
+            or relpath.startswith("/")
+            or "//" in relpath
+            or "%" in relpath
+            or "\\" in relpath
+            or "?" in relpath
+            or "#" in relpath
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in relpath)
+        ):
+            raise DevpiArtifactUnavailable("invalid devpi file path")
+        parts = relpath.split("/")
+        if (
+            any(part in ("", ".", "..") for part in parts)
+            or len(parts) < 5
+            or "/".join(parts[:2]) != source_stage
+            or parts[2] not in ("+f", "+e")
+            or parts[-1] != filename
+        ):
+            raise DevpiArtifactUnavailable("devpi path metadata does not match discovery")
+        return parts
+
+    @staticmethod
+    def _validate_upstream_url(upstream: str, resolved: ResolvedDiscovery) -> None:
+        if not isinstance(upstream, str) or any(ord(char) < 0x20 for char in upstream):
+            raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)")
+        try:
+            parsed = urlsplit(upstream)
+            port = parsed.port
+        except ValueError as error:
+            raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)") from error
+        if (
+            parsed.scheme.lower() not in ("http", "https")
+            or not parsed.hostname
+            or not parsed.hostname.isascii()
+            or any(char.isspace() or char in "/?#\\" for char in parsed.hostname)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.netloc
+            or "%" in parsed.path
+            or "\\" in parsed.path
+        ):
+            raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)")
+        resolved_url = urlsplit(resolved.origin_url)
+        origin = (
+            parsed.scheme.lower(),
+            parsed.hostname.lower(),
+            port if port is not None else (443 if parsed.scheme.lower() == "https" else 80),
+        )
+        resolved_port = resolved_url.port
+        resolved_origin = (
+            resolved_url.scheme.lower(),
+            resolved_url.hostname.lower() if resolved_url.hostname else None,
+            resolved_port
+            if resolved_port is not None
+            else (443 if resolved_url.scheme.lower() == "https" else 80),
+        )
+        if origin == resolved_origin:
+            raise DevpiArtifactUnavailable("upstream URL targets the configured devpi origin")

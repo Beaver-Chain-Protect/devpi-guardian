@@ -20,6 +20,7 @@ def test_private_upload_publishes_before_discovery_and_never_uses_url(tmp_path):
         def __init__(self):
             self.hashes = {"sha256": digest}
             self.size_calls = 0
+            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
 
         def file_size(self):
             self.size_calls += 1
@@ -32,9 +33,11 @@ def test_private_upload_publishes_before_discovery_and_never_uses_url(tmp_path):
         def discover_artifact(self, artifact, release):
             events.append("artifact_discovered")
 
+    quarantine = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     connector = PrivateUploadConnector(
-        quarantine=QuarantineStore(tmp_path / "q", max_size_bytes=100),
+        quarantine=quarantine,
         store=Store(),
+        base_url="https://devpi.invalid/",
         event=events.append,
     )
     entry = Entry()
@@ -50,6 +53,7 @@ def test_private_upload_publishes_before_discovery_and_never_uses_url(tmp_path):
     )
     assert events == ["quarantine_published", "artifact_discovered"]
     assert entry.size_calls == 1
+    quarantine.close()
 
 
 def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
@@ -59,6 +63,7 @@ def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
+            self.relpath = "root/pypi/+f/abc/demo_pkg-1.0-py3-none-any.whl"
 
         def file_size(self):
             return len(payload)
@@ -77,9 +82,11 @@ def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
         def discover_artifact(self, artifact, release):
             seen.append((artifact, release))
 
+    quarantine = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     PrivateUploadConnector(
-        quarantine=QuarantineStore(tmp_path / "q", max_size_bytes=100),
+        quarantine=quarantine,
         store=Store(),
+        base_url="https://devpi.invalid/",
     ).capture(
         stage=Stage(),
         project="Demo_Pkg",
@@ -91,8 +98,12 @@ def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
     assert release.project == "Demo_Pkg"
     assert release.version == "1.0"
     assert release.filename == "demo_pkg-1.0-py3-none-any.whl"
+    assert release.origin_url == (
+        "https://devpi.invalid/root/pypi/+f/abc/demo_pkg-1.0-py3-none-any.whl"
+    )
     assert artifact.sha256 == digest and artifact.size_bytes == len(payload)
     assert release.discovered_at == artifact.discovered_at
+    quarantine.close()
 
 
 def test_private_upload_rejects_inconsistent_filename_metadata(tmp_path):
@@ -102,6 +113,7 @@ def test_private_upload_rejects_inconsistent_filename_metadata(tmp_path):
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
+            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
 
         def file_size(self):
             return len(payload)
@@ -109,9 +121,11 @@ def test_private_upload_rejects_inconsistent_filename_metadata(tmp_path):
         def file_open_read(self):
             return BytesIO(payload)
 
+    quarantine = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     connector = PrivateUploadConnector(
-        quarantine=QuarantineStore(tmp_path / "q", max_size_bytes=100),
+        quarantine=quarantine,
         store=SimpleNamespace(discover_artifact=lambda *_: None),
+        base_url="https://devpi.invalid/",
     )
     with pytest.raises(QuarantineError):
         connector.capture(
@@ -120,6 +134,30 @@ def test_private_upload_rejects_inconsistent_filename_metadata(tmp_path):
             version="1.0",
             link=SimpleNamespace(entry=Entry(), basename="demo-1.0-py3-none-any.whl"),
         )
+    quarantine.close()
+
+
+def test_private_upload_requires_canonical_base_url(tmp_path):
+    import pytest
+
+    for base_url in (
+        "relative",
+        "https://devpi.invalid//",
+        "https://user:pass@devpi.invalid/",
+        "https://devpi.invalid/?q=1",
+        "https://devpi.invalid/#fragment",
+        "https://devpi.invalid/%2e/",
+    ):
+        quarantine = QuarantineStore(
+            tmp_path / ("q-" + str(abs(hash(base_url)))), max_size_bytes=100
+        )
+        with pytest.raises(ValueError):
+            PrivateUploadConnector(
+                quarantine=quarantine,
+                store=SimpleNamespace(discover_artifact=lambda *_: None),
+                base_url=base_url,
+            )
+        quarantine.close()
 
 
 def test_verified_close_failure_prevents_event_and_discovery():
@@ -129,7 +167,10 @@ def test_verified_close_failure_prevents_event_and_discovery():
 
     class CloseError(BytesIO):
         def close(self):
-            raise OSError("verified close failed")
+            try:
+                super().close()
+            finally:
+                raise OSError("verified close failed")
 
     verified = VerifiedArtifact(
         stage="root/pypi",
@@ -144,6 +185,7 @@ def test_verified_close_failure_prevents_event_and_discovery():
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
+            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
 
         def file_size(self):
             return len(payload)
@@ -160,10 +202,80 @@ def test_verified_close_failure_prevents_event_and_discovery():
             events.append("artifact_discovered")
 
     with pytest.raises(QuarantineError):
-        PrivateUploadConnector(quarantine=Quarantine(), store=Store(), event=events.append).capture(
+        PrivateUploadConnector(
+            quarantine=Quarantine(),
+            store=Store(),
+            base_url="https://devpi.invalid/",
+            event=events.append,
+        ).capture(
             stage="root/pypi",
             project="demo",
             version="1.0",
             link=SimpleNamespace(entry=Entry(), basename="demo-1.0-py3-none-any.whl"),
         )
+    assert events == []
+
+
+def test_verified_close_first_failure_retries_and_still_has_no_side_effects():
+    payload = b"private wheel"
+    digest = hashlib.sha256(payload).hexdigest()
+    events = []
+
+    class RetryClose(BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("first close failed")
+            super().close()
+
+    verified_stream = RetryClose(payload)
+    verified = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo-1.0-py3-none-any.whl",
+        sha256=digest,
+        size_bytes=len(payload),
+        _stream=verified_stream,
+    )
+
+    class Entry:
+        def __init__(self):
+            self.hashes = {"sha256": digest}
+            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+
+        def file_size(self):
+            return len(payload)
+
+        def file_open_read(self):
+            return BytesIO(payload)
+
+    class Quarantine:
+        def persist(self, candidate, chunks):
+            return verified
+
+    class Store:
+        def discover_artifact(self, *args):
+            events.append("artifact_discovered")
+
+    import pytest
+
+    with pytest.raises(QuarantineError):
+        PrivateUploadConnector(
+            quarantine=Quarantine(),
+            store=Store(),
+            base_url="https://devpi.invalid/",
+            event=events.append,
+        ).capture(
+            stage="root/pypi",
+            project="demo",
+            version="1.0",
+            link=SimpleNamespace(entry=Entry(), basename="demo-1.0-py3-none-any.whl"),
+        )
+    assert verified_stream.attempts == 2
+    assert verified_stream.closed
     assert events == []
