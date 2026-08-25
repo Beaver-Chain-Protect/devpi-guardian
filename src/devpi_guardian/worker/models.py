@@ -13,6 +13,28 @@ AnalyzerName = Literal["F7", "F8", "F9"]
 AnalysisStatus = Literal["completed", "skipped", "error"]
 
 
+def _close_owned(stream, primary: BaseException | None = None) -> None:
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException as first:
+        try:
+            closed = bool(stream.closed)
+        except BaseException as state_error:
+            first.add_note(f"stream closed-state check failed: {state_error}")
+            closed = False
+        if not closed:
+            try:
+                close()
+            except BaseException as second:
+                first.add_note(f"stream second close failed: {type(second).__name__}: {second}")
+        if primary is None:
+            raise first
+        primary.add_note(f"stream cleanup failed: {type(first).__name__}: {first}")
+
+
 def _required(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must not be blank")
@@ -77,13 +99,7 @@ class VerifiedArtifact:
                 )
             else:
                 if callable(close):
-                    try:
-                        close()
-                    except BaseException as cleanup_error:
-                        validation_error.add_note(
-                            "stream cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
+                    _close_owned(self._stream, validation_error)
             raise
 
     def open_for_analysis(self) -> AbstractContextManager[BinaryIO]:
@@ -102,17 +118,12 @@ class _RewoundOwnedStream(AbstractContextManager[BinaryIO]):
             self._stream.seek(0)
             return self._stream
         except BaseException as primary:
-            try:
-                self._stream.close()
-            except BaseException as cleanup_error:
-                primary.add_note(
-                    f"stream cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            _close_owned(self._stream, primary)
             raise
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         try:
-            self._stream.close()
+            _close_owned(self._stream)
         except BaseException as cleanup_error:
             if exc_value is not None:
                 exc_value.add_note(
@@ -146,7 +157,7 @@ class AnalysisBundle:
                 already_closed = False
             if not already_closed:
                 try:
-                    artifact._stream.close()
+                    _close_owned(artifact._stream)
                 except BaseException as error:
                     errors.append(error)
         if errors:

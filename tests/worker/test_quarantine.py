@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from devpi_guardian.worker.models import ArtifactCandidate
+from devpi_guardian.worker.models import ArtifactCandidate, VerifiedArtifact
 from devpi_guardian.worker.quarantine import (
     ArtifactSizeMismatch,
     QuarantineError,
@@ -284,10 +284,13 @@ def test_final_object_owner_is_revalidated(tmp_path: Path, monkeypatch) -> None:
     item = candidate(payload)
     verified = store.persist(item, [payload])
     verified._stream.close()
+    leaf_fd = store._open_leaf(item.sha256, create=False)
+    assert leaf_fd is not None
     actual_euid = os.geteuid()
     monkeypatch.setattr(os, "geteuid", lambda: actual_euid + 1)
     with pytest.raises(QuarantineError):
-        store.get_verified(item)
+        store._open_verified_fd(leaf_fd, item.sha256, item, None)
+    os.close(leaf_fd)
     store.close()
 
 
@@ -463,4 +466,129 @@ def test_nonregular_fifo_object_is_rejected_without_blocking(tmp_path: Path) -> 
     os.mkfifo(leaf / digest, 0o600)
     with pytest.raises(QuarantineError):
         store.get_verified(item)
+    store.close()
+
+
+class RetryOwnedStream:
+    def __init__(self, inner):
+        self.inner = inner
+        self.attempts = 0
+
+    @property
+    def closed(self):
+        return self.inner.closed
+
+    def read(self, size=-1):
+        return self.inner.read(size)
+
+    def seek(self, position):
+        return self.inner.seek(position)
+
+    def tell(self):
+        return self.inner.tell()
+
+    def fileno(self):
+        return self.inner.fileno()
+
+    def close(self):
+        self.attempts += 1
+        if self.attempts == 1:
+            raise OSError("owned stream first close failed")
+        self.inner.close()
+
+
+def test_persist_leaf_close_failure_retries_verified_stream(tmp_path: Path, monkeypatch) -> None:
+    payload = b"persist leaf close"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    holder = []
+
+    def artifact(candidate, size, stream):
+        wrapped = RetryOwnedStream(stream)
+        holder.append(wrapped)
+        return VerifiedArtifact(
+            stage=candidate.stage,
+            project=candidate.project,
+            version=candidate.version,
+            filename=candidate.filename,
+            sha256=candidate.sha256,
+            size_bytes=size,
+            _stream=wrapped,
+        )
+
+    real_open_leaf = store._open_leaf
+
+    def open_leaf(digest, *, create):
+        fd = real_open_leaf(digest, create=create)
+        if create:
+            holder.append(fd)
+        return fd
+
+    monkeypatch.setattr(store, "_artifact", artifact)
+    monkeypatch.setattr(store, "_open_leaf", open_leaf)
+    real_close = os.close
+    failed = False
+
+    def close(fd):
+        nonlocal failed
+        if holder and fd == holder[0] and not failed:
+            failed = True
+            raise OSError("leaf close failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(OSError, match="leaf close failed"):
+        store.persist(candidate(payload), [payload])
+    assert holder[1].attempts == 2 and holder[1].closed
+    monkeypatch.undo()
+    store.close()
+
+
+def test_get_verified_leaf_close_failure_retries_verified_stream(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payload = b"get leaf close"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    published = store.persist(item, [payload])
+    published._stream.close()
+    holder = []
+
+    def artifact(candidate, size, stream):
+        wrapped = RetryOwnedStream(stream)
+        holder.append(wrapped)
+        return VerifiedArtifact(
+            stage=candidate.stage,
+            project=candidate.project,
+            version=candidate.version,
+            filename=candidate.filename,
+            sha256=candidate.sha256,
+            size_bytes=size,
+            _stream=wrapped,
+        )
+
+    real_open_leaf = store._open_leaf
+
+    def open_leaf(digest, *, create):
+        fd = real_open_leaf(digest, create=create)
+        if not create:
+            holder.append(fd)
+        return fd
+
+    monkeypatch.setattr(store, "_artifact", artifact)
+    monkeypatch.setattr(store, "_open_leaf", open_leaf)
+    real_close = os.close
+    failed = False
+
+    def close(fd):
+        nonlocal failed
+        if holder and fd == holder[0] and not failed:
+            failed = True
+            raise OSError("leaf close failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(OSError, match="leaf close failed"):
+        store.get_verified(item)
+    assert holder[1].attempts == 2 and holder[1].closed
+    monkeypatch.undo()
     store.close()

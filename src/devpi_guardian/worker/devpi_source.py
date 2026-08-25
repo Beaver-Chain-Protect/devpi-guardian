@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable
-from urllib.parse import urlsplit
 
 from devpi_guardian.verdicts.models import validate_sha256
 
-from .devpi_paths import DevpiRouteError, validate_artifact_relpath
+from .devpi_paths import DevpiBase, DevpiRouteError, validate_artifact_relpath
 from .discovery_consumer import ResolvedDiscovery
 
 _CHUNK_SIZE = 1024 * 1024
@@ -30,59 +29,80 @@ def _close_with_primary(stream, primary: BaseException | None) -> None:
         except BaseException as state_error:
             first.add_note(f"artifact stream closed-state check failed: {state_error}")
             closed = False
-        retried = False
         if not closed:
             try:
                 close()
-                retried = True
             except BaseException as second:
                 first.add_note(
                     f"artifact stream second close failed: {type(second).__name__}: {second}"
                 )
-        if primary is None and not retried:
+        if primary is None:
             raise DevpiArtifactUnavailable("artifact stream close failed") from first
         if primary is not None:
             primary.add_note(f"artifact stream cleanup failed: {type(first).__name__}: {first}")
 
 
-def _close_response_stack(stack, response, primary: BaseException | None) -> None:
-    """Close one ExitStack-owned response, retrying only a failed callback."""
+class _OwnedResponseContext:
+    """Keep each entered HTTP response's cleanup independent and fail-closed."""
 
-    try:
-        stack.close()
-    except BaseException as first:
-        # The callback already attempted one close.  A second attempt is safe
-        # only when the response still reports itself open.
-        retried = False
-        if response is not None:
-            try:
-                closed = bool(response.closed)
-            except BaseException as state_error:
-                first.add_note(f"upstream response closed-state check failed: {state_error}")
-                closed = False
-            if not closed:
+    def __init__(self, context) -> None:
+        self._context = context
+        self.response = None
+
+    def __enter__(self):
+        self.response = self._context.__enter__()
+        return self.response
+
+    @staticmethod
+    def _closed(response) -> bool:
+        for name in ("closed", "is_closed"):
+            value = getattr(response, name, None)
+            if value is not None:
+                return bool(value() if callable(value) else value)
+        return False
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return self._context.__exit__(exc_type, exc_value, traceback)
+        except BaseException as first:
+            response = self.response
+            closed = False
+            if response is not None:
+                try:
+                    closed = self._closed(response)
+                except BaseException as state_error:
+                    first.add_note(f"response closed-state check failed: {state_error}")
+            if response is not None and not closed:
                 try:
                     response.close()
-                    retried = True
                 except BaseException as second:
                     first.add_note(
-                        f"upstream response second close failed: {type(second).__name__}: {second}"
+                        f"response second close failed: {type(second).__name__}: {second}"
                     )
-        if primary is None and not retried:
-            raise DevpiArtifactUnavailable("upstream response close failed") from first
-        if primary is not None:
-            primary.add_note(f"upstream response cleanup failed: {type(first).__name__}: {first}")
+            # Even a successful retry does not erase the original context
+            # cleanup error; ExitStack must continue to report it.
+            raise
 
 
 class DevpiArtifactBytesSource:
-    def __init__(self, xom) -> None:
+    def __init__(self, xom, *, base_url: str) -> None:
         self._xom = xom
+        try:
+            self._base = DevpiBase.parse(base_url)
+        except DevpiRouteError as error:
+            raise ValueError("base_url must be a canonical HTTP(S) URL") from error
 
     def iter_chunks(self, resolved: ResolvedDiscovery) -> Iterable[bytes]:
         validate_sha256(resolved.sha256)
         self._validate_relpath(
             resolved.relpath, resolved.source_stage, resolved.filename, resolved.sha256
         )
+        try:
+            expected_origin = self._base.origin_for(resolved.relpath)
+        except DevpiRouteError as error:
+            raise DevpiArtifactUnavailable("resolved artifact route is not canonical") from error
+        if resolved.origin_url != expected_origin:
+            raise DevpiArtifactUnavailable("resolved artifact origin is not canonical")
 
         stream = None
         upstream = None
@@ -140,9 +160,9 @@ class DevpiArtifactBytesSource:
             raise DevpiArtifactUnavailable("source stage no longer exists")
         self._validate_upstream_url(upstream, resolved)
         stack = contextlib.ExitStack()
-        response = None
         try:
-            response = stage.http.stream(stack, "GET", upstream, allow_redirects=False)
+            context = stage.http.stream("GET", upstream, allow_redirects=False)
+            response = stack.enter_context(_OwnedResponseContext(context))
             status = getattr(response, "status_code", None)
             if status != 200:
                 raise DevpiArtifactUnavailable(f"upstream returned HTTP {status}")
@@ -152,10 +172,18 @@ class DevpiArtifactBytesSource:
                         raise DevpiArtifactUnavailable("upstream returned non-bytes")
                     yield chunk
         except BaseException as primary:
-            _close_response_stack(stack, response, primary)
+            try:
+                stack.close()
+            except BaseException as cleanup:
+                primary.add_note(
+                    f"upstream response cleanup failed: {type(cleanup).__name__}: {cleanup}"
+                )
             raise
         else:
-            _close_response_stack(stack, response, None)
+            try:
+                stack.close()
+            except BaseException as cleanup:
+                raise DevpiArtifactUnavailable("upstream response close failed") from cleanup
 
     @staticmethod
     def _validate_relpath(
@@ -170,42 +198,12 @@ class DevpiArtifactBytesSource:
                 "devpi path metadata does not match discovery"
             ) from error
 
-    @staticmethod
-    def _validate_upstream_url(upstream: str, resolved: ResolvedDiscovery) -> None:
+    def _validate_upstream_url(self, upstream: str, resolved: ResolvedDiscovery) -> None:
         if not isinstance(upstream, str) or any(ord(char) < 0x20 for char in upstream):
             raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)")
         try:
-            parsed = urlsplit(upstream)
-            port = parsed.port
-        except ValueError as error:
+            origin = DevpiBase.endpoint_for_url(upstream)
+        except DevpiRouteError as error:
             raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)") from error
-        if (
-            parsed.scheme.lower() not in ("http", "https")
-            or not parsed.hostname
-            or not parsed.hostname.isascii()
-            or any(char.isspace() or char in "/?#\\" for char in parsed.hostname)
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or "%" in parsed.netloc
-            or "%" in parsed.path
-            or "\\" in parsed.path
-        ):
-            raise DevpiArtifactUnavailable("upstream URL is not valid HTTP(S)")
-        resolved_url = urlsplit(resolved.origin_url)
-        origin = (
-            parsed.scheme.lower(),
-            parsed.hostname.lower(),
-            port if port is not None else (443 if parsed.scheme.lower() == "https" else 80),
-        )
-        resolved_port = resolved_url.port
-        resolved_origin = (
-            resolved_url.scheme.lower(),
-            resolved_url.hostname.lower() if resolved_url.hostname else None,
-            resolved_port
-            if resolved_port is not None
-            else (443 if resolved_url.scheme.lower() == "https" else 80),
-        )
-        if origin == resolved_origin:
+        if origin == self._base.endpoint:
             raise DevpiArtifactUnavailable("upstream URL targets the configured devpi origin")

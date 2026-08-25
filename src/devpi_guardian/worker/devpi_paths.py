@@ -160,6 +160,36 @@ class DevpiBase:
         return f"{host}:{self.port}"
 
     @property
+    def endpoint(self) -> tuple[str, str, int]:
+        return self.scheme, self.host, self.port
+
+    @staticmethod
+    def endpoint_for_url(value: str) -> tuple[str, str, int]:
+        if not isinstance(value, str) or _control(value) or "\\" in value:
+            raise DevpiRouteError("URL is not canonical")
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except (TypeError, ValueError) as error:
+            raise DevpiRouteError("URL is not canonical") from error
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or "%" in parsed.netloc
+        ):
+            raise DevpiRouteError("URL is not canonical")
+        host = _canonical_host(parsed.hostname)
+        effective_port = port if port is not None else (443 if scheme == "https" else 80)
+        if not 1 <= effective_port <= 65535:
+            raise DevpiRouteError("URL port is invalid")
+        return scheme, host, effective_port
+
+    @property
     def url(self) -> str:
         return urlunsplit((self.scheme, self.netloc, self.mount or "/", "", ""))
 

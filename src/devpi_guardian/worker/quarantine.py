@@ -259,10 +259,7 @@ class QuarantineStore:
                 _close_fd(leaf_fd, primary_error)
             except BaseException as close_error:
                 if result is not None:
-                    try:
-                        result._stream.close()
-                    except BaseException as stream_error:
-                        _note_cleanup(close_error, "verified stream", stream_error)
+                    close_owned(result._stream, "verified stream", close_error)
                 raise
 
     def get_verified(self, candidate: ArtifactCandidate) -> VerifiedArtifact | None:
@@ -283,10 +280,7 @@ class QuarantineStore:
                 result = self._artifact(candidate, size, stream)
                 return result
             except BaseException as primary:
-                try:
-                    stream.close()
-                except BaseException as cleanup:
-                    _note_cleanup(primary, "verified stream", cleanup)
+                close_owned(stream, "verified stream", primary)
                 raise
         except BaseException as primary:
             primary_error = primary
@@ -296,10 +290,7 @@ class QuarantineStore:
                 _close_fd(leaf_fd, primary_error)
             except BaseException as close_error:
                 if result is not None:
-                    try:
-                        result._stream.close()
-                    except BaseException as stream_error:
-                        _note_cleanup(close_error, "verified stream", stream_error)
+                    close_owned(result._stream, "verified stream", close_error)
                 raise
 
     def _artifact(
@@ -511,10 +502,7 @@ class QuarantineStore:
             return stream
         except BaseException as primary:
             if stream is not None:
-                try:
-                    stream.close()
-                except BaseException as cleanup:
-                    _note_cleanup(primary, "object stream", cleanup)
+                close_owned(stream, "object stream", primary)
             if fd != -1:
                 _close_fd(fd, primary)
             raise

@@ -197,6 +197,22 @@ def test_resolver_supports_canonical_mount_and_rejects_outside_mount():
         resolver.resolve(candidate)
 
 
+def test_resolver_accepts_exact_plus_e_route():
+    candidate = item()
+    relpath = f"root/pypi/+e/abc/{candidate.filename}"
+    resolved = SimpleLinkResolver("https://devpi.invalid/").resolve(
+        DiscoveryCandidate(
+            candidate.stage,
+            candidate.project,
+            candidate.filename,
+            candidate.sha256,
+            f"/{relpath}#sha256={candidate.sha256}",
+        )
+    )
+    assert resolved.relpath == relpath
+    assert resolved.origin_url == f"https://devpi.invalid:443/{relpath}"
+
+
 def test_resolver_rejects_invalid_host_and_ports():
     for base in ("http://:80/", "https://devpi.invalid:0/", "https://devpi.invalid:65536/"):
         with __import__("pytest").raises(ValueError):

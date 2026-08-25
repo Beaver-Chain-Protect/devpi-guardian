@@ -10,6 +10,7 @@ from devpi_guardian.baseline.artifact_source import (
     _canonical_devpi_base,
     _validate_artifact_url,
 )
+from devpi_guardian.worker.devpi_paths import DevpiBase
 from devpi_guardian.worker.models import VerifiedArtifact
 from devpi_guardian.worker.quarantine import QuarantineError, QuarantineStore
 from devpi_guardian.worker.upload import PrivateUploadConnector
@@ -178,6 +179,29 @@ def test_private_upload_origin_matches_f6_artifact_url_grammar():
     assert (
         _validate_artifact_url(origin, digest, _canonical_devpi_base("https://devpi.invalid"))
         == origin
+    )
+
+
+@pytest.mark.parametrize("base", ["https://devpi.invalid", "https://devpi.invalid/devpi"])
+@pytest.mark.parametrize("marker", ["+f", "+e"])
+def test_private_routes_match_f6_for_root_and_mount(base, marker):
+    digest = "a" * 64
+    filename = "demo-1.0-py3-none-any.whl"
+    relpath = (
+        f"root/pypi/+f/{digest[:3]}/{digest[3:16]}/{filename}"
+        if marker == "+f"
+        else f"root/pypi/+e/abc/{filename}"
+    )
+    origin = DevpiBase.parse(base).origin_for(relpath)
+    assert _validate_artifact_url(origin, digest, _canonical_devpi_base(base)) == origin
+
+
+def test_private_connector_accepts_exact_plus_e_relpath():
+    digest = "a" * 64
+    filename = "demo-1.0-py3-none-any.whl"
+    relpath = file_relpath(digest, filename, "+e")
+    assert (
+        PrivateUploadConnector._validate_relpath(relpath, "root/pypi", filename, digest) == relpath
     )
 
 

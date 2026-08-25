@@ -341,13 +341,13 @@ def test_analysis_bundle_attempts_all_closes_and_reraises_first_failure() -> Non
 
     with pytest.raises(RuntimeError, match="close failed") as raised:
         bundle.close()
-    assert first.close_calls == 1
-    assert second.close_calls == 1
+    assert first.close_calls == 2
+    assert second.close_calls == 2
     assert third.closed
-    assert len(raised.value.__notes__) == 1
+    assert len(raised.value.__notes__) == 2
     bundle.close()
-    assert first.close_calls == 1
-    assert second.close_calls == 1
+    assert first.close_calls == 2
+    assert second.close_calls == 2
 
 
 def test_worker_finally_closes_all_bundle_streams_after_analyzer_failure(tmp_path) -> None:

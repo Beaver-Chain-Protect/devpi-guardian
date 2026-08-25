@@ -312,7 +312,7 @@ def test_analysis_entry_failure_closes_stream_and_preserves_primary(stream) -> N
 
     with pytest.raises(RuntimeError) as raised, artifact.open_for_analysis():
         pass
-    assert stream.close_calls == 1
+    assert stream.close_calls == (2 if isinstance(stream, EntryClosedLookupRaises) else 1)
     if isinstance(stream, EntryClosedLookupRaises):
         assert any("cleanup" in note for note in raised.value.__notes__)
 
@@ -575,4 +575,4 @@ def test_verified_artifact_preserves_validation_error_when_cleanup_fails() -> No
             _stream=stream,
         )
     assert "stage" in str(raised.value)
-    assert stream.close_attempts == 1
+    assert stream.close_attempts == 2
