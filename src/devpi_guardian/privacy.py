@@ -28,24 +28,24 @@ _SENSITIVE_KEY = (
 )
 _HEADER_CREDENTIAL = re.compile(
     r"(?ix)"
-    r"(?P<key_quote>['\"]?)"
+    r"(?P<key_quote>(?:\\['\"]|['\"])?)"
     r"(?P<key>(?<![\w])(?:authorization|x[-_ ]?devpi[-_ ]?auth)(?![\w]))"
     r"(?P=key_quote)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?:(?P<scheme>Bearer|Basic)(?P<scheme_separator>\s+))?"
     r"(?:"
-    r"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    r"(?P<quote>(?:\\['\"]|['\"]))(?:\\.|(?! (?P=quote) ).)*(?P=quote)"
     r"|(?P<bare>[^\s,;}\]]+)"
     r")"
 )
 _SECRET_ASSIGNMENT = re.compile(
     rf"(?ix)"
-    rf"(?P<key_quote>['\"]?)"
+    rf"(?P<key_quote>(?:\\['\"]|['\"])?)"
     rf"(?P<key>(?<![\w]){_SENSITIVE_KEY}(?![\w]))"
     rf"(?P=key_quote)"
     rf"(?P<separator>\s*[:=]\s*)"
     rf"(?:"
-    rf"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    rf"(?P<quote>(?:\\['\"]|['\"]))(?:\\.|(?! (?P=quote) ).)*(?P=quote)"
     rf"|(?P<bare>[^\s,;}}\[\]]+)"
     rf")"
 )
@@ -53,7 +53,7 @@ _AUTH_SCHEME = re.compile(
     r"(?ix)"
     r"(?P<scheme>(?<![\w])(?:Bearer|Basic))(?:\s+)"
     r"(?:"
-    r"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    r"(?P<quote>(?:\\['\"]|['\"]))(?:\\.|(?! (?P=quote) ).)*(?P=quote)"
     r"|(?P<bare>[^\s,;}\]]+)"
     r")"
 )
@@ -61,15 +61,29 @@ _DIGEST = re.compile(r"(?i)\b[0-9a-f]{64}\b")
 _POSIX_PATH_WITH_SPACES = re.compile(
     r"(?<![\w:])/(?!\+)"
     r"(?=[^\n,;:'\"<>{}=]*\s)"
+    r"[^\n,;:'\"<>{}=]*?\.[A-Za-z0-9]+(?=\s|$)"
+)
+_POSIX_PATH_WITH_SPACES_TERMINAL = re.compile(
+    r"(?<![\w:])/(?!\+)"
+    r"(?=[^\n,;:'\"<>{}=]*\s)"
     r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
-    r"[^\n,;:'\"<>{}=]+"
+    r"[^\n,;:'\"<>{}=]+$"
 )
 _POSIX_PATH = re.compile(r"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s,;:'\"]+")
+_POSIX_SINGLE_COMPONENT_PATH = re.compile(
+    r"(?<![\w:])/(?!\+)[^\s/,;:'\"<>{}=]+"
+    r"(?=[\s,;:'\"<>{}=]|$)"
+)
 _WINDOWS_PATH_WITH_SPACES = re.compile(
     r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
     r"(?=[^\n,;:'\"<>{}=]*\s)"
+    r"[^\n,;:'\"<>{}=]*?\.[A-Za-z0-9]+(?=\s|$)"
+)
+_WINDOWS_PATH_WITH_SPACES_TERMINAL = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
+    r"(?=[^\n,;:'\"<>{}=]*\s)"
     r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
-    r"[^\n,;:'\"<>{}=]+"
+    r"[^\n,;:'\"<>{}=]+$"
 )
 _WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;:'\"]+")
 _DIAGNOSTIC_FIELDS = frozenset(
@@ -129,8 +143,11 @@ def sanitize_diagnostic(value: object) -> str:
     text = _SECRET_ASSIGNMENT.sub(_replace_credential, text)
     text = _AUTH_SCHEME.sub(_replace_auth_scheme, text)
     text = _POSIX_PATH_WITH_SPACES.sub("[PATH]", text)
+    text = _POSIX_SINGLE_COMPONENT_PATH.sub("[PATH]", text)
+    text = _POSIX_PATH_WITH_SPACES_TERMINAL.sub("[PATH]", text)
     text = _POSIX_PATH.sub("[PATH]", text)
     text = _WINDOWS_PATH_WITH_SPACES.sub("[PATH]", text)
+    text = _WINDOWS_PATH_WITH_SPACES_TERMINAL.sub("[PATH]", text)
     text = _WINDOWS_PATH.sub("[PATH]", text)
     text = _DIGEST.sub("[DIGEST]", text)
     return text[:MAX_DIAGNOSTIC_LENGTH]
@@ -164,7 +181,7 @@ def sanitize_diagnostic_fields(
                             item,
                             _depth=_depth + 1,
                             _seen=seen,
-                            _diagnostic_context=_diagnostic_context,
+                            _diagnostic_context=True,
                         )
                     elif isinstance(item, str):
                         result[key] = sanitize_diagnostic(item)

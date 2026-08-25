@@ -138,6 +138,89 @@ def test_sanitize_diagnostic_does_not_consume_following_prose_after_path() -> No
     assert sanitize_diagnostic(value) == "download failed at [PATH] while retrying"
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("failed path=/tmp", "failed path=[PATH]"),
+        ("failed path=/a", "failed path=[PATH]"),
+        ("failed path=/tmp while retrying", "failed path=[PATH] while retrying"),
+    ],
+)
+def test_sanitize_diagnostic_redacts_single_component_posix_paths(
+    value: str, expected: str
+) -> None:
+    assert sanitize_diagnostic(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "download failed at /tmp/My Secret/a.whl while retrying",
+            "download failed at [PATH] while retrying",
+        ),
+        (
+            "download failed at /Users/alice/My Secret/file.tar.gz while retrying",
+            "download failed at [PATH] while retrying",
+        ),
+        (
+            r"download failed at C:\My Secret\a.whl while retrying",
+            "download failed at [PATH] while retrying",
+        ),
+        (
+            r"download failed at \\server\Share Name\a.whl while retrying",
+            "download failed at [PATH] while retrying",
+        ),
+        (
+            "download failed at /tmp/My File Name.whl while retrying",
+            "download failed at [PATH] while retrying",
+        ),
+    ],
+)
+def test_sanitize_diagnostic_redacts_spaced_path_but_preserves_following_prose(
+    value: str, expected: str
+) -> None:
+    result = sanitize_diagnostic(value)
+
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "secrets"),
+    [
+        (r"{\"client_secret\":\"abc\\\"def\"}", ("abc", "def")),
+        (r"{\'auth_token\': \'abc\\\'def\'}", ("abc", "def")),
+        (r"{\"X-Devpi-Auth\": \"header-secret\"}", ("header-secret",)),
+        (r"{\"Authorization\": \"Bearer bearer-secret\"}", ("bearer-secret",)),
+    ],
+)
+def test_sanitize_diagnostic_redacts_fully_escaped_mapping_credentials(
+    value: str,
+    secrets: tuple[str, ...],
+) -> None:
+    result = sanitize_diagnostic(value)
+
+    for secret in secrets:
+        assert secret not in result
+    assert "[REDACTED]" in result
+
+
+def test_sanitize_diagnostic_fields_sanitizes_composite_identity_values() -> None:
+    secret_url = "https://user:secret@example.invalid/a.whl"
+
+    result = sanitize_diagnostic_fields(
+        {
+            "sha256": {"value": secret_url},
+            "baseline_sha256": [secret_url],
+        }
+    )
+
+    assert result == {
+        "sha256": {"value": "[URL]"},
+        "baseline_sha256": ["[URL]"],
+    }
+
+
 def test_sanitize_diagnostic_fields_rejects_cycles() -> None:
     value: dict[str, object] = {}
     value["nested"] = value

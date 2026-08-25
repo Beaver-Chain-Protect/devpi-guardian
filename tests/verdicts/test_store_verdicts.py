@@ -221,7 +221,16 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     store.record_verdict(
         claim,
         verdict(created_at=created_at),
-        [evidence(details={"z": [2, 1], "a": {"enabled": True}})],
+        [
+            evidence(
+                details={
+                    "z": [2, 1],
+                    "a": {"enabled": True},
+                    "sha256": {"value": "https://user:secret@example.invalid/a.whl"},
+                    "baseline_sha256": ["https://user:secret@example.invalid/a.whl"],
+                }
+            )
+        ],
     )
 
     artifact_row = fetchall(
@@ -272,7 +281,7 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
         "demo/client.py",
         12,
         "new outbound request",
-        '{"a":{"enabled":true},"z":[2,1]}',
+        '{"a":{"enabled":true},"baseline_sha256":["[URL]"],"sha256":{"value":"[URL]"},"z":[2,1]}',
     )
 
 

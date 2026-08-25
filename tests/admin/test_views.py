@@ -104,7 +104,9 @@ def test_response_defense_in_depth_sanitizes_structured_escaped_credentials_and_
                                 "posix_path": "/tmp/My Secret/cache dir",
                                 "windows_path": r"C:\My Secret\cache dir",
                                 "sha256": digest,
-                            }
+                            },
+                            "sha256": {"value": "https://user:secret@example.invalid/a.whl"},
+                            "baseline_sha256": ["https://user:secret@example.invalid/a.whl"],
                         }
                     }
                 ],
@@ -122,6 +124,8 @@ def test_response_defense_in_depth_sanitizes_structured_escaped_credentials_and_
     assert "/tmp/My Secret/cache dir" not in rendered
     assert r"C:\My Secret\cache dir" not in rendered
     assert details["message"]["sha256"] == digest
+    assert details["sha256"] == {"value": "[URL]"}
+    assert details["baseline_sha256"] == ["[URL]"]
     assert response.json_body["artifact"]["summary"]["sha256"] == digest
     assert response.json_body["artifact"]["summary"]["baseline_sha256"] == digest
 
