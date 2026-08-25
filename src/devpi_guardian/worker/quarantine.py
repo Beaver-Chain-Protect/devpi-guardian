@@ -404,8 +404,19 @@ class QuarantineStore:
                 st = os.fstat(fd)
                 if not stat.S_ISDIR(st.st_mode):
                     raise QuarantineError("quarantine root must be a directory")
-                if final and (st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != _DIR_MODE):
-                    raise QuarantineError("quarantine root owner or mode is unsafe")
+                if final:
+                    if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != _DIR_MODE:
+                        raise QuarantineError("quarantine root owner or mode is unsafe")
+                else:
+                    owner = st.st_uid
+                    if owner not in (0, os.geteuid()):
+                        raise QuarantineError("quarantine root parent owner is unsafe")
+                    mode = stat.S_IMODE(st.st_mode)
+                    # Shared system directories such as /tmp are safe only
+                    # when root-owned and sticky; all other parents must not
+                    # be writable by group or other users.
+                    if mode & 0o022 and not (owner == 0 and mode & stat.S_ISVTX):
+                        raise QuarantineError("quarantine root parent mode is unsafe")
             except BaseException as error:
                 _close_fd(fd, error)
                 raise

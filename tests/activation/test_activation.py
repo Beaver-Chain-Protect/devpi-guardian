@@ -90,6 +90,26 @@ def test_primary_rejects_unsafe_quarantine_roots_before_migration(tmp_path, monk
     assert pyramid.tweens == []
 
 
+def test_primary_rejects_unsafe_quarantine_parent_before_migration(tmp_path, monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    server = tmp_path / "server"
+    server.mkdir()
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o777)
+    root = parent / "quarantine"
+    root.mkdir(mode=0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    config.server_path = str(server)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal, match=r"parent|unsafe|mode"):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+
 def test_upload_hook_replica_is_noop_but_primary_requires_connector():
     import devpi_guardian.plugin as plugin
 
@@ -235,6 +255,56 @@ def test_real_configurator_conflict_does_not_publish_or_build(monkeypatch, tmp_p
     assert xom.thread_pool._objects == []
     assert not hasattr(xom, "_devpi_guardian_verdict_reader")
     assert plugin.ADMIN_SERVICE_REGISTRY_KEY not in pyramid.registry
+
+
+def test_real_configurator_activation_failure_rolls_back_routes_tween_and_introspection(
+    monkeypatch, tmp_path
+):
+    from pyramid.config import Configurator
+    from pyramid.interfaces import IRoutesMapper, ITweens
+
+    import devpi_guardian.plugin as plugin
+    from devpi_guardian.activation import ActivationFailureCategory
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    before_mapper = pyramid.registry.queryUtility(IRoutesMapper)
+    before_tweens = pyramid.registry.queryUtility(ITweens)
+    before_introspection = {
+        category: dict(entries) for category, entries in pyramid.introspector._categories.items()
+    }
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(
+        plugin,
+        "ensure_guardian_activation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            plugin.GuardianActivationError(ActivationFailureCategory.STORE_UNAVAILABLE)
+        ),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    with pytest.raises(Exception, match="guardian activation failed"):
+        pyramid.commit()
+
+    assert xom.thread_pool._objects == []
+    assert pyramid.registry == {"xom": xom}
+    assert pyramid.registry.queryUtility(IRoutesMapper) is before_mapper
+    assert pyramid.registry.queryUtility(ITweens) is before_tweens
+    assert pyramid.registry.queryUtility(ITweens).sorter.names == before_tweens.sorter.names
+    assert {
+        category: dict(entries) for category, entries in pyramid.introspector._categories.items()
+    } == before_introspection
+    events = []
+    pyramid.action("post-rollback", callable=lambda: events.append("ran"))
+    pyramid.commit()
+    assert events == ["ran"]
 
 
 def test_final_publication_runs_after_later_finite_actions(monkeypatch, tmp_path):

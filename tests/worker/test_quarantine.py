@@ -95,6 +95,14 @@ def test_symlinked_root_parent_rejected(tmp_path: Path) -> None:
         QuarantineStore(parent_link / "q", max_size_bytes=100)
 
 
+def test_unsafe_root_parent_mode_rejected_during_descriptor_walk(tmp_path: Path) -> None:
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o777)
+    with pytest.raises(QuarantineError, match=r"parent|component|mode"):
+        QuarantineStore(parent / "q", max_size_bytes=100)
+
+
 def test_preexisting_component_with_unsafe_mode_rejected(tmp_path: Path) -> None:
     root = tmp_path / "q"
     root.mkdir(mode=0o700)

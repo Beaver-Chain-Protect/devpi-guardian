@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import os
 import socket
+import stat
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +16,7 @@ import requests
 from devpi_server.main import Fatal
 from pluggy import HookimplMarker
 from pyramid.httpexceptions import HTTPServiceUnavailable
+from pyramid.interfaces import IRoutesMapper, ITweens
 
 from . import __version__
 from .activation import GuardianActivationError, ensure_guardian_activation
@@ -222,6 +225,21 @@ def _safe_path(path: Path, *, label: str, server_path: Path) -> Path:
     mode = stat_result.st_mode & 0o777
     if mode != 0o700:
         raise Fatal(f"{label} mode must be 0700")
+    for parent in path.parents:
+        if parent == Path("/"):
+            break
+        try:
+            parent_stat = parent.stat()
+        except OSError as exc:
+            raise Fatal(f"{label} parent cannot be inspected") from exc
+        owner = parent_stat.st_uid
+        if owner not in (0, os.geteuid()):
+            raise Fatal(f"{label} parent owner is unsafe")
+        mode = stat.S_IMODE(parent_stat.st_mode)
+        # Root-owned sticky system directories (for example /tmp) are the
+        # only shared writable ancestors accepted by the boundary.
+        if mode & 0o022 and not (owner == 0 and mode & stat.S_ISVTX):
+            raise Fatal(f"{label} parent mode is unsafe")
     return path
 
 
@@ -282,6 +300,84 @@ class _Components:
     upload_connector: PrivateUploadConnector | None
     session: requests.Session | None
     quarantine: QuarantineStore | None
+
+
+@dataclass(slots=True)
+class _PyramidState:
+    registry_values: dict
+    utility_registrations: dict
+    adapter_registrations: dict
+    mutable_utilities: tuple
+    introspector_categories: dict
+    introspector_refs: dict
+    introspector_counter: int
+
+
+def _snapshot_pyramid_state(pyramid_config) -> _PyramidState:
+    registry = pyramid_config.registry
+    mutable_utilities = []
+    for interface in (IRoutesMapper, ITweens):
+        utility = registry.queryUtility(interface)
+        if utility is not None:
+            mutable_utilities.append((utility, deepcopy(vars(utility))))
+    introspector = pyramid_config.introspector
+    return _PyramidState(
+        registry_values=dict(registry),
+        utility_registrations=dict(registry._utility_registrations),
+        adapter_registrations=dict(registry._adapter_registrations),
+        mutable_utilities=tuple(mutable_utilities),
+        introspector_categories={
+            category: dict(entries) for category, entries in introspector._categories.items()
+        },
+        introspector_refs=dict(introspector._refs),
+        introspector_counter=introspector._counter,
+    )
+
+
+def _restore_pyramid_state(pyramid_config, snapshot: _PyramidState) -> None:
+    registry = pyramid_config.registry
+    registry.clear()
+    registry.update(snapshot.registry_values)
+
+    for key, _registration in list(registry._utility_registrations.items()):
+        if key not in snapshot.utility_registrations:
+            provided, name = key
+            registry.unregisterUtility(provided=provided, name=name)
+    for key, registration in snapshot.utility_registrations.items():
+        if registry._utility_registrations.get(key) != registration:
+            provided, name = key
+            if key in registry._utility_registrations:
+                registry.unregisterUtility(provided=provided, name=name)
+            component, info, factory = registration
+            registry.registerUtility(
+                component, provided=provided, name=name, info=info, factory=factory
+            )
+
+    for key in list(registry._adapter_registrations):
+        if key not in snapshot.adapter_registrations:
+            required, provided, name = key
+            registry.unregisterAdapter(required=required, provided=provided, name=name)
+    for key, registration in snapshot.adapter_registrations.items():
+        if registry._adapter_registrations.get(key) != registration:
+            required, provided, name = key
+            if key in registry._adapter_registrations:
+                registry.unregisterAdapter(required=required, provided=provided, name=name)
+            factory, info = registration
+            registry.registerAdapter(
+                factory, required=required, provided=provided, name=name, info=info
+            )
+
+    for utility, state in snapshot.mutable_utilities:
+        utility.__dict__.clear()
+        utility.__dict__.update(deepcopy(state))
+    registry._clear_view_lookup_cache()
+
+    introspector = pyramid_config.introspector
+    introspector._categories = {
+        category: dict(entries) for category, entries in snapshot.introspector_categories.items()
+    }
+    introspector._refs = dict(snapshot.introspector_refs)
+    introspector._counter = snapshot.introspector_counter
 
 
 def _close_components_resources(components: _Components, primary: BaseException) -> None:
@@ -490,6 +586,7 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
         # Register all route/tween actions first.  Pyramid resolves their
         # conflicts before this final action runs, so a conflict cannot leave
         # a worker registered or Guardian state published.
+        pyramid_state = _snapshot_pyramid_state(pyramid_config)
         configure_admin_routes(pyramid_config)
         pyramid_config.add_tween(
             "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
@@ -497,11 +594,20 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
         )
 
         def publish() -> None:
-            components = _build_components(settings, factory, xom, activation=activate)
+            components = None
             try:
+                components = _build_components(settings, factory, xom, activation=activate)
                 _publish_components(components, pyramid_config, xom, configure=False)
             except BaseException as primary:
-                _close_components_resources(components, primary)
+                if components is not None:
+                    _close_components_resources(components, primary)
+                try:
+                    _restore_pyramid_state(pyramid_config, pyramid_state)
+                except BaseException as rollback_error:
+                    primary.add_note(
+                        "Guardian Pyramid rollback failed: "
+                        f"{type(rollback_error).__name__}: {rollback_error}"
+                    )
                 raise
 
         action("devpi-guardian-final-publication", callable=publish, order=math.inf)
