@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 MAX_DIAGNOSTIC_LENGTH = 4096
 
@@ -26,7 +27,9 @@ _SENSITIVE_KEY = (
 )
 _HEADER_CREDENTIAL = re.compile(
     r"(?ix)"
+    r"(?P<key_quote>['\"]?)"
     r"(?P<key>(?<![\w])(?:authorization|x[-_ ]?devpi[-_ ]?auth)(?![\w]))"
+    r"(?P=key_quote)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?:(?P<scheme>Bearer|Basic)(?P<scheme_separator>\s+))?"
     r"(?:"
@@ -36,7 +39,9 @@ _HEADER_CREDENTIAL = re.compile(
 )
 _SECRET_ASSIGNMENT = re.compile(
     rf"(?ix)"
+    rf"(?P<key_quote>['\"]?)"
     rf"(?P<key>(?<![\w]){_SENSITIVE_KEY}(?![\w]))"
+    rf"(?P=key_quote)"
     rf"(?P<separator>\s*[:=]\s*)"
     rf"(?:"
     rf"(?P<quote>['\"])(?P<quoted>[^'\"]*)(?P=quote)"
@@ -52,19 +57,40 @@ _AUTH_SCHEME = re.compile(
     r")"
 )
 _DIGEST = re.compile(r"(?i)\b[0-9a-f]{64}\b")
+_POSIX_PATH_WITH_SPACES = re.compile(
+    r"(?<![\w:])/(?!\+)(?:[^/\n,;:'\"<>{}=]+/)+"
+    r"[^/\s,;:'\"<>{}=]+(?:\.[A-Za-z0-9]+)"
+)
 _POSIX_PATH = re.compile(r"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s,;:'\"]+")
 _WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;:'\"]+")
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "diagnostic",
+        "last_error",
+        "message",
+        "snippet",
+        "file",
+        "file_path",
+        "origin",
+        "source",
+        "sink",
+    }
+)
 
 
 def _replace_credential(match: re.Match[str]) -> str:
-    return f"{match.group('key')}{match.group('separator')}[REDACTED]"
+    quoted_key = match.group("key_quote") or ""
+    key = f"{quoted_key}{match.group('key')}{quoted_key}"
+    return f"{key}{match.group('separator')}[REDACTED]"
 
 
 def _replace_header_credential(match: re.Match[str]) -> str:
+    quoted_key = match.group("key_quote") or ""
+    key = f"{quoted_key}{match.group('key')}{quoted_key}"
     scheme = match.group("scheme")
     if scheme is None:
-        return f"{match.group('key')}{match.group('separator')}[REDACTED]"
-    return f"{match.group('key')}{match.group('separator')}{scheme} [REDACTED]"
+        return f"{key}{match.group('separator')}[REDACTED]"
+    return f"{key}{match.group('separator')}{scheme} [REDACTED]"
 
 
 def _replace_auth_scheme(match: re.Match[str]) -> str:
@@ -90,7 +116,58 @@ def sanitize_diagnostic(value: object) -> str:
     text = _HEADER_CREDENTIAL.sub(_replace_header_credential, text)
     text = _SECRET_ASSIGNMENT.sub(_replace_credential, text)
     text = _AUTH_SCHEME.sub(_replace_auth_scheme, text)
+    text = _POSIX_PATH_WITH_SPACES.sub("[PATH]", text)
     text = _POSIX_PATH.sub("[PATH]", text)
     text = _WINDOWS_PATH.sub("[PATH]", text)
     text = _DIGEST.sub("[DIGEST]", text)
     return text[:MAX_DIAGNOSTIC_LENGTH]
+
+
+def sanitize_diagnostic_fields(
+    value: object,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> object:
+    """Sanitize only diagnostic-shaped fields in a JSON-compatible graph."""
+
+    if _depth > 32:
+        raise ValueError("diagnostic graph is too deeply nested")
+    seen = set() if _seen is None else _seen
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("diagnostic graph contains a cycle")
+        seen.add(identity)
+        try:
+            return {
+                key: sanitize_diagnostic(item)
+                if key in _DIAGNOSTIC_FIELDS and item is not None
+                else sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen)
+                for key, item in value.items()
+            }
+        finally:
+            seen.discard(identity)
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("diagnostic graph contains a cycle")
+        seen.add(identity)
+        try:
+            return [
+                sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen) for item in value
+            ]
+        finally:
+            seen.discard(identity)
+    if isinstance(value, tuple):
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("diagnostic graph contains a cycle")
+        seen.add(identity)
+        try:
+            return tuple(
+                sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen) for item in value
+            )
+        finally:
+            seen.discard(identity)
+    return value

@@ -1,6 +1,10 @@
 import pytest
 
-from devpi_guardian.privacy import MAX_DIAGNOSTIC_LENGTH, sanitize_diagnostic
+from devpi_guardian.privacy import (
+    MAX_DIAGNOSTIC_LENGTH,
+    sanitize_diagnostic,
+    sanitize_diagnostic_fields,
+)
 
 
 def test_sanitize_diagnostic_redacts_secrets_paths_urls_controls_digests_and_bounds() -> None:
@@ -63,3 +67,41 @@ def test_sanitize_diagnostic_preserves_public_guardian_route_text() -> None:
     value = "route=/+guardian/api/v1/health"
 
     assert sanitize_diagnostic(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    [
+        ("{'auth_token': 'dict-auth-secret'}", "dict-auth-secret"),
+        ('{"client_secret": "json-client-secret"}', "json-client-secret"),
+        ("{'X-Devpi-Auth': 'header-dict-secret'}", "header-dict-secret"),
+    ],
+)
+def test_sanitize_diagnostic_redacts_quoted_mapping_keys(value: str, secret: str) -> None:
+    result = sanitize_diagnostic(value)
+
+    assert secret not in result
+    assert "[REDACTED]" in result
+
+
+def test_sanitize_diagnostic_redacts_posix_paths_with_spaces() -> None:
+    value = "download failed at /Users/alice/My Secret/file.whl"
+
+    result = sanitize_diagnostic(value)
+
+    assert "/Users/alice/My Secret/file.whl" not in result
+    assert result == "download failed at [PATH]"
+
+
+def test_sanitize_diagnostic_does_not_consume_following_prose_after_path() -> None:
+    value = "download failed at /tmp/a.whl while retrying"
+
+    assert sanitize_diagnostic(value) == "download failed at [PATH] while retrying"
+
+
+def test_sanitize_diagnostic_fields_rejects_cycles() -> None:
+    value: dict[str, object] = {}
+    value["nested"] = value
+
+    with pytest.raises(ValueError, match="cycle"):
+        sanitize_diagnostic_fields(value)

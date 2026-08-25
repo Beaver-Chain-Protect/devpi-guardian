@@ -52,6 +52,43 @@ def test_response_defense_in_depth_sanitizes_diagnostic_fields() -> None:
     assert rendered.startswith("RuntimeError: token=[REDACTED]")
 
 
+def test_response_defense_in_depth_sanitizes_legacy_evidence_without_redacting_sha() -> None:
+    digest = "a" * 64
+    secret_url = "https://user-secret@example.invalid/pkg.whl?token=query-secret"
+    response = _response(
+        {
+            "artifact": {
+                "summary": {"sha256": digest},
+                "evidence": [
+                    {
+                        "message": f"GET {secret_url}",
+                        "file_path": "/Users/alice/My Secret/file.whl",
+                        "details": {
+                            "snippet": "{'auth_token': 'dict-auth-secret'}",
+                            "source": secret_url,
+                        },
+                    }
+                ],
+            },
+            "diff": {
+                "sha256": digest,
+                "findings": [{"file": "/Users/alice/My Secret/file.whl"}],
+            },
+        }
+    )
+
+    rendered = str(response.json_body)
+    for secret in (
+        "user-secret",
+        "query-secret",
+        "dict-auth-secret",
+        "/Users/alice/My Secret/file.whl",
+    ):
+        assert secret not in rendered
+    assert response.json_body["artifact"]["summary"]["sha256"] == digest
+    assert response.json_body["diff"]["sha256"] == digest
+
+
 class Service:
     def health(self):
         return {"database": "ok"}

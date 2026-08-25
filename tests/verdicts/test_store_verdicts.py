@@ -936,6 +936,25 @@ def test_record_verdict_validates_mutated_evidence_before_connecting(
         )
 
 
+def test_record_verdict_rejects_cyclic_evidence_details_before_connecting(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+    details: dict[str, Any] = {}
+    details["cycle"] = details
+
+    with pytest.raises(ValueError, match="details"):
+        store.record_verdict(
+            claim_input(),
+            verdict(),
+            [unchecked_evidence(details=details)],
+        )
+
+
 @pytest.mark.parametrize(
     "trigger_sql",
     [

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from devpi_common.metadata import normalize_name
 
-from devpi_guardian.privacy import sanitize_diagnostic
+from devpi_guardian.privacy import sanitize_diagnostic, sanitize_diagnostic_fields
 
 from .db import ConnectionFactory
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
@@ -193,8 +193,18 @@ def _prepare_evidence(
             action = item.action
             file_path_value = item.file_path
             line = item.line
-            message = _require_stored_string(item.message, "message")
-            details_json = _serialize_details(item.details)
+            raw_message = _require_stored_string(item.message, "message")
+            message = sanitize_diagnostic(raw_message)
+            try:
+                details_json = _serialize_details(sanitize_diagnostic_fields(item.details))
+            except (
+                TypeError,
+                ValueError,
+                OverflowError,
+                RecursionError,
+                RuntimeError,
+            ) as exc:
+                raise ValueError("details must be JSON-serializable") from exc
         except AttributeError:
             message = "EvidenceInput missing required fields"
             raise ValueError(message) from None
@@ -203,7 +213,7 @@ def _prepare_evidence(
         file_path = (
             None
             if file_path_value is None
-            else _require_stored_string(file_path_value, "file_path")
+            else sanitize_diagnostic(_require_stored_string(file_path_value, "file_path"))
         )
         line_is_integer = type(line) is int
         line_in_range = line_is_integer and 0 < line <= _MAX_SQLITE_INTEGER

@@ -11,7 +11,7 @@ from typing import Any
 
 from pyramid.response import Response
 
-from devpi_guardian.privacy import sanitize_diagnostic
+from devpi_guardian.privacy import sanitize_diagnostic_fields
 from devpi_guardian.verdicts.errors import (
     ArtifactNotFound,
     InvalidSha256,
@@ -170,16 +170,7 @@ def _response(payload: dict[str, Any], status: int = 200, *, converted: bool = F
 
 
 def _sanitize_diagnostic_fields(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: sanitize_diagnostic(item)
-            if key in {"last_error", "diagnostic"} and item is not None
-            else _sanitize_diagnostic_fields(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_sanitize_diagnostic_fields(item) for item in value]
-    return value
+    return sanitize_diagnostic_fields(value)
 
 
 def _error(status: int, code: str, message: str) -> Response:
