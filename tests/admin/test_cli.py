@@ -168,6 +168,7 @@ def test_cli_policy_validate_and_simulate_read_json_file(tmp_path) -> None:
 def test_cli_reads_auth_token_from_file_without_putting_it_in_arguments(tmp_path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("secret-token\n")
+    token_file.chmod(0o600)
     captured = {}
     client = Client([{"database": "ok"}])
 
@@ -258,6 +259,66 @@ def test_client_sanitizes_http_error_shape(monkeypatch) -> None:
         "transition_conflict",
         "state conflict",
     )
+
+
+def test_client_sanitizes_json_recursion_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "devpi_guardian.admin.client.json.loads",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RecursionError()),
+    )
+    monkeypatch.setattr(
+        "devpi_guardian.admin.client._open",
+        lambda *args, **kwargs: type(
+            "R",
+            (),
+            {
+                "headers": {"Content-Type": "application/json"},
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *args: False,
+                "read": lambda self, amount: b"{}",
+            },
+        )(),
+    )
+    with pytest.raises(ApiError) as raised:
+        GuardianApiClient(api_url="https://devpi.example").request("GET", "/health")
+    assert (raised.value.status, raised.value.code) == (502, "invalid_response")
+
+
+@pytest.mark.parametrize("api_url", ["https://devpi.example:bad", "https://devpi.example:99999"])
+def test_client_rejects_invalid_ports(api_url) -> None:
+    with pytest.raises(ValueError):
+        GuardianApiClient(api_url=api_url)
+
+
+@pytest.mark.parametrize(
+    "path", ["/health?x=1", "/health#x", "/health/../x", "/health/./x", "/x" + "a" * 5000]
+)
+def test_client_rejects_unsafe_paths(path) -> None:
+    with pytest.raises(ValueError):
+        GuardianApiClient(api_url="https://devpi.example").request("GET", path)
+
+
+def test_cli_unknown_error_is_not_silently_converted(capsys) -> None:
+    class FailingClient:
+        def request(self, *args, **kwargs):
+            raise RuntimeError("programming failure")
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        main(
+            ["--api-url", "https://devpi.example", "health"],
+            client_factory=lambda **_: FailingClient(),
+        )
+
+
+def test_cli_rejects_token_file_with_unsafe_permissions(tmp_path, capsys) -> None:
+    token = tmp_path / "token"
+    token.write_text("secret-token")
+    token.chmod(0o644)
+    assert (
+        main(["--api-url", "https://devpi.example", "--auth-token-file", str(token), "health"])
+        == EXIT_USAGE
+    )
+    assert "secret-token" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

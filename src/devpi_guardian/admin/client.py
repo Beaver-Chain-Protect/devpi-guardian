@@ -98,7 +98,7 @@ def _read_json(response, *, status: int) -> dict[str, Any]:
         payload = json.loads(
             text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value))
         )
-    except (OSError, TypeError, UnicodeError, ValueError) as exc:
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as exc:
         raise ApiError(status, "invalid_response", "server returned invalid JSON") from exc
     try:
         payload = _json_snapshot(payload)
@@ -122,8 +122,11 @@ class GuardianApiClient:
         try:
             parsed = urllib.parse.urlsplit(api_url)
             hostname = parsed.hostname
+            port = parsed.port
         except ValueError as exc:
             raise ValueError("api_url is invalid") from exc
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("api_url port is invalid")
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             raise ValueError("api_url must use http or https with a hostname")
         if parsed.username is not None or parsed.password is not None:
@@ -164,11 +167,17 @@ class GuardianApiClient:
             or not path.startswith("/")
             or path.startswith("//")
             or _controls(path)
+            or len(path) > _MAX_TEXT
+            or "?" in path
+            or "#" in path
+            or any(segment in {".", ".."} for segment in urllib.parse.unquote(path).split("/"))
         ):
             raise ValueError("request path is invalid")
         if query is not None:
             if not isinstance(query, dict):
                 raise ValueError("query must be an object")
+            if len(query) > 32:
+                raise ValueError("query has too many values")
             for key, value in query.items():
                 if (
                     not isinstance(key, str)
@@ -177,6 +186,8 @@ class GuardianApiClient:
                     or _controls(key)
                     or not isinstance(value, (str, int, float, bool))
                 ):
+                    raise ValueError("query contains an invalid value")
+                if isinstance(value, str) and (len(value) > _MAX_TEXT or _controls(value)):
                     raise ValueError("query contains an invalid value")
                 if isinstance(value, float) and not math.isfinite(value):
                     raise ValueError("query contains a non-finite number")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from devpi_guardian.admin.service import AdminFeatureUnavailable
 from devpi_guardian.admin.views import (
     ADMIN_SERVICE_REGISTRY_KEY,
@@ -201,7 +203,9 @@ def test_unconnected_feature_returns_specific_retryable_503() -> None:
 
 def test_missing_or_wrong_registry_service_is_sanitized_503() -> None:
     missing = SimpleNamespace(registry={}, matchdict={"sha256": SHA256}, params={}, json_body={})
-    assert list_quarantine(missing).status_code == 503
+    missing_response = list_quarantine(missing)
+    assert missing_response.status_code == 503
+    assert missing_response.json_body["error"]["code"] == "admin_service_unavailable"
     wrong = request(object())
     assert list_quarantine(wrong).status_code == 503
 
@@ -215,6 +219,65 @@ def test_provider_value_errors_are_not_client_400s() -> None:
     assert response.status_code == 503
     assert response.json_body["error"]["code"] == "provider_unavailable"
     assert "secret" not in response.text
+
+
+def test_unknown_provider_errors_are_reraised() -> None:
+    class BrokenService(Service):
+        def artifact_diff(self, sha256):
+            raise RuntimeError("programming failure")
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        artifact_diff(request(BrokenService()))
+
+
+def test_request_json_parse_errors_are_constant_400s() -> None:
+    class BadRequest:
+        def __init__(self):
+            self.registry = {ADMIN_SERVICE_REGISTRY_KEY: Service()}
+            self.matchdict = {"sha256": SHA256}
+            self.params = {}
+            self.authenticated_userid = "root"
+
+        @property
+        def json_body(self):
+            raise ValueError("secret parser details")
+
+    response = approve_artifact(BadRequest())
+    assert response.status_code == 400
+    assert response.json_body == {
+        "error": {"code": "invalid_request", "message": "invalid JSON request"}
+    }
+
+
+def test_invalid_sha_is_constant_400_without_reflection() -> None:
+    response = inspect_artifact(request(Service(), sha256="x" * 64 + "\n"))
+    assert response.status_code == 400
+    assert response.json_body == {
+        "error": {
+            "code": "invalid_request",
+            "message": "sha256 must be a lowercase 64-character hexadecimal digest",
+        }
+    }
+
+
+def test_quarantine_page_fields_are_validated_before_200() -> None:
+    class BadPageService(Service):
+        def list_quarantine(self, *, states, limit, offset):
+            return QuarantinePage(("not-an-item",), -1, 0, -1)
+
+    response = list_quarantine(request(BadPageService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
+
+
+def test_baseline_inner_records_are_mappings() -> None:
+    class BadBaselineService(Service):
+        def list_baselines(self, project):
+            return ("not-a-record",)
+
+    response = list_baselines(request(BadBaselineService(), params={"project": "demo"}))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
 
 
 def test_serialization_rejects_cycles_without_leaking_exception() -> None:

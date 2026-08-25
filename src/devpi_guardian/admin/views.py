@@ -19,6 +19,7 @@ from devpi_guardian.verdicts.errors import (
 )
 from devpi_guardian.verdicts.models import (
     ArtifactAdminDetails,
+    ArtifactAdminSummary,
     ArtifactState,
     QuarantinePage,
     validate_sha256,
@@ -131,13 +132,23 @@ def _domain_error(exc: Exception) -> Response:
         return _error(503, "mutations_unavailable", "guardian mutations are unavailable")
     if isinstance(exc, AdminFeatureUnavailable):
         return _error(503, f"{exc.feature}_unavailable", str(exc))
-    if isinstance(exc, (StoreUnavailable, RegistryUnavailable)):
+    if isinstance(exc, RegistryUnavailable):
+        return _error(503, "admin_service_unavailable", "guardian admin service is unavailable")
+    if isinstance(exc, StoreUnavailable):
         return _error(503, "store_unavailable", "guardian store is unavailable")
-    if isinstance(exc, (AdminRequestError, InvalidSha256)):
+    if isinstance(exc, InvalidSha256):
+        return _error(
+            400,
+            "invalid_request",
+            "sha256 must be a lowercase 64-character hexadecimal digest",
+        )
+    if isinstance(exc, AdminRequestError):
         return _error(400, "invalid_request", str(exc))
     if isinstance(exc, SerializationError):
         return _error(503, "serialization_unavailable", "guardian response is unavailable")
-    return _error(503, "provider_unavailable", "guardian provider is unavailable")
+    if isinstance(exc, (ValueError, TypeError)):
+        return _error(503, "provider_unavailable", "guardian provider is unavailable")
+    raise exc
 
 
 def _service(request):
@@ -167,7 +178,10 @@ def _actor(request) -> str:
 
 
 def _body(request) -> dict[str, Any]:
-    body = request.json_body
+    try:
+        body = request.json_body
+    except (ValueError, TypeError, UnicodeError):
+        raise AdminRequestError("invalid JSON request") from None
     if not isinstance(body, dict):
         raise AdminRequestError("JSON object body is required")
     try:
@@ -176,6 +190,16 @@ def _body(request) -> dict[str, Any]:
         raise AdminRequestError("request JSON is invalid") from exc
     if not isinstance(snapshot, dict):
         raise AdminRequestError("JSON object body is required")
+    import json
+
+    try:
+        if (
+            len(json.dumps(snapshot, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            > _MAX_JSON_BYTES
+        ):
+            raise AdminRequestError("request JSON is too large")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise AdminRequestError("request JSON is invalid") from exc
     return snapshot
 
 
@@ -214,6 +238,8 @@ def _states(value: str | None) -> tuple[ArtifactState, ...]:
     if value is None:
         return _DEFAULT_STATES
     if not isinstance(value, str):
+        raise AdminRequestError("invalid quarantine state filter")
+    if len(value) > _MAX_TEXT or value.count(",") + 1 > 50:
         raise AdminRequestError("invalid quarantine state filter")
     if not value.strip():
         return _DEFAULT_STATES
@@ -254,6 +280,51 @@ def _filter_text(value: object, name: str) -> str | None:
     return value
 
 
+def _valid_quarantine_page(page: object) -> bool:
+    if not isinstance(page, QuarantinePage):
+        return False
+    if type(page.total) is not int or page.total < 0:
+        return False
+    if type(page.limit) is not int or not 1 <= page.limit <= 200:
+        return False
+    if type(page.offset) is not int or page.offset < 0:
+        return False
+    if not isinstance(page.items, tuple) or len(page.items) > 200:
+        return False
+    for item in page.items:
+        if not isinstance(item, ArtifactAdminSummary):
+            return False
+        if type(item.sha256) is not str:
+            return False
+        try:
+            validate_sha256(item.sha256)
+        except InvalidSha256:
+            return False
+        if type(item.size_bytes) is not int or item.size_bytes < 0:
+            return False
+        if not isinstance(item.state, ArtifactState) or item.state in {
+            ArtifactState.ALLOW,
+            ArtifactState.MISSING,
+        }:
+            return False
+        for timestamp in (item.discovered_at, item.updated_at):
+            if (
+                not isinstance(timestamp, datetime)
+                or timestamp.tzinfo is None
+                or timestamp.utcoffset() is None
+            ):
+                return False
+        if item.cooldown_until is not None and (
+            not isinstance(item.cooldown_until, datetime)
+            or item.cooldown_until.tzinfo is None
+            or item.cooldown_until.utcoffset() is None
+        ):
+            return False
+        if item.last_error is not None and not isinstance(item.last_error, str):
+            return False
+    return True
+
+
 def list_quarantine(request) -> Response:
     try:
         states = _states(request.params.get("state"))
@@ -264,7 +335,7 @@ def list_quarantine(request) -> Response:
                 request.params.get("offset"), default=0, minimum=0, maximum=1_000_000
             ),
         )
-        if not isinstance(page, QuarantinePage):
+        if not _valid_quarantine_page(page):
             raise SerializationError("invalid quarantine response")
         return _response(
             {"items": page.items, "total": page.total, "limit": page.limit, "offset": page.offset}
@@ -328,9 +399,14 @@ def list_baselines(request) -> Response:
         ):
             raise AdminRequestError("project is required")
         result = _service(request).list_baselines(project)
-        if isinstance(result, (str, bytes, bytearray)) or not isinstance(result, Sequence):
+        if (
+            isinstance(result, (str, bytes, bytearray))
+            or not isinstance(result, Sequence)
+            or not all(isinstance(item, Mapping) for item in result)
+        ):
             raise SerializationError("invalid baseline response")
-        return _response({"items": result})
+        snapshot = tuple(dict(item) for item in result)
+        return _response({"items": snapshot})
     except Exception as exc:
         return _domain_error(exc)
 

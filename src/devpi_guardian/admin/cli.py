@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 import urllib.error
-from pathlib import Path
 from typing import Any
 
 from devpi_guardian.verdicts.models import validate_sha256
@@ -94,14 +95,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _json_file(path: str, *, array: bool) -> Any:
-    candidate = Path(path)
     try:
-        stat = candidate.stat()
-        if not candidate.is_file() or stat.st_size > 1024 * 1024:
-            raise OSError("not a bounded regular file")
-        raw = candidate.read_bytes()
-        if len(raw) > 1024 * 1024:
-            raise OSError("file is too large")
+        raw = _safe_file_bytes(path, limit=1024 * 1024, private=False)
         payload = json.loads(
             raw.decode("utf-8"),
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
@@ -120,10 +115,9 @@ def _auth_token(args: argparse.Namespace) -> str | None:
     if args.auth_token_file is None:
         return args.auth_token
     try:
-        candidate = Path(args.auth_token_file)
-        if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size > 4096:
-            raise OSError("authentication token is not a safe regular file")
-        token = candidate.read_text(encoding="utf-8").strip()
+        token = (
+            _safe_file_bytes(args.auth_token_file, limit=4096, private=True).decode("utf-8").strip()
+        )
         if (
             len(token) > 4096
             or not token
@@ -134,6 +128,25 @@ def _auth_token(args: argparse.Namespace) -> str | None:
     except (OSError, UnicodeError, ValueError) as exc:
         raise CliInputError("could not read authentication token file") from exc
     return token
+
+
+def _safe_file_bytes(path: str, *, limit: int, private: bool) -> bytes:
+    if not isinstance(path, str) or not path or len(path) > 4096 or _controls(path):
+        raise OSError("file path is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise OSError("file is not a bounded regular file")
+        if private and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise OSError("authentication token permissions are unsafe")
+        data = os.read(descriptor, limit + 1)
+        if len(data) > limit:
+            raise OSError("file is too large")
+        return data
+    finally:
+        os.close(descriptor)
 
 
 def _sha(value: object) -> str:
@@ -253,7 +266,7 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
             return EXIT_DOMAIN
         if isinstance(exc, (OSError, TimeoutError, urllib.error.URLError)):
             return EXIT_NETWORK
-        return EXIT_DOMAIN
+        raise
 
 
 if __name__ == "__main__":
