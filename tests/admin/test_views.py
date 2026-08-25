@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from devpi_guardian.admin.service import AdminFeatureUnavailable
+from devpi_guardian.admin.service import AdminFeatureUnavailable, AdminProviderError
 from devpi_guardian.admin.views import (
     ADMIN_SERVICE_REGISTRY_KEY,
     add_baseline,
@@ -33,7 +33,7 @@ class Service:
 
     def list_quarantine(self, *, states, limit, offset):
         self.list_call = states, limit, offset
-        return QuarantinePage((), 0, limit, offset)
+        return QuarantinePage((), offset, limit, offset)
 
     def inspect(self, sha256):
         self.inspect_call = sha256
@@ -96,7 +96,7 @@ def test_list_quarantine_validates_filters_and_serializes_page() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json_body == {"items": [], "total": 0, "limit": 20, "offset": 5}
+    assert response.json_body == {"items": [], "total": 5, "limit": 20, "offset": 5}
     assert service.list_call == ((ArtifactState.REVIEW, ArtifactState.DENY), 20, 5)
 
 
@@ -117,6 +117,14 @@ def test_approve_uses_authenticated_actor_and_requires_reason() -> None:
     invalid = approve_artifact(request(service, body={"reason": ""}))
     assert invalid.status_code == 400
     assert invalid.json_body["error"]["code"] == "invalid_request"
+
+
+def test_reason_allows_json_safe_newlines_and_unicode_character_limit() -> None:
+    service = Service()
+    reason = "검토 완료\n추가 근거\t승인"
+    response = approve_artifact(request(service, body={"reason": reason}))
+    assert response.status_code == 200
+    assert service.approve_call == (SHA256, "root", reason)
 
 
 def test_approve_maps_state_conflict_to_409() -> None:
@@ -213,7 +221,7 @@ def test_missing_or_wrong_registry_service_is_sanitized_503() -> None:
 def test_provider_value_errors_are_not_client_400s() -> None:
     class BadService(Service):
         def artifact_diff(self, sha256):
-            raise ValueError("secret provider internals")
+            raise AdminProviderError("secret provider internals")
 
     response = artifact_diff(request(BadService()))
     assert response.status_code == 503
@@ -311,6 +319,41 @@ def test_admin_routes_register_expected_methods_and_permission() -> None:
 
     pyramid = Pyramid()
     configure_admin_routes(pyramid)
-    assert any(name == "guardian_artifact_revoke" for name, _ in pyramid.routes)
+    assert len(pyramid.routes) == 15
+    assert len(pyramid.views) == 16
+    assert {(name, path) for name, path in pyramid.routes} == {
+        ("guardian_quarantine", "/+guardian/api/v1/quarantine"),
+        ("guardian_artifact", "/+guardian/api/v1/artifacts/{sha256}"),
+        ("guardian_artifact_diff", "/+guardian/api/v1/artifacts/{sha256}/diff"),
+        ("guardian_artifact_approve", "/+guardian/api/v1/artifacts/{sha256}/approve"),
+        ("guardian_artifact_block", "/+guardian/api/v1/artifacts/{sha256}/block"),
+        ("guardian_artifact_rescan", "/+guardian/api/v1/artifacts/{sha256}/rescan"),
+        ("guardian_artifact_revoke", "/+guardian/api/v1/artifacts/{sha256}/revoke"),
+        ("guardian_artifact_exception", "/+guardian/api/v1/artifacts/{sha256}/exceptions"),
+        ("guardian_health", "/+guardian/api/v1/health"),
+        ("guardian_audit", "/+guardian/api/v1/audit"),
+        ("guardian_baselines", "/+guardian/api/v1/baselines"),
+        ("guardian_baseline_import", "/+guardian/api/v1/baselines/import"),
+        ("guardian_baseline_remove", "/+guardian/api/v1/baselines/{sha256}"),
+        ("guardian_policy_validate", "/+guardian/api/v1/policy/validate"),
+        ("guardian_policy_simulate", "/+guardian/api/v1/policy/simulate"),
+    }
+    assert {(kwargs["route_name"], kwargs["request_method"]) for _, kwargs in pyramid.views} == {
+        ("guardian_quarantine", "GET"),
+        ("guardian_artifact", "GET"),
+        ("guardian_artifact_diff", "GET"),
+        ("guardian_artifact_approve", "POST"),
+        ("guardian_artifact_block", "POST"),
+        ("guardian_artifact_rescan", "POST"),
+        ("guardian_artifact_revoke", "POST"),
+        ("guardian_artifact_exception", "POST"),
+        ("guardian_health", "GET"),
+        ("guardian_audit", "GET"),
+        ("guardian_baselines", "GET"),
+        ("guardian_baselines", "POST"),
+        ("guardian_baseline_remove", "DELETE"),
+        ("guardian_baseline_import", "POST"),
+        ("guardian_policy_validate", "POST"),
+        ("guardian_policy_simulate", "POST"),
+    }
     assert all(kwargs["permission"] == "user_modify" for _, kwargs in pyramid.views)
-    assert any(kwargs["request_method"] == "DELETE" for _, kwargs in pyramid.views)

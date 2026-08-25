@@ -31,6 +31,10 @@ class AdminFeatureUnavailable(RuntimeError):
         self.feature = feature
 
 
+class AdminProviderError(RuntimeError):
+    """A provider explicitly reports a sanitized, retryable failure."""
+
+
 class AdminReader(Protocol):
     def list_quarantine(
         self,

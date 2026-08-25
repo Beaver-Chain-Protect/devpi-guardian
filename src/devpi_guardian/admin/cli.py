@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import stat
 import sys
@@ -133,7 +134,7 @@ def _auth_token(args: argparse.Namespace) -> str | None:
 def _safe_file_bytes(path: str, *, limit: int, private: bool) -> bytes:
     if not isinstance(path, str) or not path or len(path) > 4096 or _controls(path):
         raise OSError("file path is invalid")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         metadata = os.fstat(descriptor)
@@ -141,10 +142,19 @@ def _safe_file_bytes(path: str, *, limit: int, private: bool) -> bytes:
             raise OSError("file is not a bounded regular file")
         if private and stat.S_IMODE(metadata.st_mode) & 0o077:
             raise OSError("authentication token permissions are unsafe")
-        data = os.read(descriptor, limit + 1)
-        if len(data) > limit:
-            raise OSError("file is too large")
-        return data
+        chunks: list[bytes] = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - total))
+            if not isinstance(chunk, bytes):
+                raise OSError("file read returned invalid data")
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise OSError("file is too large")
+        return b"".join(chunks)
     finally:
         os.close(descriptor)
 
@@ -242,14 +252,23 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
     except SystemExit as exc:
         return int(exc.code) if exc.code == 0 else EXIT_USAGE
     try:
-        client = client_factory(
-            api_url=args.api_url,
-            auth_token=_auth_token(args),
-            timeout=args.timeout,
-        )
+        try:
+            client = client_factory(
+                api_url=args.api_url,
+                auth_token=_auth_token(args),
+                timeout=args.timeout,
+            )
+        except ValueError as exc:
+            if (
+                not isinstance(args.timeout, (int, float))
+                or not math.isfinite(args.timeout)
+                or args.timeout <= 0
+            ):
+                raise CliInputError("timeout must be a finite positive number") from exc
+            raise CliInputError("invalid CLI configuration") from exc
         _print(_call(client, args), as_json=args.as_json)
         return EXIT_OK
-    except (CliInputError, ValueError) as exc:
+    except CliInputError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     except ApiError as exc:
@@ -258,13 +277,17 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
             return EXIT_AUTH
         return EXIT_DOMAIN
     except Exception as exc:
+        if isinstance(exc, (ValueError, TypeError, RuntimeError)):
+            raise
         status = getattr(exc, "status", None)
-        print(str(exc) if isinstance(status, int) else "guardian request failed", file=sys.stderr)
         if status in (401, 403):
+            print(str(exc), file=sys.stderr)
             return EXIT_AUTH
         if isinstance(status, int):
+            print(str(exc), file=sys.stderr)
             return EXIT_DOMAIN
         if isinstance(exc, (OSError, TimeoutError, urllib.error.URLError)):
+            print("guardian network request failed", file=sys.stderr)
             return EXIT_NETWORK
         raise
 

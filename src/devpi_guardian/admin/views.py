@@ -21,11 +21,20 @@ from devpi_guardian.verdicts.models import (
     ArtifactAdminDetails,
     ArtifactAdminSummary,
     ArtifactState,
+    Decision,
+    DecisionSource,
+    EvidenceRecord,
     QuarantinePage,
+    ReleaseArtifact,
     validate_sha256,
 )
 
-from .service import AdminFeatureUnavailable, AdminMutationsUnavailable, AdminRequestError
+from .service import (
+    AdminFeatureUnavailable,
+    AdminMutationsUnavailable,
+    AdminProviderError,
+    AdminRequestError,
+)
 
 ADMIN_SERVICE_REGISTRY_KEY = "devpi_guardian.admin_service"
 _DEFAULT_STATES = (
@@ -47,6 +56,24 @@ class RegistryUnavailable(RuntimeError):
     """The admin service registry entry is absent or malformed."""
 
 
+def _valid_text(value: object, *, nonblank: bool = False) -> bool:
+    if not isinstance(value, str) or (nonblank and not value.strip()) or len(value) > _MAX_TEXT:
+        return False
+    if any(
+        char == "\x00"
+        or 0xD800 <= ord(char) <= 0xDFFF
+        or (ord(char) < 0x20 and char not in "\n\r\t")
+        or 0x7F <= ord(char) <= 0x9F
+        for char in value
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _json_value(
     value: Any, *, depth: int = 0, seen: set[int] | None = None, count: list[int] | None = None
 ) -> Any:
@@ -60,10 +87,7 @@ def _json_value(
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        if len(value.encode("utf-8")) > _MAX_TEXT or any(
-            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
-            for char in value
-        ):
+        if not _valid_text(value):
             raise SerializationError("response contains invalid text")
         return value
     if isinstance(value, (int, float)):
@@ -106,17 +130,19 @@ def _json_value(
     raise SerializationError("response contains an unsupported value")
 
 
-def _response(payload: dict[str, Any], status: int = 200) -> Response:
-    converted = _json_value(payload)
+def _response(payload: dict[str, Any], status: int = 200, *, converted: bool = False) -> Response:
+    converted_payload = payload if converted else _json_value(payload)
     try:
         import json
 
-        encoded = json.dumps(converted, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        encoded = json.dumps(
+            converted_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
     except (TypeError, ValueError, UnicodeError) as exc:
         raise SerializationError("response serialization failed") from exc
     if len(encoded.encode("utf-8")) > _MAX_JSON_BYTES:
         raise SerializationError("response is too large")
-    return Response(json_body=converted, status=status)
+    return Response(json_body=converted_payload, status=status)
 
 
 def _error(status: int, code: str, message: str) -> Response:
@@ -146,7 +172,7 @@ def _domain_error(exc: Exception) -> Response:
         return _error(400, "invalid_request", str(exc))
     if isinstance(exc, SerializationError):
         return _error(503, "serialization_unavailable", "guardian response is unavailable")
-    if isinstance(exc, (ValueError, TypeError)):
+    if isinstance(exc, AdminProviderError):
         return _error(503, "provider_unavailable", "guardian provider is unavailable")
     raise exc
 
@@ -168,10 +194,7 @@ def _actor(request) -> str:
         not isinstance(actor, str)
         or not actor.strip()
         or len(actor) > _MAX_TEXT
-        or any(
-            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
-            for char in actor
-        )
+        or not _valid_text(actor, nonblank=True)
     ):
         raise AdminRequestError("authenticated actor is required")
     return actor
@@ -180,7 +203,7 @@ def _actor(request) -> str:
 def _body(request) -> dict[str, Any]:
     try:
         body = request.json_body
-    except (ValueError, TypeError, UnicodeError):
+    except (ValueError, TypeError, UnicodeError, RecursionError):
         raise AdminRequestError("invalid JSON request") from None
     if not isinstance(body, dict):
         raise AdminRequestError("JSON object body is required")
@@ -209,10 +232,7 @@ def _reason(body: Mapping[str, Any]) -> str:
         not isinstance(reason, str)
         or not reason.strip()
         or len(reason) > _MAX_TEXT
-        or any(
-            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
-            for char in reason
-        )
+        or not _valid_text(reason, nonblank=True)
     ):
         raise AdminRequestError("reason is required")
     return reason
@@ -271,17 +291,52 @@ def _filter_text(value: object, name: str) -> str | None:
         not isinstance(value, str)
         or not value.strip()
         or len(value) > _MAX_TEXT
-        or any(
-            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
-            for char in value
-        )
+        or not _valid_text(value, nonblank=True)
     ):
         raise AdminRequestError(f"{name} is invalid")
     return value
 
 
 def _valid_quarantine_page(page: object) -> bool:
-    if not isinstance(page, QuarantinePage):
+    return _valid_quarantine_page_for(page, requested_limit=None, requested_offset=None)
+
+
+def _valid_summary(item: object) -> bool:
+    if type(item) is not ArtifactAdminSummary:
+        return False
+    if not isinstance(item.sha256, str):
+        return False
+    try:
+        validate_sha256(item.sha256)
+    except InvalidSha256:
+        return False
+    if type(item.size_bytes) is not int or item.size_bytes < 0:
+        return False
+    if not isinstance(item.state, ArtifactState) or item.state in {
+        ArtifactState.ALLOW,
+        ArtifactState.MISSING,
+    }:
+        return False
+    for timestamp in (item.discovered_at, item.updated_at):
+        if (
+            not isinstance(timestamp, datetime)
+            or timestamp.tzinfo is None
+            or timestamp.utcoffset() is None
+        ):
+            return False
+    if item.cooldown_until is not None and (
+        not isinstance(item.cooldown_until, datetime)
+        or item.cooldown_until.tzinfo is None
+        or item.cooldown_until.utcoffset() is None
+    ):
+        return False
+    return item.last_error is None or _valid_text(item.last_error)
+
+
+def _valid_quarantine_page_for(
+    page: object, *, requested_limit: int | None, requested_offset: int | None
+) -> bool:
+    if type(page) is not QuarantinePage:
         return False
     if type(page.total) is not int or page.total < 0:
         return False
@@ -289,53 +344,109 @@ def _valid_quarantine_page(page: object) -> bool:
         return False
     if type(page.offset) is not int or page.offset < 0:
         return False
-    if not isinstance(page.items, tuple) or len(page.items) > 200:
+    if requested_limit is not None and page.limit != requested_limit:
         return False
-    for item in page.items:
-        if not isinstance(item, ArtifactAdminSummary):
-            return False
-        if type(item.sha256) is not str:
-            return False
+    if requested_offset is not None and page.offset != requested_offset:
+        return False
+    if not isinstance(page.items, tuple) or len(page.items) > page.limit:
+        return False
+    if page.offset > page.total or page.offset + len(page.items) > page.total:
+        return False
+    return all(_valid_summary(item) for item in page.items)
+
+
+def _valid_artifact_details(details: object) -> dict[str, Any]:
+    if type(details) is not ArtifactAdminDetails:
+        raise SerializationError("invalid artifact response")
+    if not _valid_summary(details.summary):
+        raise SerializationError("invalid artifact response")
+    if type(details.allowed) is not bool:
+        raise SerializationError("invalid artifact response")
+    if not isinstance(details.effective_decision, Decision):
+        raise SerializationError("invalid artifact response")
+    if not isinstance(details.decision_source, DecisionSource):
+        raise SerializationError("invalid artifact response")
+    for value in (details.policy_version, details.analyzer_version):
+        if value is not None and not _valid_text(value):
+            raise SerializationError("invalid artifact response")
+    if details.baseline_sha256 is not None:
         try:
-            validate_sha256(item.sha256)
-        except InvalidSha256:
-            return False
-        if type(item.size_bytes) is not int or item.size_bytes < 0:
-            return False
-        if not isinstance(item.state, ArtifactState) or item.state in {
-            ArtifactState.ALLOW,
-            ArtifactState.MISSING,
-        }:
-            return False
-        for timestamp in (item.discovered_at, item.updated_at):
-            if (
-                not isinstance(timestamp, datetime)
-                or timestamp.tzinfo is None
-                or timestamp.utcoffset() is None
-            ):
-                return False
-        if item.cooldown_until is not None and (
-            not isinstance(item.cooldown_until, datetime)
-            or item.cooldown_until.tzinfo is None
-            or item.cooldown_until.utcoffset() is None
+            validate_sha256(details.baseline_sha256)
+        except InvalidSha256 as exc:
+            raise SerializationError("invalid artifact response") from exc
+    if details.baseline_tier is not None and (
+        not isinstance(details.baseline_tier, str)
+        or details.baseline_tier
+        not in {
+            "same_tag",
+            "universal_wheel",
+            "sdist",
+        }
+    ):
+        raise SerializationError("invalid artifact response")
+    if not isinstance(details.releases, tuple) or len(details.releases) > 10_000:
+        raise SerializationError("invalid artifact response")
+    for release in details.releases:
+        if type(release) is not ReleaseArtifact:
+            raise SerializationError("invalid artifact response")
+        if (
+            not all(
+                _valid_text(getattr(release, field), nonblank=True)
+                for field in ("stage", "project", "version", "filename", "origin_url")
+            )
+            or not isinstance(release.sha256, str)
+            or type(release.size_bytes) is not int
+            or release.size_bytes < 0
         ):
-            return False
-        if item.last_error is not None and not isinstance(item.last_error, str):
-            return False
-    return True
+            raise SerializationError("invalid artifact response")
+        try:
+            validate_sha256(release.sha256)
+        except InvalidSha256 as exc:
+            raise SerializationError("invalid artifact response") from exc
+    if not isinstance(details.evidence, tuple) or len(details.evidence) > 10_000:
+        raise SerializationError("invalid artifact response")
+    for evidence in details.evidence:
+        if type(evidence) is not EvidenceRecord:
+            raise SerializationError("invalid artifact response")
+        if (
+            not _valid_text(evidence.rule_id, nonblank=True)
+            or not isinstance(evidence.action, Decision)
+            or (evidence.file_path is not None and not _valid_text(evidence.file_path))
+            or (
+                evidence.line is not None and (type(evidence.line) is not int or evidence.line <= 0)
+            )
+            or not _valid_text(evidence.message, nonblank=True)
+            or not isinstance(evidence.details, Mapping)
+        ):
+            raise SerializationError("invalid artifact response")
+    # Snapshot the complete DTO exactly once.  The returned plain graph is
+    # both the validation input and the response payload.
+    snapshot = _json_value(details)
+    if not isinstance(snapshot, dict):
+        raise SerializationError("invalid artifact response")
+    return snapshot
+
+
+def _mapping_snapshot(value: object, message: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise SerializationError(message)
+    snapshot = _json_value(value)
+    if not isinstance(snapshot, dict):
+        raise SerializationError(message)
+    return snapshot
 
 
 def list_quarantine(request) -> Response:
     try:
         states = _states(request.params.get("state"))
+        limit = _bounded_int(request.params.get("limit"), default=50, minimum=1, maximum=200)
+        offset = _bounded_int(request.params.get("offset"), default=0, minimum=0, maximum=1_000_000)
         page = _service(request).list_quarantine(
             states=states,
-            limit=_bounded_int(request.params.get("limit"), default=50, minimum=1, maximum=200),
-            offset=_bounded_int(
-                request.params.get("offset"), default=0, minimum=0, maximum=1_000_000
-            ),
+            limit=limit,
+            offset=offset,
         )
-        if not _valid_quarantine_page(page):
+        if not _valid_quarantine_page_for(page, requested_limit=limit, requested_offset=offset):
             raise SerializationError("invalid quarantine response")
         return _response(
             {"items": page.items, "total": page.total, "limit": page.limit, "offset": page.offset}
@@ -346,10 +457,10 @@ def list_quarantine(request) -> Response:
 
 def inspect_artifact(request) -> Response:
     try:
-        details = _service(request).inspect(_sha(request.matchdict["sha256"]))
-        if not isinstance(details, ArtifactAdminDetails):
-            raise SerializationError("invalid artifact response")
-        return _response({"artifact": details})
+        details = _valid_artifact_details(
+            _service(request).inspect(_sha(request.matchdict["sha256"]))
+        )
+        return _response({"artifact": details}, converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -357,9 +468,10 @@ def inspect_artifact(request) -> Response:
 def artifact_diff(request) -> Response:
     try:
         result = _service(request).artifact_diff(_sha(request.matchdict["sha256"]))
-        if not isinstance(result, Mapping):
+        snapshot = _json_value(result)
+        if not isinstance(snapshot, dict):
             raise SerializationError("invalid diff response")
-        return _response({"diff": result})
+        return _response({"diff": snapshot}, converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -378,9 +490,12 @@ def list_audit(request) -> Response:
             limit=limit,
             offset=offset,
         )
-        if not isinstance(result, Mapping):
+        snapshot = _json_value(result)
+        if not isinstance(snapshot, dict):
             raise SerializationError("invalid audit response")
-        return _response({**result, "limit": limit, "offset": offset})
+        snapshot["limit"] = limit
+        snapshot["offset"] = offset
+        return _response(snapshot, converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -392,21 +507,16 @@ def list_baselines(request) -> Response:
             not isinstance(project, str)
             or not project.strip()
             or len(project) > _MAX_TEXT
-            or any(
-                ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
-                for char in project
-            )
+            or not _valid_text(project, nonblank=True)
         ):
             raise AdminRequestError("project is required")
         result = _service(request).list_baselines(project)
-        if (
-            isinstance(result, (str, bytes, bytearray))
-            or not isinstance(result, Sequence)
-            or not all(isinstance(item, Mapping) for item in result)
-        ):
+        if isinstance(result, (str, bytes, bytearray)) or not isinstance(result, Sequence):
             raise SerializationError("invalid baseline response")
-        snapshot = tuple(dict(item) for item in result)
-        return _response({"items": snapshot})
+        snapshot = _json_value(result)
+        if not isinstance(snapshot, list) or not all(isinstance(item, dict) for item in snapshot):
+            raise SerializationError("invalid baseline response")
+        return _response({"items": snapshot}, converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -451,9 +561,9 @@ def import_baselines(request) -> Response:
         result = _service(request).import_baselines(
             tuple(records), actor=_actor(request), reason=_reason(body)
         )
-        if not isinstance(result, Mapping):
-            raise SerializationError("invalid baseline import response")
-        return _response(dict(result))
+        return _response(
+            _mapping_snapshot(result, "invalid baseline import response"), converted=True
+        )
     except Exception as exc:
         return _domain_error(exc)
 
@@ -462,9 +572,7 @@ def policy_validate(request) -> Response:
     try:
         body = _body(request)
         result = _service(request).validate_policy(_policy(body))
-        if not isinstance(result, Mapping):
-            raise SerializationError("invalid policy response")
-        return _response(dict(result))
+        return _response(_mapping_snapshot(result, "invalid policy response"), converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -473,9 +581,7 @@ def policy_simulate(request) -> Response:
     try:
         body = _body(request)
         result = _service(request).simulate_policy(_policy(body), sha256=_sha(body.get("sha256")))
-        if not isinstance(result, Mapping):
-            raise SerializationError("invalid policy response")
-        return _response(dict(result))
+        return _response(_mapping_snapshot(result, "invalid policy response"), converted=True)
     except Exception as exc:
         return _domain_error(exc)
 
@@ -544,9 +650,7 @@ def add_exception(request) -> Response:
 def health(request) -> Response:
     try:
         result = _service(request).health()
-        if not isinstance(result, Mapping):
-            raise SerializationError("invalid health response")
-        return _response(dict(result))
+        return _response(_mapping_snapshot(result, "invalid health response"), converted=True)
     except Exception as exc:
         return _domain_error(exc)
 

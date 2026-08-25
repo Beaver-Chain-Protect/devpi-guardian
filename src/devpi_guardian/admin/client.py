@@ -12,6 +12,7 @@ from typing import Any
 
 _MAX_BODY_BYTES = 1024 * 1024
 _MAX_TEXT = 4096
+_MAX_URL_BYTES = 8192
 _METHODS = frozenset(("GET", "POST", "DELETE"))
 
 
@@ -35,12 +36,44 @@ def _controls(value: str) -> bool:
     return any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
 
 
+def _encoded_size(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("URL contains invalid Unicode") from exc
+
+
+def _component_valid(value: str) -> bool:
+    try:
+        return (
+            len(value) <= _MAX_TEXT and _encoded_size(value) <= _MAX_TEXT and not _controls(value)
+        )
+    except ValueError:
+        return False
+
+
+def _json_text_valid(value: str) -> bool:
+    if any(
+        char == "\x00"
+        or 0xD800 <= ord(char) <= 0xDFFF
+        or (ord(char) < 0x20 and char not in "\n\r\t")
+        or 0x7F <= ord(char) <= 0x9F
+        for char in value
+    ):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _json_snapshot(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> Any:
     if depth > 32:
         raise ValueError("JSON input is too deeply nested")
     seen = set() if seen is None else seen
     if isinstance(value, str):
-        if len(value.encode("utf-8")) > _MAX_BODY_BYTES or _controls(value):
+        if not _json_text_valid(value) or len(value.encode("utf-8")) > _MAX_BODY_BYTES:
             raise ValueError("JSON input contains invalid text")
         return value
     if value is None or isinstance(value, bool):
@@ -59,7 +92,7 @@ def _json_snapshot(value: Any, *, depth: int = 0, seen: set[int] | None = None) 
                 raise ValueError("JSON input has too many values")
             result = {}
             for key, item in value.items():
-                if not isinstance(key, str) or _controls(key):
+                if not isinstance(key, str) or not _json_text_valid(key):
                     raise ValueError("JSON object keys must be strings")
                 result[key] = _json_snapshot(item, depth=depth + 1, seen=seen)
             return result
@@ -86,7 +119,11 @@ def _strict_json_bytes(value: Any) -> bytes:
 
 
 def _read_json(response, *, status: int) -> dict[str, Any]:
-    content_type = response.headers.get("Content-Type", "") if hasattr(response, "headers") else ""
+    try:
+        headers = getattr(response, "headers", {})
+        content_type = headers.get("Content-Type", "") if hasattr(headers, "get") else ""
+    except (AttributeError, TypeError, ValueError):
+        raise ApiError(status, "invalid_response", "server returned invalid JSON") from None
     media_type = content_type.split(";", 1)[0].strip().lower()
     if not (media_type == "application/json" or media_type.endswith("+json")):
         raise ApiError(status, "invalid_response", "server returned invalid JSON")
@@ -98,7 +135,15 @@ def _read_json(response, *, status: int) -> dict[str, Any]:
         payload = json.loads(
             text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value))
         )
-    except (OSError, TypeError, UnicodeError, ValueError, RecursionError) as exc:
+    except (
+        AttributeError,
+        OSError,
+        OverflowError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         raise ApiError(status, "invalid_response", "server returned invalid JSON") from exc
     try:
         payload = _json_snapshot(payload)
@@ -131,7 +176,15 @@ class GuardianApiClient:
             raise ValueError("api_url must use http or https with a hostname")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("api_url must not contain credentials")
-        if parsed.query or parsed.fragment or _controls(api_url):
+        if (
+            parsed.query
+            or parsed.fragment
+            or _controls(api_url)
+            or _encoded_size(api_url) > _MAX_URL_BYTES
+            or any(
+                segment in {".", ".."} for segment in urllib.parse.unquote(parsed.path).split("/")
+            )
+        ):
             raise ValueError("api_url must not contain query, fragment, or controls")
         if (
             not isinstance(timeout, (int, float))
@@ -168,6 +221,7 @@ class GuardianApiClient:
             or path.startswith("//")
             or _controls(path)
             or len(path) > _MAX_TEXT
+            or _encoded_size(path) > _MAX_TEXT
             or "?" in path
             or "#" in path
             or any(segment in {".", ".."} for segment in urllib.parse.unquote(path).split("/"))
@@ -183,19 +237,30 @@ class GuardianApiClient:
                     not isinstance(key, str)
                     or not key
                     or len(key) > _MAX_TEXT
+                    or _encoded_size(key) > _MAX_TEXT
                     or _controls(key)
                     or not isinstance(value, (str, int, float, bool))
                 ):
                     raise ValueError("query contains an invalid value")
-                if isinstance(value, str) and (len(value) > _MAX_TEXT or _controls(value)):
+                if isinstance(value, str) and (
+                    len(value) > _MAX_TEXT or _encoded_size(value) > _MAX_TEXT or _controls(value)
+                ):
                     raise ValueError("query contains an invalid value")
                 if isinstance(value, float) and not math.isfinite(value):
                     raise ValueError("query contains a non-finite number")
         if body is not None and not isinstance(body, dict):
             raise ValueError("body must be an object")
-        url = self._api_url + path
+        quoted_path = urllib.parse.quote(path, safe="/%:@-._~!$&'()*+,;=%")
+        if _encoded_size(quoted_path) > _MAX_TEXT:
+            raise ValueError("request path is invalid")
+        url = self._api_url + quoted_path
         if query:
-            url += "?" + urllib.parse.urlencode(query)
+            encoded_query = urllib.parse.urlencode(query)
+            if _encoded_size(encoded_query) > _MAX_TEXT:
+                raise ValueError("query is too large")
+            url += "?" + encoded_query
+        if _encoded_size(url) > _MAX_URL_BYTES:
+            raise ValueError("request URL is too large")
         data = None if body is None else _strict_json_bytes(body)
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -223,12 +288,7 @@ class GuardianApiClient:
                     exc.code, "invalid_response", "server returned invalid JSON"
                 ) from exc
             code, message = error["code"], error["message"]
-            if (
-                len(code) > _MAX_TEXT
-                or len(message) > _MAX_TEXT
-                or _controls(code)
-                or _controls(message)
-            ):
+            if not _component_valid(code) or not _component_valid(message):
                 raise ApiError(
                     exc.code, "invalid_response", "server returned invalid JSON"
                 ) from exc
