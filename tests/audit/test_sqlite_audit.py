@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -263,6 +262,38 @@ def test_writer_rejects_same_name_noop_trigger_before_using_cache(tmp_path):
             SQLiteAuditWriter().append_in_transaction(connection, _event())
 
 
+def test_writer_rejects_lookalike_audit_table_without_constraints(tmp_path):
+    factory = _db(tmp_path)
+    with closing(factory.connect()) as connection:
+        connection.execute("DROP TABLE audit_events")
+        migration = verdicts_db._read_migration(5)
+        table_end = migration.index(");") + 2
+        connection.executescript(
+            """
+            CREATE TABLE audit_events (
+                id INTEGER PRIMARY KEY,
+                event_version INTEGER NOT NULL,
+                canonicalization_version INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                previous_decision TEXT NOT NULL,
+                new_decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                policy_version TEXT,
+                analyzer_version TEXT,
+                previous_hash TEXT NOT NULL,
+                event_hash TEXT NOT NULL
+            );
+            """
+        )
+        connection.executescript(migration[table_end:])
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            SQLiteAuditWriter().append_in_transaction(connection, _event())
+
+
 @pytest.mark.parametrize(
     "index_sql",
     [
@@ -338,47 +369,6 @@ def test_writer_does_not_share_cache_for_raw_sqlite_connections(tmp_path):
     assert full_scans == 2
 
 
-def test_production_store_keeps_sqlite_audit_connection_stable(tmp_path):
-    factory = _db(tmp_path)
-    store = SQLiteArtifactStore(factory, SQLiteAuditWriter())
-    with store._write() as first:
-        first_connection = first
-    with store._write() as second:
-        assert second is first_connection
-    store.close()
-
-
-def test_production_store_stable_connection_is_thread_safe_and_closes(tmp_path):
-    factory = _db(tmp_path)
-    store = SQLiteArtifactStore(factory, SQLiteAuditWriter())
-
-    def append(number: int) -> None:
-        with store._write() as connection:
-            store._audit_writer.append_in_transaction(connection, _event(number))
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        list(executor.map(append, range(4)))
-    store.close()
-    store.close()
-    with pytest.raises(StoreUnavailable), store._write():
-        pass
-    assert verify_audit_chain(factory).valid is True
-
-
-def test_production_store_rejects_main_rotation_before_stable_write(tmp_path):
-    factory = _db(tmp_path)
-    replacement = _db(tmp_path / "replacement")
-    store = SQLiteArtifactStore(factory, SQLiteAuditWriter())
-    with store._write() as connection:
-        store._audit_writer.append_in_transaction(connection, _event(1))
-    os.replace(replacement.path, factory.path)
-    try:
-        with pytest.raises(StoreUnavailable), store._write():
-            pass
-    finally:
-        store.close()
-
-
 def test_writer_cache_regression_after_outer_rollback_is_repaired(tmp_path):
     factory = _db(tmp_path)
     writer = SQLiteAuditWriter()
@@ -424,104 +414,6 @@ def test_cached_writer_rejects_tampered_history_after_exact_trigger_restore(tmp_
         connection.execute("BEGIN IMMEDIATE")
         with pytest.raises(StoreUnavailable):
             writer.append_in_transaction(connection, _event(3))
-
-
-def test_cache_does_not_cross_same_path_database_replacement(tmp_path):
-    factory = _db(tmp_path)
-    replacement = _db(tmp_path / "replacement")
-    writer = SQLiteAuditWriter()
-    old_connection = factory.connect()
-    old_connection.execute("BEGIN IMMEDIATE")
-    writer.append_in_transaction(old_connection, _event(1))
-    old_connection.commit()
-    old_connection.close()
-    os.replace(replacement.path, factory.path)
-    with closing(factory.connect()) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        writer.append_in_transaction(connection, _event(2))
-        connection.commit()
-    assert verify_audit_chain(factory).valid is True
-
-
-def test_cached_writer_rejects_corrupt_replacement_after_open_connection(tmp_path):
-    factory = _db(tmp_path)
-    replacement = _db(tmp_path / "replacement")
-    writer = SQLiteAuditWriter()
-    old_connection = factory.connect()
-    old_connection.execute("BEGIN IMMEDIATE")
-    writer.append_in_transaction(old_connection, _event(1))
-    writer.append_in_transaction(old_connection, _event(2))
-    old_connection.commit()
-    with closing(replacement.connect()) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        replacement_writer = SQLiteAuditWriter()
-        replacement_writer.append_in_transaction(connection, _event(1))
-        replacement_writer.append_in_transaction(connection, _event(2))
-        connection.commit()
-        connection.execute("DROP TRIGGER audit_events_update_guard")
-        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
-        connection.execute(
-            """
-            CREATE TRIGGER audit_events_update_guard
-            BEFORE UPDATE ON audit_events
-            BEGIN
-                SELECT RAISE(ABORT, 'audit events are append-only');
-            END
-            """
-        )
-    os.replace(replacement.path, factory.path)
-    try:
-        with pytest.raises(StoreUnavailable), closing(factory.connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            writer.append_in_transaction(connection, _event(3))
-    finally:
-        old_connection.close()
-
-
-def test_cached_writer_rejects_aba_replacement_during_connection_open(tmp_path, monkeypatch):
-    factory = _db(tmp_path)
-    replacement = _db(tmp_path / "replacement")
-    backup = tmp_path / "original.db"
-    writer = SQLiteAuditWriter()
-    old_connection = factory.connect()
-    old_connection.execute("BEGIN IMMEDIATE")
-    writer.append_in_transaction(old_connection, _event(1))
-    writer.append_in_transaction(old_connection, _event(2))
-    old_connection.commit()
-    old_connection.close()
-    with closing(replacement.connect()) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        replacement_writer = SQLiteAuditWriter()
-        replacement_writer.append_in_transaction(connection, _event(1))
-        replacement_writer.append_in_transaction(connection, _event(2))
-        connection.commit()
-        connection.execute("DROP TRIGGER audit_events_update_guard")
-        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
-        connection.execute(_exact_update_guard_sql())
-        connection.execute("PRAGMA schema_version = 53")
-    real_connect = sqlite3.connect
-
-    def aba_connect(*args, **kwargs):
-        os.replace(factory.path, backup)
-        os.replace(replacement.path, factory.path)
-        connection = real_connect(*args, **kwargs)
-        os.replace(factory.path, replacement.path)
-        os.replace(backup, factory.path)
-        return connection
-
-    monkeypatch.setattr(sqlite3, "connect", aba_connect)
-    monkeypatch.setattr(
-        verdicts_db,
-        "_captured_file_identity",
-        lambda path, descriptor, before: ("file", path, before.st_dev, before.st_ino),
-    )
-    try:
-        with closing(factory.connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            with pytest.raises(StoreUnavailable):
-                writer.append_in_transaction(connection, _event(3))
-    finally:
-        old_connection.close()
 
 
 def test_persisted_fields_are_exact_and_expected_head_succeeds(tmp_path):

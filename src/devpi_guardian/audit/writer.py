@@ -6,6 +6,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib import resources
 from threading import RLock
 from typing import Any
 
@@ -29,6 +30,7 @@ _AUDIT_COLUMNS = """
 """
 _REQUIRED_SCHEMA_OBJECTS = frozenset(
     {
+        ("table", "audit_events"),
         ("index", "audit_events_sha256_occurred_at_idx"),
         ("index", "audit_events_action_occurred_at_idx"),
         ("index", "audit_events_event_hash_unique_idx"),
@@ -38,6 +40,23 @@ _REQUIRED_SCHEMA_OBJECTS = frozenset(
         ("trigger", "audit_events_delete_guard"),
     }
 )
+
+
+def _normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().lower()
+
+
+def _authoritative_audit_table_sql() -> str:
+    migration = (
+        resources.files("devpi_guardian.verdicts.sql")
+        .joinpath(
+            "005_audit_events.sql",
+        )
+        .read_text(encoding="utf-8")
+    )
+    start = migration.index("CREATE TABLE audit_events")
+    end = migration.index(");", start) + 1
+    return _normalize_sql(migration[start:end])
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +260,8 @@ def _schema_contract(
         for row in connection.execute(
             """
             SELECT type, name, sql FROM sqlite_master
-            WHERE type IN ('index', 'trigger') AND name NOT GLOB 'sqlite_*'
+            WHERE type IN ('table', 'index', 'trigger')
+              AND name NOT GLOB 'sqlite_*'
             ORDER BY type, name
             """
         ).fetchall()
@@ -250,6 +270,13 @@ def _schema_contract(
     if not present >= _REQUIRED_SCHEMA_OBJECTS:
         raise StoreUnavailable("audit database")
     if any(type(sql) is not str or not sql for _kind, _name, sql in objects):
+        raise StoreUnavailable("audit database")
+    table_definitions = {
+        name: _normalize_sql(sql)
+        for kind, name, sql in objects
+        if kind == "table" and name == "audit_events"
+    }
+    if table_definitions != {"audit_events": _authoritative_audit_table_sql()}:
         raise StoreUnavailable("audit database")
     expected_definitions = {
         "audit_events_action_occurred_at_idx": (
@@ -284,9 +311,7 @@ def _schema_contract(
         ),
     }
     definitions = {
-        name: re.sub(r"\s+", " ", sql).strip().lower()
-        for _kind, name, sql in objects
-        if name in expected_definitions
+        name: _normalize_sql(sql) for _kind, name, sql in objects if name in expected_definitions
     }
     if definitions != expected_definitions:
         raise StoreUnavailable("audit database")
@@ -337,12 +362,12 @@ class SQLiteAuditWriter:
     def _verified_prefix(self, connection: sqlite3.Connection) -> tuple[int, str]:
         """Verify the visible prefix, caching only rows present before insertion.
 
-        The cache is instance-local and bound to the live connection plus its
-        immutable audit schema catalog. It is never advanced after this method
-        returns, so an outer transaction may roll back safely; a later count
-        regression or schema change forces a cold full scan. Production store
-        writes retain one connection, so this avoids ambiguous cross-connection
-        identity and pathname TOCTOU trust entirely.
+        The cache is intentionally bound to one live connection. It is never
+        advanced after this method returns, so an outer transaction may roll
+        back safely; a later count regression or schema change forces a cold
+        full scan. A different connection always rehashes the complete visible
+        chain: without a persisted external trust anchor, a portable cache
+        cannot prove database-file or WAL generation across connections.
         """
         with self._cache_lock:
             schema, schema_version = _schema_contract(connection)

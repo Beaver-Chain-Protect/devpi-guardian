@@ -104,6 +104,12 @@ assertion도 같은 순서를 사용한다.
 않는다. 이후 단계의 필수 dependency 생성이 실패해도 부분적으로 요청을 받지 않도록
 startup을 실패시킨다. worker는 activation보다 먼저 실행될 수 없다.
 
+SQLite main file의 hot replacement는 연결이 살아 있는 동안 지원하지 않는다. 운영 중
+백업/복구가 필요하면 SQLite backup API를 사용하거나 서비스를 중지한 뒤 교체하고,
+재시작 시 startup verifier가 audit chain을 fail-closed로 다시 확인한다. 서로 다른
+SQLite 연결 사이의 audit cache는 파일/WAL generation을 증명할 외부 trust anchor가
+없으므로 재사용하지 않고 전체 chain을 다시 검증한다.
+
 ## 6. Quarantine CAS
 
 PR #1의 F5 quarantine 계약을 구현의 권위 있는 기준으로 사용한다.

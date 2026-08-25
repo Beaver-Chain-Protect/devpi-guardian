@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import os
 import sqlite3
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from threading import RLock
 
 from .errors import MigrationError, StoreUnavailable
 
@@ -30,109 +28,6 @@ _CATALOG_QUERY = """
     ORDER BY type, name, tbl_name, sql
 """
 _Catalog = tuple[tuple[object, ...], ...]
-# An open trusted connection pins the observed main inode.  A path rotation
-# while it is live is rejected before SQLite can combine a new main file with
-# the old connection's WAL generation.
-_ACTIVE_CONNECTIONS: dict[str, dict[tuple[int, int], int]] = {}
-_ACTIVE_CONNECTIONS_LOCK = RLock()
-
-
-class _TrustedConnection(sqlite3.Connection):
-    """Connection carrying identity captured atomically with its open."""
-
-    _devpi_guardian_identity: tuple[object, ...] | None = None
-    _devpi_guardian_registered = False
-
-    def close(self) -> None:
-        super().close()
-        identity = self._devpi_guardian_identity
-        if self._devpi_guardian_registered and identity is not None:
-            _unregister_connection(identity)
-            self._devpi_guardian_registered = False
-
-
-def trusted_connection_identity(
-    connection: sqlite3.Connection,
-) -> tuple[object, ...] | None:
-    """Return the factory-authenticated file identity, if available."""
-
-    if type(connection) is not _TrustedConnection:
-        return None
-    identity = connection._devpi_guardian_identity
-    if type(identity) is not tuple:
-        return None
-    return identity
-
-
-def trusted_connection_generation_current(connection: sqlite3.Connection) -> bool:
-    """Return whether a trusted file connection still names the live path."""
-
-    identity = trusted_connection_identity(connection)
-    if (
-        identity is None
-        or len(identity) != 4
-        or identity[0] != "file"
-        or type(identity[1]) is not str
-        or type(identity[2]) is not int
-        or type(identity[3]) is not int
-    ):
-        return False
-    try:
-        current = os.stat(identity[1])
-    except (OSError, ValueError):
-        return False
-    return (current.st_dev, current.st_ino) == (identity[2], identity[3])
-
-
-def _open_identity_sentinel(path: str) -> tuple[int, os.stat_result]:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except FileNotFoundError:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    before = os.fstat(descriptor)
-    identity = (before.st_dev, before.st_ino)
-    with _ACTIVE_CONNECTIONS_LOCK:
-        active = _ACTIVE_CONNECTIONS.get(path, {})
-        if active and identity not in active:
-            os.close(descriptor)
-            raise OSError("database main file changed while a connection was open")
-    return descriptor, before
-
-
-def _register_connection(connection: _TrustedConnection, identity: tuple[object, ...]) -> None:
-    path = identity[1]
-    inode = (identity[2], identity[3])
-    with _ACTIVE_CONNECTIONS_LOCK:
-        generations = _ACTIVE_CONNECTIONS.setdefault(path, {})
-        generations[inode] = generations.get(inode, 0) + 1
-    connection._devpi_guardian_registered = True
-
-
-def _unregister_connection(identity: tuple[object, ...]) -> None:
-    path = identity[1]
-    inode = (identity[2], identity[3])
-    with _ACTIVE_CONNECTIONS_LOCK:
-        active = _ACTIVE_CONNECTIONS.get(path)
-        if active is None:
-            return
-        count = active.get(inode)
-        if count is None:
-            return
-        if count > 1:
-            active[inode] = count - 1
-        else:
-            active.pop(inode)
-        if not active:
-            _ACTIVE_CONNECTIONS.pop(path, None)
-
-
-def _captured_file_identity(
-    path: str, descriptor: int, before: os.stat_result
-) -> tuple[object, ...]:
-    after = os.stat(path)
-    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
-        raise OSError("database path changed while opening")
-    return ("file", path, before.st_dev, before.st_ino)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,26 +42,14 @@ class ConnectionFactory:
         ):
             raise ValueError("invalid busy_timeout_ms")
 
-    def connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
-        if type(check_same_thread) is not bool:
-            raise ValueError("check_same_thread must be a bool")
+    def connect(self) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
-        descriptor: int | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            requested_path = os.fspath(self.path)
-            if requested_path == ":memory:":
-                database_path = requested_path
-                before = None
-            else:
-                database_path = os.path.realpath(os.path.abspath(requested_path))
-                descriptor, before = _open_identity_sentinel(database_path)
             connection = sqlite3.connect(
-                database_path,
+                self.path,
                 isolation_level=None,
                 timeout=self.busy_timeout_ms / 1000,
-                check_same_thread=check_same_thread,
-                factory=_TrustedConnection,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
@@ -185,28 +68,12 @@ class ConnectionFactory:
                 )
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
-            if (
-                type(connection) is _TrustedConnection
-                and descriptor is not None
-                and before is not None
-            ):
-                identity = _captured_file_identity(
-                    database_path,
-                    descriptor,
-                    before,
-                )
-                connection._devpi_guardian_identity = identity
-                _register_connection(connection, identity)
             return connection
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
                 with suppress(OSError, sqlite3.Error):
                     connection.close()
             raise StoreUnavailable(str(self.path)) from exc
-        finally:
-            if descriptor is not None:
-                with suppress(OSError):
-                    os.close(descriptor)
 
 
 def _version_out_of_range(version: int) -> bool:
