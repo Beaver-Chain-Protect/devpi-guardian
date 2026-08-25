@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from devpi_guardian.admin.views import _response
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import (
     ArtifactNotFound,
@@ -1118,7 +1119,10 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     store, claim = prepare_scanning(tmp_path, audit_writer)
     raw_error = (
         "RuntimeError: origin=https://user:secret@example.invalid/pkg?token=query-secret "
-        "credential=/Users/alice/private/file.whl sha256="
+        "credential=/Users/alice/private/file.whl "
+        "X-Devpi-Auth: dXNlcjpzZWNyZXQ= Authorization: Bearer bearer-secret "
+        "Authorization: Basic dXNlcjpwYXNz auth_token=secret-token "
+        "C:/Users/alice/private/file.whl sha256="
         + "a" * 64
         + "\nline two\x00\t"
         + "x" * 5000
@@ -1149,7 +1153,20 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert "secret@example.invalid" not in row["last_error"]
     assert "query-secret" not in row["last_error"]
     assert "/Users/alice/private/file.whl" not in row["last_error"]
+    assert "dXNlcjpzZWNyZXQ=" not in row["last_error"]
+    assert "bearer-secret" not in row["last_error"]
+    assert "dXNlcjpwYXNz" not in row["last_error"]
+    assert "secret-token" not in row["last_error"]
+    assert "C:/Users/alice/private/file.whl" not in row["last_error"]
     assert "a" * 64 not in row["last_error"]
+
+    response = _response({"artifact": {"last_error": row["last_error"]}})
+    serialized = response.json_body["artifact"]["last_error"]
+    assert "dXNlcjpzZWNyZXQ=" not in serialized
+    assert "bearer-secret" not in serialized
+    assert "dXNlcjpwYXNz" not in serialized
+    assert "secret-token" not in serialized
+    assert "C:/Users/alice/private/file.whl" not in serialized
     assert len(audit_writer.events) == 1
     event = audit_writer.events[0]
     assert (
