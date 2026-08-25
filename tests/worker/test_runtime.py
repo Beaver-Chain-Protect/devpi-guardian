@@ -138,6 +138,53 @@ def test_thread_runner_retries_recovery_and_redacts_error_details() -> None:
     assert runner.worker_health()["last_error"] == "RuntimeError"
 
 
+def test_thread_runner_recovers_expired_claims_on_every_cycle() -> None:
+    from devpi_guardian.worker.runtime import GuardianWorkerThread
+
+    class RecoveringCoordinator:
+        def __init__(self):
+            self.recoveries = 0
+            self.run_calls = 0
+            self.claim_expired = False
+            self.processed_after_recovery = False
+
+        def recover_expired_claims(self):
+            self.recoveries += 1
+            if self.claim_expired:
+                self.claim_expired = False
+            return 0
+
+        def run_once(self):
+            self.run_calls += 1
+            if self.run_calls == 1:
+                self.claim_expired = True
+            elif not self.claim_expired:
+                self.processed_after_recovery = True
+            return SimpleNamespace(status=CoordinatorStatus.IDLE)
+
+    class StopAfterTwoSleeps:
+        def __init__(self):
+            self.sleeps = 0
+
+        def sleep(self, _seconds):
+            self.sleeps += 1
+            if self.sleeps == 2:
+                raise KeyboardInterrupt
+
+        def exit_if_shutdown(self):
+            return None
+
+    coordinator = RecoveringCoordinator()
+    runner = GuardianWorkerThread(coordinator, poll_interval=0.01)
+    runner.thread = StopAfterTwoSleeps()
+
+    with contextlib.suppress(KeyboardInterrupt):
+        runner.thread_run()
+
+    assert coordinator.recoveries == 2
+    assert coordinator.processed_after_recovery is True
+
+
 def test_real_thread_pool_shutdown_closes_resources_in_worker_finally() -> None:
     from devpi_server.mythread import ThreadPool
 

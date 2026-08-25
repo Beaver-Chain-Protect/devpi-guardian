@@ -89,7 +89,6 @@ class GuardianWorkerThread:
         try:
             with self._health_lock:
                 self._started_at = datetime.now(UTC)
-            recovered = False
             while True:
                 # MyThread raises its pool's Shutdown exception here.  Keep
                 # this outside the recover/run exception boundary so shutdown
@@ -98,9 +97,7 @@ class GuardianWorkerThread:
                 if callable(exit_if_shutdown):
                     exit_if_shutdown()
                 try:
-                    if not recovered:
-                        self._coordinator.recover_expired_claims()
-                        recovered = True
+                    self._coordinator.recover_expired_claims()
                     cycle = self._coordinator.run_once()
                 except Exception as exc:
                     with self._health_lock:
