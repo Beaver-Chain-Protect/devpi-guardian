@@ -29,6 +29,7 @@ class CliInputError(ValueError):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="guardian")
     parser.add_argument("--api-url", required=True)
+    parser.add_argument("--username")
     authentication = parser.add_mutually_exclusive_group()
     authentication.add_argument("--auth-token")
     authentication.add_argument("--auth-token-file")
@@ -254,6 +255,7 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
         try:
             client = client_factory(
                 api_url=args.api_url,
+                username=args.username,
                 auth_token=_auth_token(args),
                 timeout=args.timeout,
             )

@@ -173,6 +173,7 @@ def seed_artifact(
     expires: datetime | None = None,
     *,
     expires_text: str | None = None,
+    cooldown_until: datetime | None = None,
 ) -> None:
     timestamp = NOW.isoformat()
     lease_values = (
@@ -186,8 +187,9 @@ def seed_artifact(
             """
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
-                lease_owner, lease_expires_at, lease_token, last_error
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                lease_owner, lease_expires_at, lease_token, last_error,
+                cooldown_started_at, cooldown_until
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sha256,
@@ -196,6 +198,8 @@ def seed_artifact(
                 timestamp,
                 *lease_values,
                 last_error,
+                timestamp if cooldown_until is not None else None,
+                None if cooldown_until is None else cooldown_until.isoformat(),
             ),
         )
         if automated is not None:
@@ -1147,6 +1151,38 @@ def test_manual_allow_over_review_is_effective(tmp_path) -> None:
     assert result.effective_decision is Decision.ALLOW
     assert result.source is DecisionSource.MANUAL_OVERRIDE
     assert result.artifact_state is ArtifactState.REVIEW
+
+
+def test_manual_allow_bypasses_automated_cooldown_but_automated_allow_does_not(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    cooldown = NOW + timedelta(hours=1)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        manual=Decision.ALLOW,
+        cooldown_until=cooldown,
+    )
+    automated_sha = "d" * 64
+    seed_artifact(
+        factory,
+        automated_sha,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        cooldown_until=cooldown,
+    )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    manual = reader.get_effective_decision(SHA_ALLOW)
+    automated = reader.get_effective_decision(automated_sha)
+
+    assert manual.allowed is True
+    assert manual.source is DecisionSource.MANUAL_OVERRIDE
+    assert automated.allowed is False
+    assert automated.source is DecisionSource.AUTOMATED
 
 
 def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:

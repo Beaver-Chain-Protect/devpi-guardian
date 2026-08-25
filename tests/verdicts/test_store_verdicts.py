@@ -1116,7 +1116,14 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     audit_writer,
 ) -> None:
     store, claim = prepare_scanning(tmp_path, audit_writer)
-    raw_error = "line one\nline two\x00\t" + "x" * 5000 + "TAIL-SECRET"
+    raw_error = (
+        "RuntimeError: origin=https://user:secret@example.invalid/pkg?token=query-secret "
+        "credential=/Users/alice/private/file.whl sha256="
+        + "a" * 64
+        + "\nline two\x00\t"
+        + "x" * 5000
+        + "TAIL-SECRET"
+    )
 
     store.mark_analysis_error(claim, raw_error)
 
@@ -1139,6 +1146,10 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert "\x00" not in row["last_error"]
     assert "\t" not in row["last_error"]
     assert "TAIL-SECRET" not in row["last_error"]
+    assert "secret@example.invalid" not in row["last_error"]
+    assert "query-secret" not in row["last_error"]
+    assert "/Users/alice/private/file.whl" not in row["last_error"]
+    assert "a" * 64 not in row["last_error"]
     assert len(audit_writer.events) == 1
     event = audit_writer.events[0]
     assert (

@@ -8,6 +8,7 @@ import pytest
 from devpi_guardian.admin.service import AdminFeatureUnavailable, AdminProviderError
 from devpi_guardian.admin.views import (
     ADMIN_SERVICE_REGISTRY_KEY,
+    _response,
     add_baseline,
     approve_artifact,
     artifact_diff,
@@ -34,6 +35,21 @@ from devpi_guardian.verdicts.models import (
 )
 
 SHA256 = "a" * 64
+
+
+def test_response_defense_in_depth_sanitizes_diagnostic_fields() -> None:
+    response = _response(
+        {
+            "worker": {
+                "last_error": "RuntimeError: token=secret path=/Users/alice/private/file",
+            }
+        }
+    )
+
+    rendered = response.json_body["worker"]["last_error"]
+    assert "secret" not in rendered
+    assert "/Users/alice/private/file" not in rendered
+    assert rendered.startswith("RuntimeError: token=[REDACTED]")
 
 
 class Service:

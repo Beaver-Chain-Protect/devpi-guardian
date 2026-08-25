@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+from devpi_guardian.privacy import sanitize_diagnostic
 from devpi_guardian.verdicts.models import require_utc, validate_sha256
 
 _DISCOVERY_SINK_XOM_ATTRIBUTE = "_devpi_guardian_discovery_sink"
@@ -545,7 +546,9 @@ class FileDiscoverySink:
             try:
                 _validate_pending_row(row)
             except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
-                diagnostic = f"discovery row invalid: {type(error).__name__}: {error}"[:4096]
+                diagnostic = sanitize_diagnostic(
+                    f"discovery row invalid: {type(error).__name__}: {error}"
+                )
                 connection.execute(
                     """
                     UPDATE discovery_jobs
@@ -577,7 +580,9 @@ class FileDiscoverySink:
                 try:
                     expires_at = _validate_processing_row(row)
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
-                    diagnostic = f"processing row invalid: {type(error).__name__}: {error}"[:4096]
+                    diagnostic = sanitize_diagnostic(
+                        f"processing row invalid: {type(error).__name__}: {error}"
+                    )
                     connection.execute(
                         """
                         UPDATE discovery_jobs
@@ -636,7 +641,9 @@ class FileDiscoverySink:
                     if _canonical_timestamp(row["available_at"], "available_at") > now_value:
                         continue
                 except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
-                    diagnostic = f"discovery row invalid: {type(error).__name__}: {error}"[:4096]
+                    diagnostic = sanitize_diagnostic(
+                        f"discovery row invalid: {type(error).__name__}: {error}"
+                    )
                     connection.execute(
                         """
                         UPDATE discovery_jobs
@@ -684,6 +691,7 @@ class FileDiscoverySink:
     def _finish(self, claim: DiscoveryClaim, *, state: str, error: str | None) -> None:
         if state not in ("COMPLETED", "FAILED"):
             raise ValueError("invalid terminal discovery state")
+        error = None if error is None else sanitize_diagnostic(error)
         with self._write() as connection:
             now_value = require_utc(self._now(), "now")
             now = now_value.isoformat()
@@ -726,6 +734,7 @@ class FileDiscoverySink:
             raise ValueError("retry delay must not be negative")
         if type(max_attempts) is not int or max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
+        error = sanitize_diagnostic(error)
         with self._write() as connection:
             now_value = require_utc(self._now(), "now")
             _validate_claim(claim)

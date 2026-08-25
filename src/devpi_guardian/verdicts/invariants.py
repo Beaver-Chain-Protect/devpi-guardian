@@ -387,7 +387,15 @@ def validate_persisted_state(
     source = DecisionSource.AUTOMATED
     if manual_is_active:
         source = DecisionSource.MANUAL_OVERRIDE
-    cooldown_finished = cooldown_until is None or cooldown_until <= evaluated_at
+    # Cooldown is an automated-verdict safety window.  A current manual
+    # override is an explicit administrator decision and therefore bypasses
+    # that automated window; an expired override falls back to the automated
+    # decision and resumes cooldown enforcement.
+    cooldown_finished = (
+        source is not DecisionSource.AUTOMATED
+        or cooldown_until is None
+        or cooldown_until <= evaluated_at
+    )
     return PersistedStateContext(
         artifact_state=state,
         effective_decision=effective,

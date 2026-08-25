@@ -109,6 +109,31 @@ def test_retry_preserves_attempt_count_and_terminal_failure(tmp_path) -> None:
     assert sink.count("PENDING") == 0
 
 
+def test_discovery_failure_diagnostic_is_sanitized_before_persistence(tmp_path) -> None:
+    sink = FileDiscoverySink(tmp_path, now=lambda: NOW)
+    sink.discover(candidate())
+    claim = sink.claim_next("worker-1", NOW + timedelta(minutes=5))
+    assert claim is not None
+
+    sink.fail(
+        claim,
+        "ValueError: origin=https://user:secret@example.invalid/item?token=query-secret "
+        "path=/Users/alice/private/file.whl sha256=" + "a" * 64 + "\n\t",
+    )
+
+    with sqlite3.connect(sink.path) as connection:
+        row = connection.execute("SELECT last_error FROM discovery_jobs").fetchone()
+    assert row is not None
+    diagnostic = row[0]
+    assert diagnostic.startswith("ValueError: origin=[URL]")
+    assert "secret@example.invalid" not in diagnostic
+    assert "query-secret" not in diagnostic
+    assert "/Users/alice/private/file.whl" not in diagnostic
+    assert "a" * 64 not in diagnostic
+    assert "\n" not in diagnostic
+    assert "\t" not in diagnostic
+
+
 def test_expired_processing_job_is_recovered(tmp_path) -> None:
     clock = [NOW]
     sink = FileDiscoverySink(tmp_path, now=lambda: clock[0])

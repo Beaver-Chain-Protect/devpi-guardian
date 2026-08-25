@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 
 from devpi_common.metadata import normalize_name
 
+from devpi_guardian.privacy import sanitize_diagnostic
+
 from .db import ConnectionFactory
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
@@ -36,7 +38,6 @@ from .releases import sanitize_origin_url
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_STORED_TEXT_LENGTH = 4096
 _MAX_DETAILS_JSON_LENGTH = 1024 * 1024
-_MAX_ANALYSIS_ERROR_LENGTH = 4096
 _TERMINAL_STATES = {"ALLOW", "REVIEW", "DENY", "ERROR"}
 
 
@@ -127,16 +128,7 @@ def _serialize_details(value: object) -> str:
 def _sanitize_analysis_error(value: object) -> str:
     if type(value) is not str:
         raise ValueError("error must be a string")
-    return "".join(
-        " "
-        if (
-            ord(character) < 32
-            or 127 <= ord(character) <= 159
-            or 0xD800 <= ord(character) <= 0xDFFF
-        )
-        else character
-        for character in value[:_MAX_ANALYSIS_ERROR_LENGTH]
-    )
+    return sanitize_diagnostic(value)
 
 
 def _require_lease_token(value: object) -> str:

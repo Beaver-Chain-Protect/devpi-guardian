@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 from io import BytesIO
@@ -183,11 +184,20 @@ def test_cli_reads_auth_token_from_file_without_putting_it_in_arguments(tmp_path
 
     assert (
         main(
-            ["--api-url", "https://devpi.example", "--auth-token-file", str(token_file), "health"],
+            [
+                "--api-url",
+                "https://devpi.example",
+                "--username",
+                "root",
+                "--auth-token-file",
+                str(token_file),
+                "health",
+            ],
             client_factory=factory,
         )
         == EXIT_OK
     )
+    assert captured["username"] == "root"
     assert captured["auth_token"] == "secret-token"
 
 
@@ -244,6 +254,68 @@ def test_client_requires_bounded_json_content_type_and_read_cap(monkeypatch) -> 
     result = GuardianApiClient(api_url="https://devpi.example").request("GET", "/health")
     assert result == {"ok": True}
     assert calls == [1024 * 1024 + 1]
+
+
+def test_client_sends_devpi_auth_header_for_username_and_token(monkeypatch) -> None:
+    captured = {}
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, amount):
+            return b'{"ok":true}'
+
+    def open_request(request, timeout):
+        captured.update(dict(request.header_items()))
+        return Response()
+
+    monkeypatch.setattr("devpi_guardian.admin.client._open", open_request)
+
+    result = GuardianApiClient(
+        api_url="https://devpi.example",
+        username="root",
+        auth_token="secret-token",
+    ).request("GET", "/health")
+
+    assert result == {"ok": True}
+    assert captured["X-devpi-auth"] == base64.b64encode(b"root:secret-token").decode("ascii")
+    assert "Authorization" not in captured
+    from devpi_server.auth_devpi import devpiserver_get_credentials
+
+    assert devpiserver_get_credentials(
+        type("Request", (), {"headers": {"X-Devpi-Auth": captured["X-devpi-auth"]}})()
+    ) == (
+        "root",
+        "secret-token",
+    )
+
+
+@pytest.mark.parametrize(
+    ("username", "auth_token"),
+    [("root", None), (None, "secret-token"), ("root:other", "secret-token")],
+)
+def test_client_requires_safe_paired_devpi_credentials(username, auth_token) -> None:
+    with pytest.raises(ClientInputError):
+        GuardianApiClient(
+            api_url="https://devpi.example",
+            username=username,
+            auth_token=auth_token,
+        )
+
+
+def test_cli_rejects_token_without_username(capsys) -> None:
+    assert (
+        main(["--api-url", "https://devpi.example", "--auth-token", "secret-token", "health"])
+        == EXIT_USAGE
+    )
+    assert "username" in capsys.readouterr().err
 
 
 def test_client_sanitizes_http_error_shape(monkeypatch) -> None:

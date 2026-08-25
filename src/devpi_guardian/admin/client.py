@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import urllib.error
@@ -163,6 +164,7 @@ class GuardianApiClient:
         self,
         *,
         api_url: str,
+        username: str | None = None,
         auth_token: str | None = None,
         timeout: float = 30.0,
     ) -> None:
@@ -197,6 +199,17 @@ class GuardianApiClient:
             or timeout <= 0
         ):
             raise ClientInputError("timeout must be a finite positive number")
+        if username is not None and (
+            not isinstance(username, str)
+            or not username
+            or len(username) > _MAX_TEXT
+            or _controls(username)
+            or ":" in username
+            or any(0xD800 <= ord(char) <= 0xDFFF for char in username)
+        ):
+            raise ClientInputError("username is invalid")
+        if (username is None) != (auth_token is None):
+            raise ClientInputError("username and auth_token must be supplied together")
         if auth_token is not None and (
             not isinstance(auth_token, str)
             or not auth_token
@@ -206,6 +219,7 @@ class GuardianApiClient:
         ):
             raise ClientInputError("auth_token is invalid")
         self._api_url = api_url.rstrip("/")
+        self._username = username
         self._auth_token = auth_token
         self._timeout = float(timeout)
 
@@ -269,8 +283,9 @@ class GuardianApiClient:
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if self._auth_token:
-            headers["Authorization"] = f"Bearer {self._auth_token}"
+        if self._username is not None and self._auth_token is not None:
+            credentials = f"{self._username}:{self._auth_token}".encode()
+            headers["X-Devpi-Auth"] = base64.b64encode(credentials).decode("ascii")
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with _open(request, self._timeout) as response:

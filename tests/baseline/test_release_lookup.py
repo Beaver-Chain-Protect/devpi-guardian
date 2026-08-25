@@ -53,8 +53,8 @@ def test_the_real_reader_satisfies_the_adapter_protocol(tmp_path):
 def test_the_public_verdict_reader_interface_covers_what_the_adapter_needs():
     # The F4 README points F6 consumers at the registry-provided VerdictReader,
     # so anything satisfying that interface must satisfy this adapter too.
-    assert "list_allowed_releases" in VerdictReader.__protocol_attrs__
-    assert "get_artifact_releases" in VerdictReader.__protocol_attrs__
+    for method_name in ("list_allowed_releases", "get_artifact_releases"):
+        assert callable(getattr(VerdictReader, method_name, None))
 
 
 def test_the_preexisting_six_field_allowed_release_constructor_remains_valid():
