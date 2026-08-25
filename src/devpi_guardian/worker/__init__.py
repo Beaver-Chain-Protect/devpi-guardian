@@ -2,6 +2,7 @@
 
 from .adapters import VerdictReaderCandidateSource
 from .analysis import GuardianAnalysisEngine, build_analysis_engine
+from .devpi_source import DevpiArtifactBytesSource, DevpiArtifactUnavailable
 from .discovery import (
     DiscoveryCandidate,
     DiscoveryClaim,
@@ -10,6 +11,14 @@ from .discovery import (
     DiscoveryUnavailable,
     FileDiscoverySink,
     get_discovery_sink,
+)
+from .discovery_consumer import (
+    ArtifactBytesSource,
+    DiscoveryConsumer,
+    DiscoveryCycle,
+    DiscoveryCycleStatus,
+    ResolvedDiscovery,
+    SimpleLinkResolver,
 )
 from .models import (
     AnalysisBundle,
@@ -21,6 +30,15 @@ from .models import (
     VerifiedArtifact,
 )
 from .pipeline import QuarantineWorker, WorkerCycle, WorkerCycleStatus
+from .preparer import HttpArtifactPreparer, QuarantineArtifactPreparer
+from .quarantine import (
+    ArtifactHashMismatch,
+    ArtifactSizeMismatch,
+    ArtifactTooLarge,
+    QuarantineError,
+    QuarantineStore,
+)
+from .upload import PrivateUploadConnector
 
 __all__ = [
     "AnalysisBundle",
@@ -28,15 +46,31 @@ __all__ = [
     "AnalysisFileDiff",
     "AnalysisReport",
     "AnalysisStep",
+    "ArtifactBytesSource",
     "ArtifactCandidate",
+    "ArtifactHashMismatch",
+    "ArtifactSizeMismatch",
+    "ArtifactTooLarge",
+    "DevpiArtifactBytesSource",
+    "DevpiArtifactUnavailable",
     "DiscoveryCandidate",
     "DiscoveryClaim",
+    "DiscoveryConsumer",
+    "DiscoveryCycle",
+    "DiscoveryCycleStatus",
     "DiscoveryQueueFull",
     "DiscoverySink",
     "DiscoveryUnavailable",
     "FileDiscoverySink",
     "GuardianAnalysisEngine",
+    "HttpArtifactPreparer",
+    "PrivateUploadConnector",
+    "QuarantineArtifactPreparer",
+    "QuarantineError",
+    "QuarantineStore",
     "QuarantineWorker",
+    "ResolvedDiscovery",
+    "SimpleLinkResolver",
     "VerdictReaderCandidateSource",
     "VerifiedArtifact",
     "WorkerCycle",
