@@ -1,51 +1,94 @@
-# PR5/PR9 safe integration review draft
+# PR5/PR9 integration review record
 
-Status: factual draft pending the final fresh specification and security/code-quality
-reviews. This file intentionally does not claim reviewer approval or invent reviewer
-identities.
+Status: **APPROVED**
+
+This record documents the selective integration review for PR5 and PR9. The reviewed
+implementation is ready for integration assessment; it has not been pushed or merged by
+this task.
 
 ## Scope and provenance
 
-- Approved integration base: `3d210395dc806cc0420bda97c6e6e8a8dc1a1883` (PR1 merge).
+- Approved integration base: `3d210395dc806cc0420bda97c6e6e8a8dc1a1883`.
 - Selective PR5 source: `22bc029e584af43e6c79b72a3d6fcef35f49f05f`.
 - Selective PR9 source: `52593ae444f416625a0e96f0a4874bc30987ce8d`.
-- Current implementation head: `<PENDING FINAL INTEGRATION COMMIT AND FRESH REVIEW>`.
-- Final specification reviewer: `<PENDING — identity and result not yet recorded>`.
-- Final security/code-quality reviewer: `<PENDING — identity and result not yet recorded>`.
+- Reviewed implementation head: `105be3415a40aa4cfff3e2c7f71a960c66140505`.
 
 PR5 and PR9 were selectively integrated; their merge histories were not replayed. PR1
-activation ordering, CI documentation, immutable verdict history, claim fencing, and
-fail-closed public download enforcement remain the governing contracts.
+activation ordering, immutable verdict and evidence history, claim fencing, and fail-closed
+public download enforcement remain the governing contracts.
 
-Existing devpi instances with Artifact candidates remain unsupported until a future offline
-inventory/backfill process is delivered. The worker quarantine is a dedicated absolute
-`0700` root outside devpi server storage.
+Existing devpi migration/backfill is not supported. If first-activation inventory finds
+Artifact candidates, activation fails closed. Installations are therefore supported only
+for new or empty instances until a future offline inventory/backfill process is delivered.
+Worker quarantine uses a dedicated absolute `0700` root outside devpi server storage.
 
-## Task 8 evidence recorded before final review
+## Behavioral and security outcomes
 
-The real-devpi integration proof was first run RED. The initial assertion failed because the
-fixture had no cache-entry materialization operation; this was observed before the fixture
-helper was added. Subsequent RED runs exposed the subprocess module path and then the expected
-devpi project metadata mismatch; both were corrected by wiring the repository path into the
-helper environment and using devpi's normalized project name. The focused run then passed:
+The implementation covers selective activation rollback, including removal of Guardian-owned
+runtime state while preserving unrelated plugin state. It keeps direct `+f`/`+e` URL bypasses
+blocked, uses the public verdict/store interfaces, and preserves worker shutdown boundaries
+and stale-token fencing.
+
+The cached hashless `+e` lifecycle is verified as follows:
+
+1. A stopped-server helper materializes the official cached devpi `FileEntry` with real
+   `filestore.maplink(URL(...))` and `file_set_content(..., hashes=Digests(sha256=...))`.
+2. After restart, an ordinary Guardian Simple request reaches production
+   `GuardianStage` hydration, cross-check, and discovery-sink enqueue. The sink is not called
+   directly by the test or a public bypass path.
+3. GET/HEAD remain blocked before manual effective `ALLOW`, including after the worker reaches
+   a terminal verdict.
+4. After manual effective `ALLOW`, real GET/HEAD return the exact cached bytes with status 200.
+
+The original href may be hashless; Artifact identity is determined by the authoritative
+cached `FileEntry` SHA. No public URL fragment, filename, or client header bypasses identity
+validation.
+
+The privacy boundary sanitizes SQLite evidence before persistence, F11/API responses
+(including legacy database rows), and `reason`, `failure_reason`, and `details` fields. It
+covers paths, credentials, and non-canonical/composite identity values while preserving only
+canonical identity scalars. Baseline selection logging is metadata-free.
+
+Two additional review findings were resolved and reverified:
+
+- Guardian post-link crash residue recovery was verified. Arbitrary hardlinks remain
+  fail-closed; recovery performs both parent-directory `fsync` and final `nlink == 1`
+  re-verification.
+- Expired discovery/analysis claims are recovered on every worker cycle. Failed work is
+  retried, while the shutdown boundary and stale-token fencing remain enforced.
+
+## Final reviewers
+
+- Specification/security reviewer `/root/final_spec_review_747caaf`: exact head
+  `105be3415a40aa4cfff3e2c7f71a960c66140505`, **APPROVED** — Critical 0, Important 0,
+  Minor 0.
+- Code-quality reviewer `/root/final_quality_review_747caaf`: exact head
+  `105be3415a40aa4cfff3e2c7f71a960c66140505`, **APPROVED** — Critical 0, Important 0,
+  Minor 0.
+
+Direct reviewer evidence was summarized from the final passes: quality review covered 173
+focused tests plus explicit crash/runtime reproduction; specification review covered 295
+focused tests, 183 worker tests, 3 real-devpi worker integration tests, and 502 F3, `+e`,
+activation, and privacy regression tests.
+
+## Controller verification at the reviewed implementation head
+
+The controller independently reported:
 
 ```text
-uv run pytest tests/integration/test_worker_runtime.py -q -m integration
-3 passed, 4 warnings
+Python 3.11: 2079 passed, 5 warnings
+Python 3.12: 2079 passed, 9 warnings
+Python 3.13: 2079 passed, 7 warnings
+Python 3.14: 2079 passed, 7 warnings
+Ruff format: 148 files already formatted
+Ruff lint: pass
+Flake8: pass
+uv lock --check: pass
+uv build: sdist and wheel produced
+git diff --check base...HEAD: pass
+Worktree: clean
 ```
 
-The passing proofs observe private upload CAS publication, exact CAS bytes and path, terminal
-Artifact state, protected `+f` and `.metadata` GET/HEAD, and release only after a manual
-effective `ALLOW`. The new `+e` proof first blocks GET/HEAD on the real hashless mirror route,
-stops the already-activated server, fetches the fixture's upstream bytes, and commits them
-through devpi's `MutableFileEntry.file_set_content(..., hashes=...)` KeyFS cache transaction.
-After restart, the durable discovery sink consumes a canonical SHA-bearing link for that same
-`+e` relpath; terminal verdict remains blocked until effective ALLOW, after which real GET/HEAD
-reach devpi's handler. This is operationally valid because it reproduces devpi's official
-post-fetch cache commit after activation, without rewriting route strings or weakening identity
-checks. The existing hashed mirror proof remains and observes the production internal stage
-client fetch upstream bytes; the public Guardian route is not used as the worker source.
-
-The complete acceptance matrix, final implementation head, reviewer identities, reviewer
-results, and resolved finding disposition must be filled in by the final controller after
-the fresh review pass. No Critical/Important count is asserted here pending those reviews.
+Final disposition: **Critical 0 / Important 0 / Minor 0**. The implementation is ready for
+integration assessment. This review record does not claim that any branch was pushed or
+merged.
