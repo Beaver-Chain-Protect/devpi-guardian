@@ -23,6 +23,10 @@ class ApiError(RuntimeError):
         self.code = code
 
 
+class ClientInputError(ValueError):
+    """The caller supplied an invalid client URL, query, or JSON value."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -40,7 +44,7 @@ def _encoded_size(value: str) -> int:
     try:
         return len(value.encode("utf-8"))
     except UnicodeEncodeError as exc:
-        raise ValueError("URL contains invalid Unicode") from exc
+        raise ClientInputError("URL contains invalid Unicode") from exc
 
 
 def _component_valid(value: str) -> bool:
@@ -112,9 +116,9 @@ def _strict_json_bytes(value: Any) -> bytes:
             snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeError) as exc:
-        raise ValueError("JSON input is invalid") from exc
+        raise ClientInputError("JSON input is invalid") from exc
     if len(data) > _MAX_BODY_BYTES:
-        raise ValueError("JSON input is too large")
+        raise ClientInputError("JSON input is too large")
     return data
 
 
@@ -163,19 +167,19 @@ class GuardianApiClient:
         timeout: float = 30.0,
     ) -> None:
         if not isinstance(api_url, str) or not api_url.strip():
-            raise ValueError("api_url must not be blank")
+            raise ClientInputError("api_url must not be blank")
         try:
             parsed = urllib.parse.urlsplit(api_url)
             hostname = parsed.hostname
             port = parsed.port
         except ValueError as exc:
-            raise ValueError("api_url is invalid") from exc
+            raise ClientInputError("api_url is invalid") from exc
         if port is not None and not 1 <= port <= 65535:
-            raise ValueError("api_url port is invalid")
+            raise ClientInputError("api_url port is invalid")
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
-            raise ValueError("api_url must use http or https with a hostname")
+            raise ClientInputError("api_url must use http or https with a hostname")
         if parsed.username is not None or parsed.password is not None:
-            raise ValueError("api_url must not contain credentials")
+            raise ClientInputError("api_url must not contain credentials")
         if (
             parsed.query
             or parsed.fragment
@@ -185,14 +189,14 @@ class GuardianApiClient:
                 segment in {".", ".."} for segment in urllib.parse.unquote(parsed.path).split("/")
             )
         ):
-            raise ValueError("api_url must not contain query, fragment, or controls")
+            raise ClientInputError("api_url must not contain query, fragment, or controls")
         if (
             not isinstance(timeout, (int, float))
             or isinstance(timeout, bool)
             or not math.isfinite(timeout)
             or timeout <= 0
         ):
-            raise ValueError("timeout must be a finite positive number")
+            raise ClientInputError("timeout must be a finite positive number")
         if auth_token is not None and (
             not isinstance(auth_token, str)
             or not auth_token
@@ -200,7 +204,7 @@ class GuardianApiClient:
             or _controls(auth_token)
             or any(0xD800 <= ord(char) <= 0xDFFF for char in auth_token)
         ):
-            raise ValueError("auth_token is invalid")
+            raise ClientInputError("auth_token is invalid")
         self._api_url = api_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = float(timeout)
@@ -214,7 +218,7 @@ class GuardianApiClient:
         query: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(method, str) or method not in _METHODS:
-            raise ValueError("HTTP method is invalid")
+            raise ClientInputError("HTTP method is invalid")
         if (
             not isinstance(path, str)
             or not path.startswith("/")
@@ -226,12 +230,12 @@ class GuardianApiClient:
             or "#" in path
             or any(segment in {".", ".."} for segment in urllib.parse.unquote(path).split("/"))
         ):
-            raise ValueError("request path is invalid")
+            raise ClientInputError("request path is invalid")
         if query is not None:
             if not isinstance(query, dict):
-                raise ValueError("query must be an object")
+                raise ClientInputError("query must be an object")
             if len(query) > 32:
-                raise ValueError("query has too many values")
+                raise ClientInputError("query has too many values")
             for key, value in query.items():
                 if (
                     not isinstance(key, str)
@@ -241,26 +245,26 @@ class GuardianApiClient:
                     or _controls(key)
                     or not isinstance(value, (str, int, float, bool))
                 ):
-                    raise ValueError("query contains an invalid value")
+                    raise ClientInputError("query contains an invalid value")
                 if isinstance(value, str) and (
                     len(value) > _MAX_TEXT or _encoded_size(value) > _MAX_TEXT or _controls(value)
                 ):
-                    raise ValueError("query contains an invalid value")
+                    raise ClientInputError("query contains an invalid value")
                 if isinstance(value, float) and not math.isfinite(value):
-                    raise ValueError("query contains a non-finite number")
+                    raise ClientInputError("query contains a non-finite number")
         if body is not None and not isinstance(body, dict):
-            raise ValueError("body must be an object")
+            raise ClientInputError("body must be an object")
         quoted_path = urllib.parse.quote(path, safe="/%:@-._~!$&'()*+,;=%")
         if _encoded_size(quoted_path) > _MAX_TEXT:
-            raise ValueError("request path is invalid")
+            raise ClientInputError("request path is invalid")
         url = self._api_url + quoted_path
         if query:
             encoded_query = urllib.parse.urlencode(query)
             if _encoded_size(encoded_query) > _MAX_TEXT:
-                raise ValueError("query is too large")
+                raise ClientInputError("query is too large")
             url += "?" + encoded_query
         if _encoded_size(url) > _MAX_URL_BYTES:
-            raise ValueError("request URL is too large")
+            raise ClientInputError("request URL is too large")
         data = None if body is None else _strict_json_bytes(body)
         headers = {"Accept": "application/json"}
         if data is not None:

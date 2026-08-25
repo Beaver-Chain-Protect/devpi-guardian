@@ -310,6 +310,18 @@ def test_cli_unknown_error_is_not_silently_converted(capsys) -> None:
         )
 
 
+@pytest.mark.parametrize("error", [ValueError("provider secret"), TypeError("programming secret")])
+def test_cli_factory_programming_errors_are_reraised(error) -> None:
+    def failing_factory(**kwargs):
+        raise error
+
+    with pytest.raises(type(error), match="secret"):
+        main(
+            ["--api-url", "https://devpi.example", "health"],
+            client_factory=failing_factory,
+        )
+
+
 def test_cli_rejects_token_file_with_unsafe_permissions(tmp_path, capsys) -> None:
     token = tmp_path / "token"
     token.write_text("secret-token")
@@ -355,3 +367,22 @@ def test_client_rejects_invalid_request_shapes() -> None:
 def test_cli_invalid_timeout_is_usage_error(capsys) -> None:
     assert main(["--api-url", "https://devpi.example", "--timeout", "nan", "health"]) == EXIT_USAGE
     assert "timeout" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["quarantine", "list", "--state", "bad\nstate"],
+        ["audit", "list", "--actor", "bad\nactor"],
+        ["baseline", "list", "bad\nproject"],
+    ],
+)
+def test_cli_rejects_controlled_query_values_as_usage_errors(arguments, capsys) -> None:
+    assert (
+        main(
+            ["--api-url", "https://devpi.example", *arguments],
+            client_factory=GuardianApiClient,
+        )
+        == EXIT_USAGE
+    )
+    assert "bad" not in capsys.readouterr().err

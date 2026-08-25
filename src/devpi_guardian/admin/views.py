@@ -56,8 +56,14 @@ class RegistryUnavailable(RuntimeError):
     """The admin service registry entry is absent or malformed."""
 
 
-def _valid_text(value: object, *, nonblank: bool = False) -> bool:
-    if not isinstance(value, str) or (nonblank and not value.strip()) or len(value) > _MAX_TEXT:
+def _valid_text(
+    value: object, *, nonblank: bool = False, max_chars: int | None = _MAX_TEXT
+) -> bool:
+    if (
+        not isinstance(value, str)
+        or (nonblank and not value.strip())
+        or (max_chars is not None and len(value) > max_chars)
+    ):
         return False
     if any(
         char == "\x00"
@@ -75,7 +81,12 @@ def _valid_text(value: object, *, nonblank: bool = False) -> bool:
 
 
 def _json_value(
-    value: Any, *, depth: int = 0, seen: set[int] | None = None, count: list[int] | None = None
+    value: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+    count: list[int] | None = None,
+    text_limit: int | None = _MAX_TEXT,
 ) -> Any:
     if depth > 32:
         raise SerializationError("response is too deeply nested")
@@ -87,7 +98,7 @@ def _json_value(
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
-        if not _valid_text(value):
+        if not _valid_text(value, max_chars=text_limit):
             raise SerializationError("response contains invalid text")
         return value
     if isinstance(value, (int, float)):
@@ -99,7 +110,9 @@ def _json_value(
             raise SerializationError("response contains a naive datetime")
         return value.isoformat()
     if isinstance(value, Enum):
-        return _json_value(value.value, depth=depth + 1, seen=seen, count=count)
+        return _json_value(
+            value.value, depth=depth + 1, seen=seen, count=count, text_limit=text_limit
+        )
     identity = id(value)
     if identity in seen:
         raise SerializationError("response contains a cycle")
@@ -108,7 +121,11 @@ def _json_value(
         if is_dataclass(value) and not isinstance(value, type):
             return {
                 field.name: _json_value(
-                    getattr(value, field.name), depth=depth + 1, seen=seen, count=count
+                    getattr(value, field.name),
+                    depth=depth + 1,
+                    seen=seen,
+                    count=count,
+                    text_limit=None if field.name == "details" else text_limit,
                 )
                 for field in fields(value)
             }
@@ -117,10 +134,15 @@ def _json_value(
             for key, item in value.items():
                 if not isinstance(key, str):
                     raise SerializationError("response object keys must be strings")
-                result[key] = _json_value(item, depth=depth + 1, seen=seen, count=count)
+                result[key] = _json_value(
+                    item, depth=depth + 1, seen=seen, count=count, text_limit=text_limit
+                )
             return result
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return [_json_value(item, depth=depth + 1, seen=seen, count=count) for item in value]
+            return [
+                _json_value(item, depth=depth + 1, seen=seen, count=count, text_limit=text_limit)
+                for item in value
+            ]
     except (RecursionError, TypeError, ValueError) as exc:
         if isinstance(exc, SerializationError):
             raise
@@ -301,7 +323,7 @@ def _valid_quarantine_page(page: object) -> bool:
     return _valid_quarantine_page_for(page, requested_limit=None, requested_offset=None)
 
 
-def _valid_summary(item: object) -> bool:
+def _valid_summary(item: object, *, quarantine: bool = True) -> bool:
     if type(item) is not ArtifactAdminSummary:
         return False
     if not isinstance(item.sha256, str):
@@ -312,10 +334,9 @@ def _valid_summary(item: object) -> bool:
         return False
     if type(item.size_bytes) is not int or item.size_bytes < 0:
         return False
-    if not isinstance(item.state, ArtifactState) or item.state in {
-        ArtifactState.ALLOW,
-        ArtifactState.MISSING,
-    }:
+    if not isinstance(item.state, ArtifactState):
+        return False
+    if quarantine and item.state in {ArtifactState.ALLOW, ArtifactState.MISSING}:
         return False
     for timestamp in (item.discovered_at, item.updated_at):
         if (
@@ -358,7 +379,7 @@ def _valid_quarantine_page_for(
 def _valid_artifact_details(details: object) -> dict[str, Any]:
     if type(details) is not ArtifactAdminDetails:
         raise SerializationError("invalid artifact response")
-    if not _valid_summary(details.summary):
+    if not _valid_summary(details.summary, quarantine=False):
         raise SerializationError("invalid artifact response")
     if type(details.allowed) is not bool:
         raise SerializationError("invalid artifact response")
@@ -383,6 +404,8 @@ def _valid_artifact_details(details: object) -> dict[str, Any]:
             "sdist",
         }
     ):
+        raise SerializationError("invalid artifact response")
+    if details.baseline_tier is not None and details.baseline_sha256 is None:
         raise SerializationError("invalid artifact response")
     if not isinstance(details.releases, tuple) or len(details.releases) > 10_000:
         raise SerializationError("invalid artifact response")

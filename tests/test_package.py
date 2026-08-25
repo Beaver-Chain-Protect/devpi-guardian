@@ -2,6 +2,7 @@
 # Keep devpi's no-section, from-first style in this integration-facing test.
 # ruff: noqa: I001
 from devpi_guardian import plugin
+from devpi_guardian.admin import AdminProviderError
 from devpi_guardian.enforcement.metrics import BLOCK_METRIC_REGISTRY_KEY
 from devpi_guardian.enforcement.metrics import InMemoryBlockMetricRecorder
 from devpi_guardian.enforcement.tween import VERDICT_READER_REGISTRY_KEY
@@ -73,6 +74,10 @@ def test_package_exposes_guardian_admin_console_script() -> None:
 
     assert len(matches) == 1
     assert matches[0].value == "devpi_guardian.admin.cli:main"
+
+
+def test_package_exposes_sanitized_admin_provider_error() -> None:
+    assert issubclass(AdminProviderError, RuntimeError)
 
 
 def test_package_declares_requests_as_direct_runtime_dependency() -> None:

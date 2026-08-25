@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,15 @@ from devpi_guardian.admin.views import (
     revoke_artifact,
 )
 from devpi_guardian.verdicts.errors import ArtifactNotFound, TransitionConflict
-from devpi_guardian.verdicts.models import ArtifactState, QuarantinePage
+from devpi_guardian.verdicts.models import (
+    ArtifactAdminDetails,
+    ArtifactAdminSummary,
+    ArtifactState,
+    Decision,
+    DecisionSource,
+    EvidenceRecord,
+    QuarantinePage,
+)
 
 SHA256 = "a" * 64
 
@@ -104,6 +113,82 @@ def test_inspect_maps_missing_artifact_to_stable_404() -> None:
     response = inspect_artifact(request(Service(), sha256="b" * 64))
     assert response.status_code == 404
     assert response.json_body["error"]["code"] == "artifact_not_found"
+
+
+def test_inspect_allows_allow_details_and_large_nested_evidence_text() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    summary = ArtifactAdminSummary(
+        sha256=SHA256,
+        size_bytes=1,
+        state=ArtifactState.ALLOW,
+        discovered_at=now,
+        updated_at=now,
+        cooldown_until=None,
+        last_error=None,
+    )
+    details = ArtifactAdminDetails(
+        summary=summary,
+        allowed=True,
+        effective_decision=Decision.ALLOW,
+        decision_source=DecisionSource.MANUAL_OVERRIDE,
+        policy_version="policy-1",
+        analyzer_version="analyzer-1",
+        baseline_sha256=None,
+        baseline_tier=None,
+        releases=(),
+        evidence=(
+            EvidenceRecord(
+                rule_id="manual",
+                action=Decision.ALLOW,
+                file_path=None,
+                line=None,
+                message="trusted",
+                details={"note": "x" * 5000},
+            ),
+        ),
+    )
+
+    class DetailsService(Service):
+        def inspect(self, sha256):
+            return details
+
+    response = inspect_artifact(request(DetailsService()))
+    assert response.status_code == 200
+    assert response.json_body["artifact"]["allowed"] is True
+    assert response.json_body["artifact"]["evidence"][0]["details"]["note"] == "x" * 5000
+
+
+def test_inspect_rejects_baseline_tier_without_sha() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    summary = ArtifactAdminSummary(
+        sha256=SHA256,
+        size_bytes=1,
+        state=ArtifactState.REVIEW,
+        discovered_at=now,
+        updated_at=now,
+        cooldown_until=None,
+        last_error=None,
+    )
+    details = ArtifactAdminDetails(
+        summary=summary,
+        allowed=False,
+        effective_decision=Decision.REVIEW,
+        decision_source=DecisionSource.AUTOMATED,
+        policy_version="policy-1",
+        analyzer_version="analyzer-1",
+        baseline_sha256=None,
+        baseline_tier="same_tag",
+        releases=(),
+        evidence=(),
+    )
+
+    class DetailsService(Service):
+        def inspect(self, sha256):
+            return details
+
+    response = inspect_artifact(request(DetailsService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
 
 
 def test_approve_uses_authenticated_actor_and_requires_reason() -> None:

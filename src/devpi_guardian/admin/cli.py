@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import stat
 import sys
@@ -13,7 +12,7 @@ from typing import Any
 
 from devpi_guardian.verdicts.models import validate_sha256
 
-from .client import ApiError, GuardianApiClient, _controls, _json_snapshot
+from .client import ApiError, ClientInputError, GuardianApiClient, _controls, _json_snapshot
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -258,17 +257,11 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
                 auth_token=_auth_token(args),
                 timeout=args.timeout,
             )
-        except ValueError as exc:
-            if (
-                not isinstance(args.timeout, (int, float))
-                or not math.isfinite(args.timeout)
-                or args.timeout <= 0
-            ):
-                raise CliInputError("timeout must be a finite positive number") from exc
-            raise CliInputError("invalid CLI configuration") from exc
+        except ClientInputError as exc:
+            raise CliInputError(str(exc)) from exc
         _print(_call(client, args), as_json=args.as_json)
         return EXIT_OK
-    except CliInputError as exc:
+    except (CliInputError, ClientInputError) as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     except ApiError as exc:
