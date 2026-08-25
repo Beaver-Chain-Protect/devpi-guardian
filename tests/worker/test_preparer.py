@@ -77,7 +77,9 @@ def test_worker_fences_missing_or_corrupt_quarantine_object(tmp_path, corrupt):
     class ClaimStore:
         def __init__(self):
             self.claim = claim(wheel, len(payload))
+            self.original_claim = self.claim
             self.errors = []
+            self.recorded = []
 
         def claim_next(self, worker_id, lease_until):
             item, self.claim = self.claim, None
@@ -86,12 +88,22 @@ def test_worker_fences_missing_or_corrupt_quarantine_object(tmp_path, corrupt):
         def mark_analysis_error(self, item, error):
             self.errors.append((item, error))
 
+        def record_verdict(self, item, verdict, evidence):
+            raise AssertionError("verdict must not be recorded for missing CAS")
+
+    class NeverCalled:
+        def analyze(self, bundle):
+            raise AssertionError("analysis must not run for missing CAS")
+
+        def evaluate(self, target, report):
+            raise AssertionError("policy must not run for missing CAS")
+
     store = ClaimStore()
     worker = QuarantineWorker(
         store=store,
         preparer=QuarantineArtifactPreparer(source=Source(wheel, ()), quarantine=quarantine),
-        analysis_engine=object(),
-        policy_engine=object(),
+        analysis_engine=NeverCalled(),
+        policy_engine=NeverCalled(),
         worker_id="worker",
         now=lambda: datetime.now(UTC),
     )
@@ -100,5 +112,6 @@ def test_worker_fences_missing_or_corrupt_quarantine_object(tmp_path, corrupt):
 
     assert result.status is WorkerCycleStatus.ERROR
     assert len(store.errors) == 1
+    assert store.errors[0][0] == store.original_claim
     assert "quarantine" in store.errors[0][1].lower()
     quarantine.close()

@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from devpi_guardian.verdicts.models import validate_sha256
 
+from .devpi_paths import DevpiRouteError, validate_artifact_relpath
 from .discovery_consumer import ResolvedDiscovery
 
 _CHUNK_SIZE = 1024 * 1024
@@ -23,10 +24,54 @@ def _close_with_primary(stream, primary: BaseException | None) -> None:
         return
     try:
         close()
-    except BaseException as error:
-        if primary is None:
-            raise DevpiArtifactUnavailable("artifact stream close failed") from error
-        primary.add_note(f"artifact stream cleanup failed: {type(error).__name__}: {error}")
+    except BaseException as first:
+        try:
+            closed = bool(stream.closed)
+        except BaseException as state_error:
+            first.add_note(f"artifact stream closed-state check failed: {state_error}")
+            closed = False
+        retried = False
+        if not closed:
+            try:
+                close()
+                retried = True
+            except BaseException as second:
+                first.add_note(
+                    f"artifact stream second close failed: {type(second).__name__}: {second}"
+                )
+        if primary is None and not retried:
+            raise DevpiArtifactUnavailable("artifact stream close failed") from first
+        if primary is not None:
+            primary.add_note(f"artifact stream cleanup failed: {type(first).__name__}: {first}")
+
+
+def _close_response_stack(stack, response, primary: BaseException | None) -> None:
+    """Close one ExitStack-owned response, retrying only a failed callback."""
+
+    try:
+        stack.close()
+    except BaseException as first:
+        # The callback already attempted one close.  A second attempt is safe
+        # only when the response still reports itself open.
+        retried = False
+        if response is not None:
+            try:
+                closed = bool(response.closed)
+            except BaseException as state_error:
+                first.add_note(f"upstream response closed-state check failed: {state_error}")
+                closed = False
+            if not closed:
+                try:
+                    response.close()
+                    retried = True
+                except BaseException as second:
+                    first.add_note(
+                        f"upstream response second close failed: {type(second).__name__}: {second}"
+                    )
+        if primary is None and not retried:
+            raise DevpiArtifactUnavailable("upstream response close failed") from first
+        if primary is not None:
+            primary.add_note(f"upstream response cleanup failed: {type(first).__name__}: {first}")
 
 
 class DevpiArtifactBytesSource:
@@ -35,7 +80,9 @@ class DevpiArtifactBytesSource:
 
     def iter_chunks(self, resolved: ResolvedDiscovery) -> Iterable[bytes]:
         validate_sha256(resolved.sha256)
-        self._validate_relpath(resolved.relpath, resolved.source_stage, resolved.filename)
+        self._validate_relpath(
+            resolved.relpath, resolved.source_stage, resolved.filename, resolved.sha256
+        )
 
         stream = None
         upstream = None
@@ -58,7 +105,9 @@ class DevpiArtifactBytesSource:
                 if advertised != resolved.sha256:
                     raise DevpiArtifactUnavailable("devpi file entry SHA-256 does not match")
                 entry_relpath = entry.relpath
-                self._validate_relpath(entry_relpath, resolved.source_stage, resolved.filename)
+                self._validate_relpath(
+                    entry_relpath, resolved.source_stage, resolved.filename, resolved.sha256
+                )
                 if entry_relpath != resolved.relpath:
                     raise DevpiArtifactUnavailable("devpi file entry relpath does not match")
                 exists = entry.file_exists()
@@ -91,6 +140,7 @@ class DevpiArtifactBytesSource:
             raise DevpiArtifactUnavailable("source stage no longer exists")
         self._validate_upstream_url(upstream, resolved)
         stack = contextlib.ExitStack()
+        response = None
         try:
             response = stage.http.stream(stack, "GET", upstream, allow_redirects=False)
             status = getattr(response, "status_code", None)
@@ -102,43 +152,23 @@ class DevpiArtifactBytesSource:
                         raise DevpiArtifactUnavailable("upstream returned non-bytes")
                     yield chunk
         except BaseException as primary:
-            try:
-                stack.close()
-            except BaseException as cleanup:
-                primary.add_note(
-                    f"upstream response cleanup failed: {type(cleanup).__name__}: {cleanup}"
-                )
+            _close_response_stack(stack, response, primary)
             raise
         else:
-            try:
-                stack.close()
-            except BaseException as cleanup:
-                raise DevpiArtifactUnavailable("upstream response close failed") from cleanup
+            _close_response_stack(stack, response, None)
 
     @staticmethod
-    def _validate_relpath(relpath: str, source_stage: str, filename: str) -> list[str]:
-        if (
-            not isinstance(relpath, str)
-            or not relpath
-            or relpath.startswith("/")
-            or "//" in relpath
-            or "%" in relpath
-            or "\\" in relpath
-            or "?" in relpath
-            or "#" in relpath
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in relpath)
-        ):
-            raise DevpiArtifactUnavailable("invalid devpi file path")
-        parts = relpath.split("/")
-        if (
-            any(part in ("", ".", "..") for part in parts)
-            or len(parts) < 5
-            or "/".join(parts[:2]) != source_stage
-            or parts[2] not in ("+f", "+e")
-            or parts[-1] != filename
-        ):
-            raise DevpiArtifactUnavailable("devpi path metadata does not match discovery")
-        return parts
+    def _validate_relpath(
+        relpath: str, source_stage: str, filename: str, sha256: str
+    ) -> tuple[str, ...]:
+        try:
+            return validate_artifact_relpath(
+                relpath, stage=source_stage, filename=filename, sha256=sha256
+            )
+        except DevpiRouteError as error:
+            raise DevpiArtifactUnavailable(
+                "devpi path metadata does not match discovery"
+            ) from error
 
     @staticmethod
     def _validate_upstream_url(upstream: str, resolved: ResolvedDiscovery) -> None:

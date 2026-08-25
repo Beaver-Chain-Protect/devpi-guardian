@@ -174,27 +174,39 @@ class QuarantineStore:
 
             hasher = hashlib.sha256()
             size = 0
+            output = os.fdopen(staging_fd, "wb", closefd=False)
+            output_error: BaseException | None = None
             try:
-                with os.fdopen(staging_fd, "wb", closefd=True) as output:
-                    staging_fd = None
-                    for chunk in chunks:
-                        if not isinstance(chunk, bytes):
-                            raise QuarantineError("download chunks must be bytes")
-                        size += len(chunk)
-                        if size > self._max_size_bytes:
-                            raise ArtifactTooLarge("artifact exceeds configured size limit")
-                        hasher.update(chunk)
-                        output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
+                for chunk in chunks:
+                    if not isinstance(chunk, bytes):
+                        raise QuarantineError("download chunks must be bytes")
+                    size += len(chunk)
+                    if size > self._max_size_bytes:
+                        raise ArtifactTooLarge("artifact exceeds configured size limit")
+                    hasher.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
             except BaseException as error:
-                if hasher.hexdigest() != digest and isinstance(
-                    error, (ArtifactTooLarge, QuarantineError)
-                ):
-                    # Preserve the primary error; this branch only documents the
-                    # fact that the incomplete stream is intentionally discarded.
-                    pass
-                raise
+                output_error = error
+            try:
+                close_owned(output, "staging output", output_error)
+            except BaseException as close_error:
+                if output_error is None:
+                    output_error = close_error
+                else:
+                    _note_cleanup(output_error, "staging output", close_error)
+            if staging_fd is not None:
+                try:
+                    os.close(staging_fd)
+                except BaseException as close_error:
+                    if output_error is None:
+                        output_error = QuarantineError("staging descriptor close failed")
+                    _note_cleanup(output_error, "staging descriptor", close_error)
+                else:
+                    staging_fd = None
+            if output_error is not None:
+                raise output_error
 
             if hasher.hexdigest() != digest:
                 raise ArtifactHashMismatch("downloaded SHA-256 does not match advertised SHA-256")
@@ -219,7 +231,7 @@ class QuarantineStore:
                 existing = self._open_verified_fd(leaf_fd, digest, candidate, size)
                 if existing is None:
                     raise QuarantineError("existing quarantine object is corrupt") from None
-                existing.close()
+                close_owned(existing, "existing quarantine object")
             if staging_name is not None:
                 os.unlink(staging_name, dir_fd=self._incoming_fd)
                 staging_name = None

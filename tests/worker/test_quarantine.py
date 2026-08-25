@@ -3,12 +3,17 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 
 from devpi_guardian.worker.models import ArtifactCandidate
-from devpi_guardian.worker.quarantine import QuarantineError, QuarantineStore
+from devpi_guardian.worker.quarantine import (
+    ArtifactSizeMismatch,
+    QuarantineError,
+    QuarantineStore,
+)
 
 
 def candidate(payload: bytes, *, size: int | None = None) -> ArtifactCandidate:
@@ -169,6 +174,16 @@ def test_mismatch_cleans_incoming(tmp_path: Path) -> None:
     store.close()
 
 
+def test_matching_digest_with_wrong_expected_size_cleans_incoming(tmp_path: Path) -> None:
+    payload = b"exact payload"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload, size=len(payload) + 1)
+    with pytest.raises(ArtifactSizeMismatch):
+        store.persist(item, [payload])
+    assert not list((store.root_path / ".incoming").iterdir())
+    store.close()
+
+
 def test_corrupt_existing_object_fails_closed(tmp_path: Path) -> None:
     payload = b"correct"
     store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
@@ -230,6 +245,197 @@ def test_hard_linked_object_is_rejected(tmp_path: Path) -> None:
     os.link(path, tmp_path / "hard-link")
     with pytest.raises(QuarantineError):
         store.get_verified(item)
+    store.close()
+
+
+def test_hard_link_added_during_hash_is_rejected(tmp_path: Path, monkeypatch) -> None:
+    payload = b"hash race"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    verified = store.persist(item, [payload])
+    verified._stream.close()
+    path = store.root_path / store.object_relative_path(item.sha256)
+    added = tmp_path / "during-hash"
+    real_sha256 = hashlib.sha256
+
+    class Hash:
+        def __init__(self):
+            self.inner = real_sha256()
+            self.done = False
+
+        def update(self, chunk):
+            self.inner.update(chunk)
+            if not self.done:
+                os.link(path, added)
+                self.done = True
+
+        def hexdigest(self):
+            return self.inner.hexdigest()
+
+    monkeypatch.setattr(hashlib, "sha256", Hash)
+    with pytest.raises(QuarantineError):
+        store.get_verified(item)
+    store.close()
+
+
+def test_final_object_owner_is_revalidated(tmp_path: Path, monkeypatch) -> None:
+    payload = b"owner check"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    verified = store.persist(item, [payload])
+    verified._stream.close()
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: actual_euid + 1)
+    with pytest.raises(QuarantineError):
+        store.get_verified(item)
+    store.close()
+
+
+def test_failing_iterable_cleans_staging(tmp_path: Path) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+
+    def broken():
+        yield b"partial"
+        raise ValueError("source failed")
+
+    with pytest.raises(ValueError, match="source failed"):
+        store.persist(candidate(b"partial"), broken())
+    assert not list((store.root_path / ".incoming").iterdir())
+    store.close()
+
+
+def test_iterator_error_remains_primary_when_staging_close_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    real_fdopen = os.fdopen
+
+    class CloseFailingOutput:
+        def __init__(self, inner):
+            self.inner = inner
+
+        @property
+        def closed(self):
+            return self.inner.closed
+
+        def write(self, data):
+            return self.inner.write(data)
+
+        def flush(self):
+            return self.inner.flush()
+
+        def fileno(self):
+            return self.inner.fileno()
+
+        def close(self):
+            self.inner.close()
+            raise OSError("staging close failed")
+
+    monkeypatch.setattr(
+        os,
+        "fdopen",
+        lambda fd, mode, closefd=False: CloseFailingOutput(real_fdopen(fd, mode, closefd=closefd)),
+    )
+
+    def broken():
+        yield b"partial"
+        raise ValueError("iterator primary")
+
+    with pytest.raises(ValueError, match="iterator primary") as raised:
+        store.persist(candidate(b"partial"), broken())
+    assert any("staging output" in note for note in raised.value.__notes__)
+    assert not list((store.root_path / ".incoming").iterdir())
+    store.close()
+
+
+def test_link_failure_cleans_staging(tmp_path: Path, monkeypatch) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    real_link = os.link
+
+    def fail_link(*args, **kwargs):
+        raise OSError("link failed")
+
+    monkeypatch.setattr(os, "link", fail_link)
+    with pytest.raises(OSError, match="link failed"):
+        store.persist(candidate(b"link failure"), [b"link failure"])
+    assert not list((store.root_path / ".incoming").iterdir())
+    monkeypatch.setattr(os, "link", real_link)
+    store.close()
+
+
+def test_fsync_failure_cleans_staging(tmp_path: Path, monkeypatch) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    real_fsync = os.fsync
+
+    monkeypatch.setattr(os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync failed")))
+    with pytest.raises(OSError, match="fsync failed"):
+        store.persist(candidate(b"fsync failure"), [b"fsync failure"])
+    assert not list((store.root_path / ".incoming").iterdir())
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    store.close()
+
+
+def test_existing_corrupt_close_failure_is_fail_closed(tmp_path: Path, monkeypatch) -> None:
+    payload = b"existing close"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    published = store.persist(item, [payload])
+    published._stream.close()
+    real_open = store._open_verified_fd
+    calls = 0
+
+    class FailingClose(BytesIO):
+        def close(self):
+            raise OSError("existing close failed")
+
+    def open_verified(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FailingClose(payload)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_open_verified_fd", open_verified)
+    with pytest.raises(QuarantineError, match="existing quarantine object close failed"):
+        store.persist(item, [payload])
+    store.close()
+
+
+def test_existing_close_first_failure_retries_then_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    payload = b"existing retry"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    published = store.persist(item, [payload])
+    published._stream.close()
+    real_open = store._open_verified_fd
+    calls = 0
+
+    class RetryClose(BytesIO):
+        def __init__(self, value):
+            super().__init__(value)
+            self.attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("existing first close failed")
+            super().close()
+
+    existing = RetryClose(payload)
+
+    def open_verified(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return existing
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_open_verified_fd", open_verified)
+    with pytest.raises(QuarantineError, match="existing quarantine object close failed"):
+        store.persist(item, [payload])
+    assert existing.attempts == 2 and existing.closed
     store.close()
 
 

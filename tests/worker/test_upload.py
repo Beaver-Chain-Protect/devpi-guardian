@@ -6,9 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from devpi_guardian.baseline.artifact_source import (
+    _canonical_devpi_base,
+    _validate_artifact_url,
+)
 from devpi_guardian.worker.models import VerifiedArtifact
 from devpi_guardian.worker.quarantine import QuarantineError, QuarantineStore
 from devpi_guardian.worker.upload import PrivateUploadConnector
+
+
+def file_relpath(digest: str, filename: str, marker: str = "+f") -> str:
+    if marker == "+f":
+        return f"root/pypi/+f/{digest[:3]}/{digest[3:16]}/{filename}"
+    return f"root/pypi/+e/abc/{filename}"
 
 
 def test_private_upload_publishes_before_discovery_and_never_uses_url(tmp_path):
@@ -20,7 +30,7 @@ def test_private_upload_publishes_before_discovery_and_never_uses_url(tmp_path):
         def __init__(self):
             self.hashes = {"sha256": digest}
             self.size_calls = 0
-            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+            self.relpath = file_relpath(digest, "demo-1.0-py3-none-any.whl")
 
         def file_size(self):
             self.size_calls += 1
@@ -63,7 +73,7 @@ def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
-            self.relpath = "root/pypi/+f/abc/demo_pkg-1.0-py3-none-any.whl"
+            self.relpath = file_relpath(digest, "demo_pkg-1.0-py3-none-any.whl")
 
         def file_size(self):
             return len(payload)
@@ -99,7 +109,7 @@ def test_private_upload_uses_canonical_stage_and_metadata_fidelity(tmp_path):
     assert release.version == "1.0"
     assert release.filename == "demo_pkg-1.0-py3-none-any.whl"
     assert release.origin_url == (
-        "https://devpi.invalid/root/pypi/+f/abc/demo_pkg-1.0-py3-none-any.whl"
+        f"https://devpi.invalid:443/{file_relpath(digest, 'demo_pkg-1.0-py3-none-any.whl')}"
     )
     assert artifact.sha256 == digest and artifact.size_bytes == len(payload)
     assert release.discovered_at == artifact.discovered_at
@@ -113,7 +123,7 @@ def test_private_upload_rejects_inconsistent_filename_metadata(tmp_path):
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
-            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+            self.relpath = file_relpath(digest, "demo-1.0-py3-none-any.whl")
 
         def file_size(self):
             return len(payload)
@@ -160,6 +170,17 @@ def test_private_upload_requires_canonical_base_url(tmp_path):
         quarantine.close()
 
 
+def test_private_upload_origin_matches_f6_artifact_url_grammar():
+    payload = b"private wheel"
+    digest = hashlib.sha256(payload).hexdigest()
+    relpath = file_relpath(digest, "demo-1.0-py3-none-any.whl")
+    origin = f"https://devpi.invalid:443/{relpath}"
+    assert (
+        _validate_artifact_url(origin, digest, _canonical_devpi_base("https://devpi.invalid"))
+        == origin
+    )
+
+
 def test_verified_close_failure_prevents_event_and_discovery():
     payload = b"private wheel"
     digest = hashlib.sha256(payload).hexdigest()
@@ -185,7 +206,7 @@ def test_verified_close_failure_prevents_event_and_discovery():
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
-            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+            self.relpath = file_relpath(digest, "demo-1.0-py3-none-any.whl")
 
         def file_size(self):
             return len(payload)
@@ -246,7 +267,7 @@ def test_verified_close_first_failure_retries_and_still_has_no_side_effects():
     class Entry:
         def __init__(self):
             self.hashes = {"sha256": digest}
-            self.relpath = "root/pypi/+f/abc/demo-1.0-py3-none-any.whl"
+            self.relpath = file_relpath(digest, "demo-1.0-py3-none-any.whl")
 
         def file_size(self):
             return len(payload)

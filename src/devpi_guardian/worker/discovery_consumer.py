@@ -6,9 +6,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from pathlib import PurePosixPath
 from typing import Protocol
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from devpi_common.metadata import normalize_name, splitbasename
 
@@ -16,6 +15,7 @@ from devpi_guardian.verdicts.errors import TransitionConflict
 from devpi_guardian.verdicts.interfaces import ArtifactStore
 from devpi_guardian.verdicts.models import ArtifactInput, ReleaseInput
 
+from .devpi_paths import DevpiBase, DevpiRouteError, validate_artifact_relpath
 from .discovery import DiscoveryCandidate, FileDiscoverySink
 from .models import ArtifactCandidate
 from .quarantine import QuarantineError, QuarantineStore, close_owned
@@ -39,61 +39,27 @@ class ArtifactBytesSource(Protocol):
 
 class SimpleLinkResolver:
     def __init__(self, base_url: str) -> None:
-        parsed = urlsplit(base_url)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError("base_url must be an absolute HTTP(S) URL")
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in ("", "/")
-            or any(char in base_url for char in "\\\x00\n\r\t")
-            or not parsed.hostname.isascii()
-            or any(char.isspace() or char in "/?#\\" for char in parsed.hostname)
-            or "%" in parsed.netloc
-            or "%" in parsed.path
-        ):
-            raise ValueError("base_url must not contain user information")
-        self._base_url = base_url.rstrip("/") + "/"
-        self._origin = (parsed.scheme.lower(), parsed.hostname, parsed.port)
+        try:
+            self._base = DevpiBase.parse(base_url)
+        except DevpiRouteError as error:
+            raise ValueError("base_url must be an absolute canonical HTTP(S) URL") from error
 
     def resolve(self, candidate: DiscoveryCandidate) -> ResolvedDiscovery:
         raw = candidate.link_href
         raw_parts = urlsplit(raw)
-        raw_path = raw_parts.path
-        if (
-            any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw)
-            or "\\" in raw_path
-            or "//" in raw_path
-            or any(segment in (".", "..") for segment in raw_path.split("/"))
-            or "%" in raw_path
-            or raw_parts.query
-        ):
-            raise ValueError("artifact link path is not canonical")
-        absolute = urljoin(self._base_url, candidate.link_href)
-        parsed = urlsplit(absolute)
-        if (parsed.scheme.lower(), parsed.hostname, parsed.port) != self._origin:
-            raise ValueError("artifact link must stay on the configured devpi origin")
-        if parsed.username is not None or parsed.password is not None or parsed.query:
-            raise ValueError("artifact link credentials or query parameters are not accepted")
-        if not parsed.fragment or parsed.fragment != f"sha256={candidate.sha256}":
+        if raw_parts.fragment != f"sha256={candidate.sha256}":
             raise ValueError("artifact link must contain one exact SHA-256 fragment")
-        if "\\" in parsed.path or "//" in parsed.path or "%" in parsed.path:
-            raise ValueError("artifact link path is not canonical")
-        parts = PurePosixPath(parsed.path).parts
-        if parts and parts[0] == "/":
-            parts = parts[1:]
-        if any(part in ("", ".", "..") for part in parts) or len(parts) < 5:
-            raise ValueError("artifact link is not a devpi file path")
-        if parts[2] not in ("+f", "+e") or parts[-1] != candidate.filename:
-            raise ValueError("artifact link is not a devpi file path")
+        try:
+            relpath, canonical_origin = self._base.resolve_link(raw)
+            parts = validate_artifact_relpath(
+                relpath, filename=candidate.filename, sha256=candidate.sha256
+            )
+        except DevpiRouteError as error:
+            raise ValueError("artifact link is not a canonical devpi file path") from error
         parsed_project, version, _extension = splitbasename(candidate.filename)
         if normalize_name(parsed_project) != normalize_name(candidate.project):
             raise ValueError("artifact filename does not match project")
         source_stage = f"{parts[0]}/{parts[1]}"
-        relpath = "/".join(parts)
-        canonical_origin = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
         return ResolvedDiscovery(
             observer_stage=candidate.stage,
             source_stage=source_stage,

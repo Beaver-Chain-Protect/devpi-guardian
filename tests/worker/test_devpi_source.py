@@ -22,7 +22,7 @@ class Entry:
 
     def __init__(self, payload, sha256, url="https://upstream.invalid/a"):
         self.payload, self.hashes, self.url = payload, {"sha256": sha256}, url
-        self.relpath = "root/pypi/+f/abc/demo-1.0.whl"
+        self.relpath = f"root/pypi/+f/{sha256[:3]}/{sha256[3:16]}/demo-1.0.whl"
 
     def file_exists(self):
         return self.payload is not None
@@ -64,8 +64,8 @@ def resolved(sha256="a" * 64):
         "1.0",
         "demo-1.0.whl",
         sha256,
-        "root/pypi/+f/abc/demo-1.0.whl",
-        "https://devpi.invalid/root/pypi/+f/abc/demo-1.0.whl",
+        f"root/pypi/+f/{sha256[:3]}/{sha256[3:16]}/demo-1.0.whl",
+        f"https://devpi.invalid/root/pypi/+f/{sha256[:3]}/{sha256[3:16]}/demo-1.0.whl",
     )
 
 
@@ -84,6 +84,28 @@ def test_cached_source_closes_file_and_does_not_use_http():
     xom, http = xom_for(Entry(b"cached", item.sha256))
     assert b"".join(DevpiArtifactBytesSource(xom).iter_chunks(item)) == b"cached"
     assert http.calls == []
+
+
+def test_cached_source_retries_a_failed_close():
+    item = resolved()
+
+    class RetryClose(BytesIO):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.attempts = 0
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("first close failed")
+            super().close()
+
+    stream = RetryClose(b"cached")
+    entry = Entry(b"cached", item.sha256)
+    entry.file_open_read = lambda: stream
+    xom, _ = xom_for(entry)
+    assert b"".join(DevpiArtifactBytesSource(xom).iter_chunks(item)) == b"cached"
+    assert stream.attempts == 2 and stream.closed
 
 
 def test_uncached_source_uses_internal_stage_client():
@@ -111,11 +133,11 @@ def test_source_rejects_same_origin_upstream_even_without_redirects():
 def test_source_rejects_noncanonical_raw_relpaths():
     item = resolved()
     for bad in (
-        "root//pypi/+f/abc/demo-1.0.whl",
-        "/root/pypi/+f/abc/demo-1.0.whl",
-        "root/pypi/./+f/abc/demo-1.0.whl",
-        "root/pypi/%2e%2e/+f/abc/demo-1.0.whl",
-        "root/pypi/+f/abc\\demo-1.0.whl",
+        "root//pypi/+f/aaa/bbbbbbbbbbbbb/demo-1.0.whl",
+        "/root/pypi/+f/aaa/bbbbbbbbbbbbb/demo-1.0.whl",
+        "root/pypi/./+f/aaa/bbbbbbbbbbbbb/demo-1.0.whl",
+        "root/pypi/%2e%2e/+f/aaa/bbbbbbbbbbbbb/demo-1.0.whl",
+        "root/pypi/+f/aaa/bbbbbbbbbbbbb/demo-1.0.whl\\demo-1.0.whl",
     ):
         bad_item = replace(item, relpath=bad)
         xom, _ = xom_for(Entry(b"cached", item.sha256))
@@ -172,7 +194,7 @@ def test_exitstack_cleanup_error_is_surfaced_on_success():
     )
     with pytest.raises(DevpiArtifactUnavailable, match="response close failed"):
         tuple(DevpiArtifactBytesSource(xom).iter_chunks(item))
-    assert http.response.close_calls == 1
+    assert http.response.close_calls == 2
 
 
 def test_exitstack_cleanup_error_does_not_mask_body_error():
@@ -205,6 +227,40 @@ def test_exitstack_cleanup_error_does_not_mask_body_error():
     with pytest.raises(ValueError, match="body failed") as raised:
         tuple(DevpiArtifactBytesSource(xom).iter_chunks(item))
     assert any("upstream response cleanup failed" in note for note in raised.value.__notes__)
+
+
+def test_exitstack_retries_response_close_once_when_callback_leaves_open():
+    item = resolved()
+
+    class RetryResponse(Response):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.closed = False
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("first response close failed")
+            self.closed = True
+
+    class RetryHttp(Http):
+        def stream(self, stack, method, url, *, allow_redirects):
+            response = RetryResponse(self.payload)
+            stack.callback(response.close)
+            self.response = response
+            return response
+
+    http = RetryHttp(b"upstream")
+    stage = SimpleNamespace(http=http)
+    xom = SimpleNamespace(
+        keyfs=Keyfs(),
+        filestore=SimpleNamespace(
+            get_file_entry=lambda _: Entry(None, item.sha256, "https://upstream.invalid/a")
+        ),
+        model=SimpleNamespace(getstage=lambda *_: stage),
+    )
+    assert b"".join(DevpiArtifactBytesSource(xom).iter_chunks(item)) == b"upstream"
+    assert http.response.close_calls == 2 and http.response.closed
 
 
 def test_cached_descriptor_is_streamed_after_transaction_exit():

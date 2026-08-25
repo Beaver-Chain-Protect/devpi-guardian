@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import PurePath
-from urllib.parse import urlsplit, urlunsplit
 
 from devpi_common.metadata import normalize_name, splitbasename
 
 from devpi_guardian.verdicts.models import ArtifactInput, ReleaseInput, validate_sha256
 
+from .devpi_paths import DevpiBase, DevpiRouteError, validate_artifact_relpath
 from .models import ArtifactCandidate, VerifiedArtifact
 from .quarantine import QuarantineError, QuarantineStore, close_owned
 
@@ -55,8 +55,8 @@ class PrivateUploadConnector:
         relpath_value = getattr(entry, "relpath", None)
         if not isinstance(relpath_value, str):
             raise QuarantineError("private upload has no canonical relpath")
-        relpath = self._validate_relpath(relpath_value, stage_name, filename)
-        origin = urlunsplit((self._base_url[0], self._base_url[1], "/" + relpath, "", ""))
+        relpath = self._validate_relpath(relpath_value, stage_name, filename, digest)
+        origin = self._base_url.origin_for(relpath)
         candidate = ArtifactCandidate(
             stage=stage_name,
             project=project,
@@ -126,60 +126,18 @@ class PrivateUploadConnector:
             raise QuarantineError("private upload metadata does not match filename")
 
     @staticmethod
-    def _validate_base_url(base_url: str) -> tuple[str, str]:
-        if not isinstance(base_url, str) or any(ord(char) < 0x20 for char in base_url):
-            raise ValueError("base_url must be a canonical HTTP(S) URL")
+    def _validate_base_url(base_url: str) -> DevpiBase:
         try:
-            parsed = urlsplit(base_url)
-            port = parsed.port
-        except ValueError as error:
+            return DevpiBase.parse(base_url)
+        except DevpiRouteError as error:
             raise ValueError("base_url must be a canonical HTTP(S) URL") from error
-        host = parsed.hostname
-        if (
-            parsed.scheme.lower() not in ("http", "https")
-            or not host
-            or not host.isascii()
-            or any(char.isspace() or char in "/?#\\" for char in host)
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in ("", "/")
-            or "%" in parsed.path
-            or "%" in parsed.netloc
-            or "\\" in parsed.path
-            or "//" in parsed.path
-            or (port is not None and not 1 <= port <= 65535)
-        ):
-            raise ValueError("base_url must be a canonical HTTP(S) URL")
-        host = host.lower()
-        if ":" in host:
-            host = f"[{host}]"
-        authority = host if port is None else f"{host}:{port}"
-        return parsed.scheme.lower(), authority
 
     @staticmethod
-    def _validate_relpath(relpath: str, stage: str, filename: str) -> str:
-        if (
-            not relpath
-            or relpath.startswith("/")
-            or "//" in relpath
-            or "%" in relpath
-            or "\\" in relpath
-            or "?" in relpath
-            or "#" in relpath
-            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in relpath)
-        ):
-            raise QuarantineError("private upload relpath is not canonical")
-        parts = relpath.split("/")
-        if (
-            any(part in ("", ".", "..") for part in parts)
-            or len(parts) < 5
-            or "/".join(parts[:2]) != stage
-            or parts[2] not in ("+f", "+e")
-            or parts[-1] != filename
-        ):
-            raise QuarantineError("private upload relpath is not canonical")
+    def _validate_relpath(relpath: str, stage: str, filename: str, sha256: str) -> str:
+        try:
+            validate_artifact_relpath(relpath, stage=stage, filename=filename, sha256=sha256)
+        except DevpiRouteError as error:
+            raise QuarantineError("private upload relpath is not canonical") from error
         return relpath
 
     @staticmethod
