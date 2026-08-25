@@ -955,6 +955,54 @@ def test_record_verdict_rejects_cyclic_evidence_details_before_connecting(
         )
 
 
+def test_record_verdict_rejects_cycle_below_diagnostic_evidence_key_before_connecting(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+    details: dict[str, Any] = {}
+    cycle: dict[str, Any] = {}
+    cycle["self"] = cycle
+    details["message"] = cycle
+
+    with pytest.raises(ValueError, match="details"):
+        store.record_verdict(
+            claim_input(),
+            verdict(),
+            [unchecked_evidence(details=details)],
+        )
+
+
+def test_record_verdict_redacts_nested_credential_fields_at_persistence_boundary(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    digest = "a" * 64
+
+    store.record_verdict(
+        claim,
+        verdict(),
+        [
+            evidence(
+                details={
+                    "message": {
+                        "client_secret": "nested-secret",
+                        "sha256": digest,
+                    }
+                }
+            )
+        ],
+    )
+
+    details_json = fetchall(store, "SELECT details_json FROM evidence")[0][0]
+
+    assert details_json == (f'{{"message":{{"client_secret":"[REDACTED]","sha256":"{digest}"}}}}')
+
+
 @pytest.mark.parametrize(
     "trigger_sql",
     [

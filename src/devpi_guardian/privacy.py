@@ -23,6 +23,7 @@ _SENSITIVE_KEY = (
     r"|secret"
     r"|api[-_ ]?key"
     r"|credential"
+    r"|authorization"
     r")"
 )
 _HEADER_CREDENTIAL = re.compile(
@@ -33,8 +34,8 @@ _HEADER_CREDENTIAL = re.compile(
     r"(?P<separator>\s*[:=]\s*)"
     r"(?:(?P<scheme>Bearer|Basic)(?P<scheme_separator>\s+))?"
     r"(?:"
-    r"(?P<quote>['\"])(?P<quoted>[^'\"]*)(?P=quote)"
-    r"|(?P<bare>[^\s,;]+)"
+    r"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    r"|(?P<bare>[^\s,;}\]]+)"
     r")"
 )
 _SECRET_ASSIGNMENT = re.compile(
@@ -44,24 +45,32 @@ _SECRET_ASSIGNMENT = re.compile(
     rf"(?P=key_quote)"
     rf"(?P<separator>\s*[:=]\s*)"
     rf"(?:"
-    rf"(?P<quote>['\"])(?P<quoted>[^'\"]*)(?P=quote)"
-    rf"|(?P<bare>[^\s,;]+)"
+    rf"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    rf"|(?P<bare>[^\s,;}}\[\]]+)"
     rf")"
 )
 _AUTH_SCHEME = re.compile(
     r"(?ix)"
     r"(?P<scheme>(?<![\w])(?:Bearer|Basic))(?:\s+)"
     r"(?:"
-    r"(?P<quote>['\"])(?P<quoted>[^'\"]*)(?P=quote)"
-    r"|(?P<bare>[^\s,;]+)"
+    r"(?P<quote>['\"])(?P<quoted>(?:\\.|(?! (?P=quote) ).)*)(?P=quote)"
+    r"|(?P<bare>[^\s,;}\]]+)"
     r")"
 )
 _DIGEST = re.compile(r"(?i)\b[0-9a-f]{64}\b")
 _POSIX_PATH_WITH_SPACES = re.compile(
-    r"(?<![\w:])/(?!\+)(?:[^/\n,;:'\"<>{}=]+/)+"
-    r"[^/\s,;:'\"<>{}=]+(?:\.[A-Za-z0-9]+)"
+    r"(?<![\w:])/(?!\+)"
+    r"(?=[^\n,;:'\"<>{}=]*\s)"
+    r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
+    r"[^\n,;:'\"<>{}=]+"
 )
 _POSIX_PATH = re.compile(r"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s,;:'\"]+")
+_WINDOWS_PATH_WITH_SPACES = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
+    r"(?=[^\n,;:'\"<>{}=]*\s)"
+    r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
+    r"[^\n,;:'\"<>{}=]+"
+)
 _WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;:'\"]+")
 _DIAGNOSTIC_FIELDS = frozenset(
     {
@@ -76,6 +85,9 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "sink",
     }
 )
+_IDENTITY_FIELDS = frozenset({"sha256", "baseline_sha256", "fingerprint"})
+_CANONICAL_IDENTITY = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_SENSITIVE_KEY_NAME = re.compile(rf"(?ix)^{_SENSITIVE_KEY}$")
 
 
 def _replace_credential(match: re.Match[str]) -> str:
@@ -118,6 +130,7 @@ def sanitize_diagnostic(value: object) -> str:
     text = _AUTH_SCHEME.sub(_replace_auth_scheme, text)
     text = _POSIX_PATH_WITH_SPACES.sub("[PATH]", text)
     text = _POSIX_PATH.sub("[PATH]", text)
+    text = _WINDOWS_PATH_WITH_SPACES.sub("[PATH]", text)
     text = _WINDOWS_PATH.sub("[PATH]", text)
     text = _DIGEST.sub("[DIGEST]", text)
     return text[:MAX_DIAGNOSTIC_LENGTH]
@@ -128,6 +141,7 @@ def sanitize_diagnostic_fields(
     *,
     _depth: int = 0,
     _seen: set[int] | None = None,
+    _diagnostic_context: bool = False,
 ) -> object:
     """Sanitize only diagnostic-shaped fields in a JSON-compatible graph."""
 
@@ -140,12 +154,46 @@ def sanitize_diagnostic_fields(
             raise ValueError("diagnostic graph contains a cycle")
         seen.add(identity)
         try:
-            return {
-                key: sanitize_diagnostic(item)
-                if key in _DIAGNOSTIC_FIELDS and item is not None
-                else sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen)
-                for key, item in value.items()
-            }
+            result: dict[object, object] = {}
+            for key, item in value.items():
+                if isinstance(key, str) and key in _IDENTITY_FIELDS:
+                    if isinstance(item, str) and _CANONICAL_IDENTITY.fullmatch(item):
+                        result[key] = item
+                    elif isinstance(item, (Mapping, list, tuple)):
+                        result[key] = sanitize_diagnostic_fields(
+                            item,
+                            _depth=_depth + 1,
+                            _seen=seen,
+                            _diagnostic_context=_diagnostic_context,
+                        )
+                    elif isinstance(item, str):
+                        result[key] = sanitize_diagnostic(item)
+                    else:
+                        result[key] = item
+                elif isinstance(key, str) and _SENSITIVE_KEY_NAME.fullmatch(key):
+                    if isinstance(item, (Mapping, list, tuple)):
+                        sanitize_diagnostic_fields(
+                            item,
+                            _depth=_depth + 1,
+                            _seen=seen,
+                            _diagnostic_context=True,
+                        )
+                    result[key] = None if item is None else "[REDACTED]"
+                elif isinstance(key, str) and key in _DIAGNOSTIC_FIELDS and item is not None:
+                    result[key] = sanitize_diagnostic_fields(
+                        item,
+                        _depth=_depth + 1,
+                        _seen=seen,
+                        _diagnostic_context=True,
+                    )
+                else:
+                    result[key] = sanitize_diagnostic_fields(
+                        item,
+                        _depth=_depth + 1,
+                        _seen=seen,
+                        _diagnostic_context=_diagnostic_context,
+                    )
+            return result
         finally:
             seen.discard(identity)
     if isinstance(value, list):
@@ -155,7 +203,13 @@ def sanitize_diagnostic_fields(
         seen.add(identity)
         try:
             return [
-                sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen) for item in value
+                sanitize_diagnostic_fields(
+                    item,
+                    _depth=_depth + 1,
+                    _seen=seen,
+                    _diagnostic_context=_diagnostic_context,
+                )
+                for item in value
             ]
         finally:
             seen.discard(identity)
@@ -166,8 +220,14 @@ def sanitize_diagnostic_fields(
         seen.add(identity)
         try:
             return tuple(
-                sanitize_diagnostic_fields(item, _depth=_depth + 1, _seen=seen) for item in value
+                sanitize_diagnostic_fields(
+                    item,
+                    _depth=_depth + 1,
+                    _seen=seen,
+                    _diagnostic_context=_diagnostic_context,
+                )
+                for item in value
             )
         finally:
             seen.discard(identity)
-    return value
+    return sanitize_diagnostic(value) if _diagnostic_context and isinstance(value, str) else value

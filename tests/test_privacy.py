@@ -93,6 +93,45 @@ def test_sanitize_diagnostic_redacts_posix_paths_with_spaces() -> None:
     assert result == "download failed at [PATH]"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "download failed at /Users/alice/My Secret/cache dir",
+        "download failed at /tmp/My Dir",
+        r"download failed at C:\Users\alice\My Secret\cache dir",
+        r"download failed at C:\My Dir",
+        r"download failed at \\fileserver\Share Name\cache dir",
+        r"download failed at \\server\Share Name",
+    ],
+)
+def test_sanitize_diagnostic_redacts_complete_extensionless_paths_with_spaces(
+    value: str,
+) -> None:
+    result = sanitize_diagnostic(value)
+
+    assert result == "download failed at [PATH]"
+
+
+def test_sanitize_diagnostic_redacts_json_escaped_quoted_secret_value() -> None:
+    value = r'{"client_secret":"abc\"def"}'
+
+    result = sanitize_diagnostic(value)
+
+    assert "abc" not in result
+    assert "def" not in result
+    assert result == r'{"client_secret":[REDACTED]}'
+
+
+def test_sanitize_diagnostic_redacts_json_escaped_header_credential() -> None:
+    value = r'{"Authorization":"Bearer abc\"def"}'
+
+    result = sanitize_diagnostic(value)
+
+    assert "abc" not in result
+    assert "def" not in result
+    assert result == r'{"Authorization":[REDACTED]}'
+
+
 def test_sanitize_diagnostic_does_not_consume_following_prose_after_path() -> None:
     value = "download failed at /tmp/a.whl while retrying"
 
@@ -105,3 +144,54 @@ def test_sanitize_diagnostic_fields_rejects_cycles() -> None:
 
     with pytest.raises(ValueError, match="cycle"):
         sanitize_diagnostic_fields(value)
+
+
+def test_sanitize_diagnostic_fields_rejects_cycle_below_diagnostic_key() -> None:
+    cycle: dict[str, object] = {}
+    cycle["self"] = cycle
+    value = {"message": cycle}
+
+    with pytest.raises(ValueError, match="cycle"):
+        sanitize_diagnostic_fields(value)
+
+
+def test_sanitize_diagnostic_fields_preserves_structured_shape_and_safe_digests() -> None:
+    digest = "a" * 64
+    value = {
+        "message": {
+            "auth_token": "nested-token",
+            "nested": [{"client_secret": "nested-secret"}],
+            "sha256": digest,
+            "baseline_sha256": digest,
+            "fingerprint": digest,
+        }
+    }
+
+    result = sanitize_diagnostic_fields(value)
+
+    assert result == {
+        "message": {
+            "auth_token": "[REDACTED]",
+            "nested": [{"client_secret": "[REDACTED]"}],
+            "sha256": digest,
+            "baseline_sha256": digest,
+            "fingerprint": digest,
+        }
+    }
+
+
+def test_sanitize_diagnostic_fields_redacts_noncanonical_identity_values() -> None:
+    value = {"message": {"sha256": "https://user:secret@example.invalid/a.whl"}}
+
+    result = sanitize_diagnostic_fields(value)
+
+    assert result == {"message": {"sha256": "[URL]"}}
+
+
+def test_sanitize_diagnostic_fields_rejects_deep_composite_below_diagnostic_key() -> None:
+    value: object = "leaf"
+    for _ in range(34):
+        value = [value]
+
+    with pytest.raises(ValueError, match="deeply nested"):
+        sanitize_diagnostic_fields({"message": value})

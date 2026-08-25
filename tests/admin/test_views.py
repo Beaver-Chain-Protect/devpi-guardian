@@ -89,6 +89,43 @@ def test_response_defense_in_depth_sanitizes_legacy_evidence_without_redacting_s
     assert response.json_body["diff"]["sha256"] == digest
 
 
+def test_response_defense_in_depth_sanitizes_structured_escaped_credentials_and_paths() -> None:
+    digest = "a" * 64
+    response = _response(
+        {
+            "artifact": {
+                "summary": {"sha256": digest, "baseline_sha256": digest},
+                "evidence": [
+                    {
+                        "details": {
+                            "message": {
+                                "client_secret": r"abc\"def",
+                                "Authorization": r"Bearer abc\"def",
+                                "posix_path": "/tmp/My Secret/cache dir",
+                                "windows_path": r"C:\My Secret\cache dir",
+                                "sha256": digest,
+                            }
+                        }
+                    }
+                ],
+            }
+        }
+    )
+
+    details = response.json_body["artifact"]["evidence"][0]["details"]
+    rendered = str(response.json_body)
+
+    assert details["message"]["client_secret"] == "[REDACTED]"
+    assert details["message"]["Authorization"] == "[REDACTED]"
+    assert "abc" not in rendered
+    assert "def" not in rendered
+    assert "/tmp/My Secret/cache dir" not in rendered
+    assert r"C:\My Secret\cache dir" not in rendered
+    assert details["message"]["sha256"] == digest
+    assert response.json_body["artifact"]["summary"]["sha256"] == digest
+    assert response.json_body["artifact"]["summary"]["baseline_sha256"] == digest
+
+
 class Service:
     def health(self):
         return {"database": "ok"}
