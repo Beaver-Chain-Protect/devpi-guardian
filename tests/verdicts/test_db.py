@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from devpi_guardian.verdicts import db
-from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+from devpi_guardian.verdicts.db import ConnectionFactory, migrate, trusted_connection_identity
 from devpi_guardian.verdicts.errors import MigrationError, StoreUnavailable
 
 
@@ -344,6 +345,38 @@ def test_connection_enables_required_pragmas(tmp_path) -> None:
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 4321
         recursive = connection.execute("PRAGMA recursive_triggers").fetchone()
         assert recursive[0] == 1
+
+
+def test_connection_captures_trusted_identity_for_new_database(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "new.db")
+    connection = factory.connect()
+    try:
+        identity = trusted_connection_identity(connection)
+    finally:
+        connection.close()
+    assert identity is not None
+    assert identity[0] == "file"
+    assert identity[1] == str(factory.path.resolve())
+    assert type(identity[2]) is int
+    assert type(identity[3]) is int
+
+
+def test_connection_rejects_path_replacement_during_open(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "guardian.db"
+    replacement = tmp_path / "replacement.db"
+    with closing(sqlite3.connect(replacement)) as connection:
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        connection.commit()
+    real_connect = db.sqlite3.connect
+
+    def swapping_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        os.replace(replacement, path)
+        return connection
+
+    monkeypatch.setattr(db.sqlite3, "connect", swapping_connect)
+    with pytest.raises(StoreUnavailable):
+        ConnectionFactory(path).connect()
 
 
 @pytest.mark.parametrize(

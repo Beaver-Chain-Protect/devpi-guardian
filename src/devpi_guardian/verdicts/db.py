@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import closing, suppress
 from dataclasses import dataclass
@@ -30,6 +31,42 @@ _CATALOG_QUERY = """
 _Catalog = tuple[tuple[object, ...], ...]
 
 
+class _TrustedConnection(sqlite3.Connection):
+    """Connection carrying identity captured atomically with its open."""
+
+    _devpi_guardian_identity: tuple[object, ...] | None = None
+
+
+def trusted_connection_identity(
+    connection: sqlite3.Connection,
+) -> tuple[object, ...] | None:
+    """Return the factory-authenticated file identity, if available."""
+
+    if type(connection) is not _TrustedConnection:
+        return None
+    identity = connection._devpi_guardian_identity
+    if type(identity) is not tuple:
+        return None
+    return identity
+
+
+def _open_identity_sentinel(path: str) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    return descriptor, os.fstat(descriptor)
+
+
+def _captured_file_identity(
+    path: str, descriptor: int, before: os.stat_result
+) -> tuple[object, ...]:
+    after = os.stat(path)
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        raise OSError("database path changed while opening")
+    return ("file", path, before.st_dev, before.st_ino)
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectionFactory:
     path: Path
@@ -44,12 +81,21 @@ class ConnectionFactory:
 
     def connect(self) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
+        descriptor: int | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            requested_path = os.fspath(self.path)
+            if requested_path == ":memory:":
+                database_path = requested_path
+                before = None
+            else:
+                database_path = os.path.realpath(os.path.abspath(requested_path))
+                descriptor, before = _open_identity_sentinel(database_path)
             connection = sqlite3.connect(
-                self.path,
+                database_path,
                 isolation_level=None,
                 timeout=self.busy_timeout_ms / 1000,
+                factory=_TrustedConnection,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
@@ -68,12 +114,26 @@ class ConnectionFactory:
                 )
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+            if (
+                type(connection) is _TrustedConnection
+                and descriptor is not None
+                and before is not None
+            ):
+                connection._devpi_guardian_identity = _captured_file_identity(
+                    database_path,
+                    descriptor,
+                    before,
+                )
             return connection
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:
                 with suppress(OSError, sqlite3.Error):
                     connection.close()
             raise StoreUnavailable(str(self.path)) from exc
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
 
 
 def _version_out_of_range(version: int) -> bool:

@@ -297,6 +297,23 @@ def test_writer_cache_reuses_verified_prefix_across_fresh_connections(tmp_path):
     assert suffix_scans == 3
 
 
+def test_writer_does_not_share_cache_for_raw_sqlite_connections(tmp_path):
+    factory = _db(tmp_path)
+    writer = SQLiteAuditWriter()
+    statements = []
+    for number in range(2):
+        with closing(sqlite3.connect(factory.path)) as connection:
+            connection.set_trace_callback(statements.append)
+            connection.execute("BEGIN IMMEDIATE")
+            writer.append_in_transaction(connection, _event(number))
+            connection.commit()
+    full_scans = sum(
+        "FROM audit_events ORDER BY id" in statement and "WHERE" not in statement
+        for statement in statements
+    )
+    assert full_scans == 2
+
+
 def test_writer_cache_regression_after_outer_rollback_is_repaired(tmp_path):
     factory = _db(tmp_path)
     writer = SQLiteAuditWriter()
@@ -367,6 +384,45 @@ def test_cache_does_not_cross_same_path_database_replacement(tmp_path):
         writer.append_in_transaction(connection, _event(2))
         connection.commit()
     assert verify_audit_chain(factory).valid is True
+
+
+def test_cached_writer_rejects_corrupt_replacement_after_open_connection(tmp_path):
+    factory = _db(tmp_path)
+    replacement = _db(tmp_path / "replacement")
+    writer = SQLiteAuditWriter()
+    old_connection = factory.connect()
+    old_connection.execute("BEGIN IMMEDIATE")
+    writer.append_in_transaction(old_connection, _event(1))
+    writer.append_in_transaction(old_connection, _event(2))
+    old_connection.commit()
+    with closing(replacement.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        replacement_writer = SQLiteAuditWriter()
+        replacement_writer.append_in_transaction(connection, _event(1))
+        replacement_writer.append_in_transaction(connection, _event(2))
+        connection.commit()
+        connection.execute("DROP TRIGGER audit_events_update_guard")
+        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
+        connection.execute(
+            """
+            CREATE TRIGGER audit_events_update_guard
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit events are append-only');
+            END
+            """
+        )
+    os.replace(replacement.path, factory.path)
+    wal_path = factory.path.with_name(f"{factory.path.name}-wal")
+    if wal_path.exists():
+        wal_path.unlink()
+    try:
+        with closing(factory.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with pytest.raises(StoreUnavailable):
+                writer.append_in_transaction(connection, _event(3))
+    finally:
+        old_connection.close()
 
 
 def test_persisted_fields_are_exact_and_expected_head_succeeds(tmp_path):
