@@ -17,6 +17,7 @@ from devpi_guardian.audit import (
 from devpi_guardian.audit.writer import _event_hash
 from devpi_guardian.policy import PolicyConfig, PolicyEngine
 from devpi_guardian.verdicts import ConnectionFactory, Decision, migrate
+from devpi_guardian.verdicts import db as verdicts_db
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.models import AuditEventInput, VerdictInput
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
@@ -152,6 +153,11 @@ class _ProcessCleanupConnection(_CleanupFailureConnection):
         raise KeyboardInterrupt("close interrupted")
 
 
+class _PrimaryProcessCleanupConnection(_ProcessCleanupConnection):
+    def execute(self, _sql, *_args, **_kwargs):
+        raise sqlite3.OperationalError("primary failed")
+
+
 class _CleanupFailureFactory:
     def __init__(self, factory, *, primary=False):
         self._factory = factory
@@ -172,6 +178,11 @@ class _CleanupFailureFactory:
 class _ProcessCleanupFactory(_CleanupFailureFactory):
     def connect(self):
         return _ProcessCleanupConnection(self._factory.connect())
+
+
+class _PrimaryProcessCleanupFactory(_CleanupFailureFactory):
+    def connect(self):
+        return _PrimaryProcessCleanupConnection(self._factory.connect())
 
 
 class _TraceFactory:
@@ -221,6 +232,12 @@ def test_verifier_does_not_hide_process_control_cleanup_failure(tmp_path):
     factory = _db(tmp_path)
     with pytest.raises(KeyboardInterrupt, match="close interrupted"):
         verify_audit_chain(_ProcessCleanupFactory(factory))
+
+
+def test_verifier_cleanup_process_control_wins_over_primary_error(tmp_path):
+    factory = _db(tmp_path)
+    with pytest.raises(KeyboardInterrupt, match="close interrupted"):
+        verify_audit_chain(_PrimaryProcessCleanupFactory(factory))
 
 
 def test_writer_rejects_same_name_noop_trigger_before_using_cache(tmp_path):
@@ -413,9 +430,60 @@ def test_cached_writer_rejects_corrupt_replacement_after_open_connection(tmp_pat
             """
         )
     os.replace(replacement.path, factory.path)
-    wal_path = factory.path.with_name(f"{factory.path.name}-wal")
-    if wal_path.exists():
-        wal_path.unlink()
+    try:
+        with pytest.raises(StoreUnavailable), closing(factory.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            writer.append_in_transaction(connection, _event(3))
+    finally:
+        old_connection.close()
+
+
+def test_cached_writer_rejects_aba_replacement_during_connection_open(tmp_path, monkeypatch):
+    factory = _db(tmp_path)
+    replacement = _db(tmp_path / "replacement")
+    backup = tmp_path / "original.db"
+    writer = SQLiteAuditWriter()
+    old_connection = factory.connect()
+    old_connection.execute("BEGIN IMMEDIATE")
+    writer.append_in_transaction(old_connection, _event(1))
+    writer.append_in_transaction(old_connection, _event(2))
+    old_connection.commit()
+    with closing(replacement.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        replacement_writer = SQLiteAuditWriter()
+        replacement_writer.append_in_transaction(connection, _event(1))
+        replacement_writer.append_in_transaction(connection, _event(2))
+        connection.commit()
+        connection.execute("DROP TRIGGER audit_events_update_guard")
+        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
+        connection.execute(
+            """
+            CREATE TRIGGER audit_events_update_guard
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit events are append-only');
+            END
+            """
+        )
+    old_wal = factory.path.with_name(f"{factory.path.name}-wal")
+    if old_wal.exists():
+        old_wal.unlink()
+    real_connect = sqlite3.connect
+
+    def aba_connect(*args, **kwargs):
+        os.replace(factory.path, backup)
+        os.replace(replacement.path, factory.path)
+        connection = real_connect(*args, **kwargs)
+        os.replace(factory.path, replacement.path)
+        os.replace(backup, factory.path)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", aba_connect)
+    monkeypatch.setattr(
+        verdicts_db,
+        "_captured_file_identity",
+        lambda path, descriptor, before: ("file", path, before.st_dev, before.st_ino),
+    )
     try:
         with closing(factory.connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")

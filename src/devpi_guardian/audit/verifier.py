@@ -135,12 +135,16 @@ def verify_audit_chain(
                         "additional audit cleanup failed: "
                         f"{type(cleanup_error).__name__}: {cleanup_error}"
                     )
-            if primary is not None:
+            if process_control is not None:
+                if primary is not None:
+                    process_control.add_note(
+                        f"primary audit verification failed: {type(primary).__name__}: {primary}"
+                    )
+                primary = process_control
+            elif primary is not None:
                 primary.add_note(
                     f"audit cleanup failed: {type(note_target).__name__}: {note_target}"
                 )
-            elif process_control is not None:
-                primary = process_control
             else:
                 primary = StoreUnavailable(str(getattr(factory, "path", "audit database")))
                 primary.__cause__ = cleanup_errors[0]

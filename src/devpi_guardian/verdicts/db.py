@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
+from threading import RLock
 
 from .errors import MigrationError, StoreUnavailable
 
@@ -29,12 +30,25 @@ _CATALOG_QUERY = """
     ORDER BY type, name, tbl_name, sql
 """
 _Catalog = tuple[tuple[object, ...], ...]
+# An open trusted connection pins the observed main inode.  A path rotation
+# while it is live is rejected before SQLite can combine a new main file with
+# the old connection's WAL generation.
+_ACTIVE_CONNECTIONS: dict[str, set[tuple[int, int]]] = {}
+_ACTIVE_CONNECTIONS_LOCK = RLock()
 
 
 class _TrustedConnection(sqlite3.Connection):
     """Connection carrying identity captured atomically with its open."""
 
     _devpi_guardian_identity: tuple[object, ...] | None = None
+    _devpi_guardian_registered = False
+
+    def close(self) -> None:
+        super().close()
+        identity = self._devpi_guardian_identity
+        if self._devpi_guardian_registered and identity is not None:
+            _unregister_connection(identity)
+            self._devpi_guardian_registered = False
 
 
 def trusted_connection_identity(
@@ -55,7 +69,34 @@ def _open_identity_sentinel(path: str) -> tuple[int, os.stat_result]:
         descriptor = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    return descriptor, os.fstat(descriptor)
+    before = os.fstat(descriptor)
+    identity = (before.st_dev, before.st_ino)
+    with _ACTIVE_CONNECTIONS_LOCK:
+        active = _ACTIVE_CONNECTIONS.get(path, set())
+        if active and identity not in active:
+            os.close(descriptor)
+            raise OSError("database main file changed while a connection was open")
+    return descriptor, before
+
+
+def _register_connection(connection: _TrustedConnection, identity: tuple[object, ...]) -> None:
+    path = identity[1]
+    inode = (identity[2], identity[3])
+    with _ACTIVE_CONNECTIONS_LOCK:
+        _ACTIVE_CONNECTIONS.setdefault(path, set()).add(inode)
+    connection._devpi_guardian_registered = True
+
+
+def _unregister_connection(identity: tuple[object, ...]) -> None:
+    path = identity[1]
+    inode = (identity[2], identity[3])
+    with _ACTIVE_CONNECTIONS_LOCK:
+        active = _ACTIVE_CONNECTIONS.get(path)
+        if active is None:
+            return
+        active.discard(inode)
+        if not active:
+            _ACTIVE_CONNECTIONS.pop(path, None)
 
 
 def _captured_file_identity(
@@ -119,11 +160,13 @@ class ConnectionFactory:
                 and descriptor is not None
                 and before is not None
             ):
-                connection._devpi_guardian_identity = _captured_file_identity(
+                identity = _captured_file_identity(
                     database_path,
                     descriptor,
                     before,
                 )
+                connection._devpi_guardian_identity = identity
+                _register_connection(connection, identity)
             return connection
         except (OSError, sqlite3.Error) as exc:
             if connection is not None:

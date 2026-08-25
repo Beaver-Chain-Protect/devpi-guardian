@@ -44,6 +44,7 @@ _REQUIRED_SCHEMA_OBJECTS = frozenset(
 @dataclass(frozen=True, slots=True)
 class _VerifiedPrefix:
     identity: tuple[object, ...]
+    source_connection: sqlite3.Connection
     schema: tuple[tuple[str, str, str], ...]
     schema_version: int
     count: int
@@ -341,7 +342,9 @@ class SQLiteAuditWriter:
         The cache is instance-local and bound to the canonical database file
         identity plus its immutable audit schema catalog. It is never advanced
         after this method returns, so an outer transaction may roll back safely;
-        a later count regression or schema change forces a cold full scan.
+        a later count regression or schema change forces a cold full scan. A
+        cross-connection cache entry is used only after its source connection
+        has closed; an open source forces a cold scan to cover open-FD ABA.
         """
         with self._cache_lock:
             identity = trusted_connection_identity(connection)
@@ -358,9 +361,16 @@ class SQLiteAuditWriter:
                 raise StoreUnavailable("audit database")
             count = count_row[0]
             cache = self._cache
+            source_usable = cache is not None and cache.source_connection is connection
+            if cache is not None and not source_usable and identity[0] != "connection":
+                try:
+                    cache.source_connection.execute("SELECT 1")
+                except Exception:
+                    source_usable = True
             usable = (
                 cache is not None
                 and cache.identity == identity
+                and source_usable
                 and cache.schema == schema
                 and cache.schema_version == schema_version
                 and count >= cache.count
@@ -399,7 +409,14 @@ class SQLiteAuditWriter:
                     head=ZERO_HASH,
                     expected_count=count,
                 )
-            self._cache = _VerifiedPrefix(identity, schema, schema_version, verified_count, head)
+            self._cache = _VerifiedPrefix(
+                identity,
+                connection,
+                schema,
+                schema_version,
+                verified_count,
+                head,
+            )
             return verified_count, head
 
     def append_in_transaction(
