@@ -497,58 +497,79 @@ class PolicyEngine:
                 raise PolicyInputError("file diff paths must be globally unique")
         seen_evidence: dict[tuple[object, ...], tuple[object, ...]] = {}
         deduplicated_evidence: list[AnalysisEvidence] = []
+        raw_evidence_values: list[tuple[object, ...]] = []
         analyzer_error_findings: set[str] = set()
         for item in evidence_snapshot:
-            if (
-                type(item) is not AnalysisEvidence
-                or type(item.analyzer) is not str
-                or item.analyzer not in _ANALYZERS
-            ):
+            if type(item) is not AnalysisEvidence:
                 raise PolicyInputError("invalid analysis evidence")
-            if type(item.finding) is not Finding:
+            item_analyzer = item.analyzer
+            item_finding = item.finding
+            item_origin = item.origin
+            item_baseline_tier = item.baseline_tier
+            if type(item_analyzer) is not str or item_analyzer not in _ANALYZERS:
+                raise PolicyInputError("invalid analysis evidence")
+            if type(item_finding) is not Finding:
                 raise PolicyInputError("invalid finding")
+            finding_snapshot = Finding(
+                item_finding.rule,
+                item_finding.action,
+                item_finding.file,
+                item_finding.line,
+                item_finding.snippet,
+                item_finding.message,
+                item_finding.source,
+                item_finding.sink,
+            )
             try:
-                _validate_finding(item.finding)
+                _validate_finding(finding_snapshot)
             except ValueError as exc:
                 raise PolicyInputError(str(exc)) from exc
-            if item.origin is not None:
+            if item_origin is not None:
                 try:
-                    _validate_text(item.origin, "evidence origin")
+                    _validate_text(item_origin, "evidence origin")
                 except ValueError as exc:
                     raise PolicyInputError(str(exc)) from exc
-            if item.baseline_tier is not None and type(item.baseline_tier) is not str:
+            if item_baseline_tier is not None and type(item_baseline_tier) is not str:
                 raise PolicyInputError("evidence baseline tier must be a string")
-            if steps[item.analyzer].status == "skipped":
+            if steps[item_analyzer].status == "skipped":
                 raise PolicyInputError("skipped analyzers cannot contribute evidence")
-            if item.analyzer == "F7":
-                if item.baseline_tier != baseline_tier:
+            if item_analyzer == "F7":
+                if item_baseline_tier != baseline_tier:
                     raise PolicyInputError("F7 evidence baseline tier does not match report")
-            elif item.baseline_tier is not None:
+            elif item_baseline_tier is not None:
                 raise PolicyInputError("F8/F9 evidence cannot claim a baseline tier")
-            fingerprint = finding_fingerprint(item.finding)
-            identity = (item.analyzer, fingerprint, item.origin, item.baseline_tier)
+            fingerprint = finding_fingerprint(finding_snapshot)
             evidence_value = (
-                item.analyzer,
-                item.origin,
-                item.baseline_tier,
-                item.finding.rule,
-                item.finding.action,
-                item.finding.file,
-                item.finding.line,
-                item.finding.snippet,
-                item.finding.message,
-                item.finding.source,
-                item.finding.sink,
+                item_analyzer,
+                item_origin,
+                item_baseline_tier,
+                finding_snapshot.rule,
+                finding_snapshot.action,
+                finding_snapshot.file,
+                finding_snapshot.line,
+                finding_snapshot.snippet,
+                finding_snapshot.message,
+                finding_snapshot.source,
+                finding_snapshot.sink,
             )
+            raw_evidence_values.append(evidence_value)
+            identity = (item_analyzer, fingerprint, item_origin, item_baseline_tier)
             previous_value = seen_evidence.get(identity)
             if previous_value is not None:
                 if previous_value != evidence_value:
                     raise PolicyInputError("conflicting analysis evidence")
                 continue
             seen_evidence[identity] = evidence_value
-            deduplicated_evidence.append(item)
-            if item.finding.rule == "analyzer_error":
-                analyzer_error_findings.add(item.analyzer)
+            deduplicated_evidence.append(
+                AnalysisEvidence(
+                    analyzer=item_analyzer,
+                    finding=finding_snapshot,
+                    origin=item_origin,
+                    baseline_tier=item_baseline_tier,
+                )
+            )
+            if finding_snapshot.rule == "analyzer_error":
+                analyzer_error_findings.add(item_analyzer)
         analyzer_error_steps = {step.analyzer for step in steps_snapshot if step.status == "error"}
         if not analyzer_error_findings <= analyzer_error_steps:
             raise PolicyInputError("analyzer_error evidence must match error steps")
@@ -560,22 +581,7 @@ class PolicyEngine:
                     "baseline_sha256": baseline_sha256,
                     "baseline_tier": baseline_tier,
                     "steps": [(step.analyzer, step.status, step.reason) for step in steps_snapshot],
-                    "evidence": [
-                        (
-                            item.analyzer,
-                            item.origin,
-                            item.baseline_tier,
-                            item.finding.rule,
-                            item.finding.action,
-                            item.finding.file,
-                            item.finding.line,
-                            item.finding.snippet,
-                            item.finding.message,
-                            item.finding.source,
-                            item.finding.sink,
-                        )
-                        for item in evidence_snapshot
-                    ],
+                    "evidence": raw_evidence_values,
                     "file_diff": None
                     if report_file_diff is None
                     else {

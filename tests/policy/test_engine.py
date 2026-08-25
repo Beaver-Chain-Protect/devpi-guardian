@@ -588,6 +588,22 @@ def test_policy_cardinality_limits_are_explicit() -> None:
         engine().assess(report(evidence=evidence))
 
 
+def test_duplicate_evidence_still_counts_toward_aggregate_report_limit() -> None:
+    long_finding = Finding(
+        "r" * 4096,
+        "REVIEW",
+        "f" * 4096,
+        1,
+        "s" * 4096,
+        "m" * 4096,
+        "source" * 682,
+        "sink" * 682,
+    )
+    evidence = AnalysisEvidence(analyzer="F8", finding=long_finding)
+    with pytest.raises(PolicyInputError, match="too large"):
+        engine().assess(report(evidence=(evidence,) * 1024))
+
+
 def test_custom_mapping_is_snapshotted_before_cardinality_validation() -> None:
     values = {f"rule-{i}": "REVIEW" for i in range(257)}
     with pytest.raises(ValueError, match="rule escalations"):
