@@ -132,7 +132,7 @@ def _json_value(
         if isinstance(value, Mapping):
             result = {}
             for key, item in value.items():
-                if not isinstance(key, str):
+                if not _valid_text(key, max_chars=text_limit):
                     raise SerializationError("response object keys must be strings")
                 result[key] = _json_value(
                     item, depth=depth + 1, seen=seen, count=count, text_limit=text_limit
@@ -159,10 +159,10 @@ def _response(payload: dict[str, Any], status: int = 200, *, converted: bool = F
 
         encoded = json.dumps(
             converted_payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        )
+        ).encode("utf-8")
     except (TypeError, ValueError, UnicodeError) as exc:
         raise SerializationError("response serialization failed") from exc
-    if len(encoded.encode("utf-8")) > _MAX_JSON_BYTES:
+    if len(encoded) > _MAX_JSON_BYTES:
         raise SerializationError("response is too large")
     return Response(json_body=converted_payload, status=status)
 
@@ -323,7 +323,7 @@ def _valid_quarantine_page(page: object) -> bool:
     return _valid_quarantine_page_for(page, requested_limit=None, requested_offset=None)
 
 
-def _valid_summary(item: object, *, quarantine: bool = True) -> bool:
+def _valid_summary(item: object, *, quarantine: bool = True, reject_missing: bool = False) -> bool:
     if type(item) is not ArtifactAdminSummary:
         return False
     if not isinstance(item.sha256, str):
@@ -337,6 +337,8 @@ def _valid_summary(item: object, *, quarantine: bool = True) -> bool:
     if not isinstance(item.state, ArtifactState):
         return False
     if quarantine and item.state in {ArtifactState.ALLOW, ArtifactState.MISSING}:
+        return False
+    if reject_missing and item.state is ArtifactState.MISSING:
         return False
     for timestamp in (item.discovered_at, item.updated_at):
         if (
@@ -379,7 +381,7 @@ def _valid_quarantine_page_for(
 def _valid_artifact_details(details: object) -> dict[str, Any]:
     if type(details) is not ArtifactAdminDetails:
         raise SerializationError("invalid artifact response")
-    if not _valid_summary(details.summary, quarantine=False):
+    if not _valid_summary(details.summary, quarantine=False, reject_missing=True):
         raise SerializationError("invalid artifact response")
     if type(details.allowed) is not bool:
         raise SerializationError("invalid artifact response")

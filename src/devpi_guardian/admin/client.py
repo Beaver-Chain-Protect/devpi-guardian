@@ -110,8 +110,8 @@ def _json_snapshot(value: Any, *, depth: int = 0, seen: set[int] | None = None) 
 
 
 def _strict_json_bytes(value: Any) -> bytes:
-    snapshot = _json_snapshot(value)
     try:
+        snapshot = _json_snapshot(value)
         data = json.dumps(
             snapshot, ensure_ascii=False, allow_nan=False, separators=(",", ":")
         ).encode("utf-8")

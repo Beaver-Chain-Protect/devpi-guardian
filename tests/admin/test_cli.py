@@ -8,7 +8,12 @@ from urllib.error import HTTPError
 import pytest
 
 from devpi_guardian.admin.cli import EXIT_DOMAIN, EXIT_OK, EXIT_USAGE, main
-from devpi_guardian.admin.client import ApiError, GuardianApiClient
+from devpi_guardian.admin.client import (
+    ApiError,
+    ClientInputError,
+    GuardianApiClient,
+    _strict_json_bytes,
+)
 
 
 class Client:
@@ -386,3 +391,51 @@ def test_cli_rejects_controlled_query_values_as_usage_errors(arguments, capsys) 
         == EXIT_USAGE
     )
     assert "bad" not in capsys.readouterr().err
+
+
+def test_cli_rejects_invalid_reason_json_as_usage_error(capsys) -> None:
+    assert (
+        main(
+            [
+                "--api-url",
+                "https://devpi.example",
+                "artifact",
+                "approve",
+                "a" * 64,
+                "--reason",
+                "bad\ud800reason",
+            ],
+            client_factory=GuardianApiClient,
+        )
+        == EXIT_USAGE
+    )
+    assert "bad" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"value": object()},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": "bad\x01value"},
+        {"value": "bad\ud800value"},
+    ],
+)
+def test_strict_json_bytes_wraps_invalid_caller_values(payload) -> None:
+    with pytest.raises(ClientInputError):
+        _strict_json_bytes(payload)
+
+
+def test_strict_json_bytes_wraps_cycles_and_depth() -> None:
+    cyclic = []
+    cyclic.append(cyclic)
+    with pytest.raises(ClientInputError):
+        _strict_json_bytes({"value": cyclic})
+
+    deeply_nested = value = []
+    for _ in range(34):
+        value.append([])
+        value = value[0]
+    with pytest.raises(ClientInputError):
+        _strict_json_bytes({"value": deeply_nested})

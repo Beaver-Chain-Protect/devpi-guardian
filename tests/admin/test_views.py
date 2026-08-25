@@ -385,6 +385,50 @@ def test_serialization_rejects_cycles_without_leaking_exception() -> None:
     assert response.json_body["error"]["code"] == "serialization_unavailable"
 
 
+@pytest.mark.parametrize("key", ["bad\x00key", "bad\ud800key"])
+def test_serialization_rejects_invalid_nested_mapping_keys(key) -> None:
+    class BadKeyService(Service):
+        def artifact_diff(self, sha256):
+            return {"nested": {key: "value"}}
+
+    response = artifact_diff(request(BadKeyService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
+
+
+def test_inspect_rejects_missing_artifact_state() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    summary = ArtifactAdminSummary(
+        sha256=SHA256,
+        size_bytes=1,
+        state=ArtifactState.MISSING,
+        discovered_at=now,
+        updated_at=now,
+        cooldown_until=None,
+        last_error=None,
+    )
+    details = ArtifactAdminDetails(
+        summary=summary,
+        allowed=False,
+        effective_decision=Decision.REVIEW,
+        decision_source=DecisionSource.MISSING,
+        policy_version=None,
+        analyzer_version=None,
+        baseline_sha256=None,
+        baseline_tier=None,
+        releases=(),
+        evidence=(),
+    )
+
+    class DetailsService(Service):
+        def inspect(self, sha256):
+            return details
+
+    response = inspect_artifact(request(DetailsService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
+
+
 def test_falsey_body_is_not_replaced_by_an_empty_object() -> None:
     response = approve_artifact(request(Service(), body=[]))
     assert response.status_code == 400
