@@ -37,6 +37,14 @@ class FailingCloseStream(TrackingStream):
         raise RuntimeError("close failed")
 
 
+class EventuallyCloseStream(TrackingStream):
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls < 3:
+            raise RuntimeError("close failed")
+        BytesIO.close(self)
+
+
 def artifact(tmp_path: Path) -> VerifiedArtifact:
     return VerifiedArtifact(
         stage="root/pypi",
@@ -345,9 +353,33 @@ def test_analysis_bundle_attempts_all_closes_and_reraises_first_failure() -> Non
     assert second.close_calls == 2
     assert third.closed
     assert len(raised.value.__notes__) == 2
+    with pytest.raises(RuntimeError, match="close failed"):
+        bundle.close()
+    assert first.close_calls == 4
+    assert second.close_calls == 4
+
+
+def test_analysis_bundle_retries_an_open_stream_on_later_close() -> None:
+    stream = EventuallyCloseStream(b"payload")
+    target = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.whl",
+        sha256=SHA256,
+        size_bytes=7,
+        _stream=stream,
+    )
+    bundle = AnalysisBundle(target=target)
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        bundle.close()
+    assert stream.close_calls == 2
+    assert not stream.closed
+
     bundle.close()
-    assert first.close_calls == 2
-    assert second.close_calls == 2
+    assert stream.close_calls == 3
+    assert stream.closed
 
 
 def test_worker_finally_closes_all_bundle_streams_after_analyzer_failure(tmp_path) -> None:

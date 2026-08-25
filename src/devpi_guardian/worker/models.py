@@ -147,19 +147,37 @@ class AnalysisBundle:
         """Close every distinct owned stream exactly once."""
         errors: list[BaseException] = []
         for artifact in (self.target, self.same_release_sdist, self.same_release_wheel):
-            if artifact is None or id(artifact._stream) in self._closed_streams:
+            if artifact is None:
                 continue
-            self._closed_streams.add(id(artifact._stream))
+            stream_id = id(artifact._stream)
+            if stream_id in self._closed_streams:
+                continue
             try:
                 already_closed = artifact._stream.closed
             except BaseException as error:
                 errors.append(error)
                 already_closed = False
-            if not already_closed:
+            if already_closed:
+                self._closed_streams.add(stream_id)
+                continue
+            try:
+                _close_owned(artifact._stream)
+            except BaseException as error:
+                errors.append(error)
+                # _close_owned deliberately preserves the first close anomaly
+                # even when its retry discharged ownership.  Do not retain a
+                # permanently open stream as "closed", so a later bundle.close
+                # can retry it; mark it only when the stream is now closed.
                 try:
-                    _close_owned(artifact._stream)
-                except BaseException as error:
-                    errors.append(error)
+                    if artifact._stream.closed:
+                        self._closed_streams.add(stream_id)
+                except BaseException as state_error:
+                    error.add_note(
+                        "stream closed-state check failed: "
+                        f"{type(state_error).__name__}: {state_error}"
+                    )
+            else:
+                self._closed_streams.add(stream_id)
         if errors:
             first, *additional = errors
             for error in additional:

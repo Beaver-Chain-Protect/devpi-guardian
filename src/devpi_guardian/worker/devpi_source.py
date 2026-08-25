@@ -84,6 +84,13 @@ class _OwnedResponseContext:
             raise
 
 
+class _OwnedResponseStack(contextlib.ExitStack):
+    """Wrap every HTTP context entered by devpi's client independently."""
+
+    def enter_context(self, cm):
+        return super().enter_context(_OwnedResponseContext(cm))
+
+
 class DevpiArtifactBytesSource:
     def __init__(self, xom, *, base_url: str) -> None:
         self._xom = xom
@@ -159,10 +166,9 @@ class DevpiArtifactBytesSource:
         if stage is None:
             raise DevpiArtifactUnavailable("source stage no longer exists")
         self._validate_upstream_url(upstream, resolved)
-        stack = contextlib.ExitStack()
+        stack = _OwnedResponseStack()
         try:
-            context = stage.http.stream("GET", upstream, allow_redirects=False)
-            response = stack.enter_context(_OwnedResponseContext(context))
+            response = stage.http.stream(stack, "GET", upstream, allow_redirects=False)
             status = getattr(response, "status_code", None)
             if status != 200:
                 raise DevpiArtifactUnavailable(f"upstream returned HTTP {status}")

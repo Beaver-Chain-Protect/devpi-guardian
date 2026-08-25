@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+import inspect
+from contextlib import contextmanager
 from dataclasses import replace
 from io import BytesIO
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ import pytest
 from devpi_guardian.worker.devpi_source import (
     DevpiArtifactBytesSource,
     DevpiArtifactUnavailable,
-    _OwnedResponseContext,
+    _OwnedResponseStack,
 )
 from devpi_guardian.worker.discovery_consumer import ResolvedDiscovery
 
@@ -59,11 +60,11 @@ class Http:
     def __init__(self, payload):
         self.payload, self.calls = payload, []
 
-    def stream(self, method, url, *, allow_redirects):
+    def stream(self, cstack, method, url, *, allow_redirects):
         self.calls.append((method, url, allow_redirects))
         response = Response(self.payload)
         self.response = response
-        return response
+        return cstack.enter_context(response)
 
 
 def resolved(sha256="a" * 64):
@@ -91,6 +92,10 @@ def xom_for(entry, payload=b"upstream"):
 
 def source(xom, base_url="https://devpi.invalid/"):
     return DevpiArtifactBytesSource(xom, base_url=base_url)
+
+
+def test_http_stream_fake_matches_installed_signature():
+    assert str(inspect.signature(Http.stream)) == "(self, cstack, method, url, *, allow_redirects)"
 
 
 def test_source_requires_canonical_base_url():
@@ -249,10 +254,10 @@ def test_exitstack_cleanup_error_is_surfaced_on_success():
             raise OSError("response close failed")
 
     class FailingHttp(Http):
-        def stream(self, method, url, *, allow_redirects):
+        def stream(self, cstack, method, url, *, allow_redirects):
             response = FailingResponse(self.payload)
             self.response = response
-            return response
+            return cstack.enter_context(response)
 
     http = FailingHttp(b"upstream")
     stage = SimpleNamespace(http=http)
@@ -280,10 +285,10 @@ def test_exitstack_cleanup_error_does_not_mask_body_error():
             raise OSError("response close failed")
 
     class BrokenHttp(Http):
-        def stream(self, method, url, *, allow_redirects):
+        def stream(self, cstack, method, url, *, allow_redirects):
             response = BrokenResponse(self.payload)
             self.response = response
-            return response
+            return cstack.enter_context(response)
 
     http = BrokenHttp(b"unused")
     stage = SimpleNamespace(http=http)
@@ -314,10 +319,10 @@ def test_exitstack_retries_response_close_once_when_callback_leaves_open():
             self.closed = True
 
     class RetryHttp(Http):
-        def stream(self, method, url, *, allow_redirects):
+        def stream(self, cstack, method, url, *, allow_redirects):
             response = RetryResponse(self.payload)
             self.response = response
-            return response
+            return cstack.enter_context(response)
 
     http = RetryHttp(b"upstream")
     stage = SimpleNamespace(http=http)
@@ -336,8 +341,8 @@ def test_exitstack_retries_response_close_once_when_callback_leaves_open():
 def test_exitstack_unrelated_cleanup_error_does_not_reclose_response():
     response = Response(b"payload")
     unrelated = RuntimeError("unrelated cleanup failed")
-    stack = ExitStack()
-    stack.enter_context(_OwnedResponseContext(response))
+    stack = _OwnedResponseStack()
+    stack.enter_context(response)
     stack.callback(lambda: (_ for _ in ()).throw(unrelated))
     with pytest.raises(RuntimeError, match="unrelated cleanup failed"):
         stack.close()
@@ -359,9 +364,9 @@ def test_exitstack_discharges_each_response_context_independently():
             self.response.close_calls += 1
             raise OSError("first context cleanup failed")
 
-    stack = ExitStack()
-    stack.enter_context(_OwnedResponseContext(FailingContext(first)))
-    stack.enter_context(_OwnedResponseContext(second))
+    stack = _OwnedResponseStack()
+    stack.enter_context(FailingContext(first))
+    stack.enter_context(second)
     with pytest.raises(OSError, match="first context cleanup failed"):
         stack.close()
     assert first.close_calls == 2
