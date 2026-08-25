@@ -126,14 +126,16 @@ class PolicyConfig:
         }
         if not isinstance(self.f7_tier_scores, Mapping):
             raise ValueError("f7_tier_scores must be a mapping")
+        try:
+            tier_input = dict(self.f7_tier_scores)
+        except Exception as exc:
+            raise ValueError("f7_tier_scores could not be snapshotted") from exc
         tier_scores: dict[str, int] = {}
         for tier in _BASELINE_TIERS:
-            if tier not in self.f7_tier_scores:
+            if tier not in tier_input:
                 raise ValueError(f"missing f7 tier score: {tier}")
-            tier_scores[tier] = _validate_score(
-                self.f7_tier_scores[tier], f"f7_tier_scores[{tier}]"
-            )
-        if set(self.f7_tier_scores) != set(_BASELINE_TIERS):
+            tier_scores[tier] = _validate_score(tier_input[tier], f"f7_tier_scores[{tier}]")
+        if set(tier_input) != set(_BASELINE_TIERS):
             raise ValueError("f7_tier_scores must contain exactly the baseline tiers")
         ordered_scores = (
             self.score_allow,
@@ -183,10 +185,14 @@ class PolicyConfig:
             raise ValueError("F7 tier scores must be non-decreasing")
         if not isinstance(self.rule_escalations, Mapping):
             raise ValueError("rule_escalations must be a mapping")
-        if len(self.rule_escalations) > _MAX_RULE_ESCALATIONS:
+        try:
+            escalation_input = dict(self.rule_escalations)
+        except Exception as exc:
+            raise ValueError("rule_escalations could not be snapshotted") from exc
+        if len(escalation_input) > _MAX_RULE_ESCALATIONS:
             raise ValueError("too many rule escalations")
         escalations: dict[str, str] = {}
-        for rule, action in self.rule_escalations.items():
+        for rule, action in escalation_input.items():
             _validate_text(rule, "rule escalation id")
             try:
                 normalized = Decision(action)
@@ -278,14 +284,21 @@ class PolicyEngine:
         return self._policy_version
 
     def assess(self, report: AnalysisReport) -> PolicyAssessment:
-        self._validate_report(report)
-        steps = {step.analyzer: step for step in report.steps}
+        (
+            steps_snapshot,
+            evidence_snapshot,
+            _report_file_diff,
+            _analyzer_version,
+            baseline_sha256,
+            baseline_tier,
+        ) = self._validate_report(report)
+        steps = {step.analyzer: step for step in steps_snapshot}
         reason_codes: set[str] = set()
         score = self._config.score_allow
         has_deny = False
         has_review = False
 
-        for item in report.evidence:
+        for item in evidence_snapshot:
             action = self._effective_action(item)
             if item.finding.rule == "analyzer_error" and action is not Decision.DENY:
                 continue
@@ -307,7 +320,7 @@ class PolicyEngine:
                 reason_codes.add(f"coverage.error:{step.analyzer}")
                 score = max(score, self._config.score_analyzer_error)
 
-        if self._config.require_baseline and not report.has_baseline:
+        if self._config.require_baseline and baseline_sha256 is None:
             has_review = True
             reason_codes.add("coverage.no_baseline")
             score = max(score, self._config.score_no_baseline)
@@ -325,9 +338,9 @@ class PolicyEngine:
             score=score,
             reason_codes=tuple(sorted(reason_codes)),
             policy_version=self._policy_version,
-            analyzer_version=report.analyzer_version,
-            baseline_sha256=report.baseline_sha256,
-            baseline_tier=report.baseline_tier,
+            analyzer_version=_analyzer_version,
+            baseline_sha256=baseline_sha256,
+            baseline_tier=baseline_tier,
             created_at=now,
         )
 
@@ -365,19 +378,54 @@ class PolicyEngine:
         return value.astimezone(UTC)
 
     @staticmethod
-    def _validate_report(report: AnalysisReport) -> None:
+    def _validate_report(
+        report: AnalysisReport,
+    ) -> tuple[
+        tuple[AnalysisStep, ...],
+        tuple[AnalysisEvidence, ...],
+        AnalysisFileDiff | None,
+        str,
+        str | None,
+        str | None,
+    ]:
         if type(report) is not AnalysisReport:
             raise PolicyInputError("report must be an AnalysisReport")
         try:
-            _validate_text(report.analyzer_version, "analyzer_version")
+            analyzer_version = report.analyzer_version
+            has_baseline = report.has_baseline
+            baseline_sha256 = report.baseline_sha256
+            baseline_tier = report.baseline_tier
+            raw_steps = report.steps
+            raw_evidence = report.evidence
+            raw_file_diff = report.file_diff
+            if not isinstance(raw_steps, tuple) or not isinstance(raw_evidence, tuple):
+                raise PolicyInputError("report collections must be tuples")
+            steps_snapshot = tuple(raw_steps)
+            evidence_snapshot = tuple(raw_evidence)
+            if raw_file_diff is None:
+                report_file_diff = None
+            elif type(raw_file_diff) is not AnalysisFileDiff:
+                raise PolicyInputError("invalid file diff")
+            else:
+                report_file_diff = AnalysisFileDiff(
+                    added=tuple(raw_file_diff.added),
+                    changed=tuple(raw_file_diff.changed),
+                    removed=tuple(raw_file_diff.removed),
+                )
+        except PolicyInputError:
+            raise
+        except Exception as exc:
+            raise PolicyInputError("report collections could not be snapshotted") from exc
+        try:
+            _validate_text(analyzer_version, "analyzer_version")
         except ValueError as exc:
             raise PolicyInputError(str(exc)) from exc
-        if type(report.has_baseline) is not bool:
+        if type(has_baseline) is not bool:
             raise PolicyInputError("has_baseline must be a bool")
-        if not isinstance(report.steps, tuple) or len(report.steps) != 3:
+        if len(steps_snapshot) != 3:
             raise PolicyInputError("report must contain exactly three analyzer steps")
         steps: dict[str, AnalysisStep] = {}
-        for step in report.steps:
+        for step in steps_snapshot:
             if type(step) is not AnalysisStep:
                 raise PolicyInputError("invalid analyzer step")
             if (
@@ -403,35 +451,31 @@ class PolicyEngine:
             raise PolicyInputError("report must contain one F7, F8, and F9 step")
         if steps["F8"].status == "skipped":
             raise PolicyInputError("F8 cannot be skipped")
-        if report.has_baseline:
+        if has_baseline:
             if (
-                report.baseline_sha256 is None
-                or type(report.baseline_tier) is not str
-                or report.baseline_tier not in _BASELINE_TIERS
+                baseline_sha256 is None
+                or type(baseline_tier) is not str
+                or baseline_tier not in _BASELINE_TIERS
             ):
                 raise PolicyInputError("selected baseline requires a SHA-256 and valid tier")
             try:
-                validate_sha256(report.baseline_sha256)
+                validate_sha256(baseline_sha256)
             except Exception as exc:
                 raise PolicyInputError("selected baseline requires a canonical SHA-256") from exc
             if steps["F7"].status == "skipped":
                 raise PolicyInputError("selected baseline cannot have a skipped F7 step")
-        elif report.baseline_sha256 is not None or report.baseline_tier is not None:
+        elif baseline_sha256 is not None or baseline_tier is not None:
             raise PolicyInputError("absent baseline must have neither SHA-256 nor tier")
         elif steps["F7"].status == "completed":
             raise PolicyInputError("absent baseline cannot have a completed F7 step")
-        if not isinstance(report.evidence, tuple):
-            raise PolicyInputError("evidence must be a tuple")
-        if len(report.evidence) > _MAX_EVIDENCE:
+        if len(evidence_snapshot) > _MAX_EVIDENCE:
             raise PolicyInputError("too many analysis evidence items")
-        if report.file_diff is not None:
-            if type(report.file_diff) is not AnalysisFileDiff:
-                raise PolicyInputError("invalid file diff")
-            if not report.has_baseline or steps["F7"].status == "skipped":
+        if report_file_diff is not None:
+            if not has_baseline or steps["F7"].status == "skipped":
                 raise PolicyInputError("file diff requires an F7 baseline")
             all_paths: list[str] = []
             for field_name in ("added", "changed", "removed"):
-                paths = getattr(report.file_diff, field_name)
+                paths = getattr(report_file_diff, field_name)
                 if type(paths) is not tuple:
                     raise PolicyInputError("file diff paths must be tuples")
                 for path in paths:
@@ -454,7 +498,7 @@ class PolicyEngine:
         seen_evidence: set[tuple[object, ...]] = set()
         analyzer_error_steps: set[str] = set()
         analyzer_error_findings: set[str] = set()
-        for item in report.evidence:
+        for item in evidence_snapshot:
             if (
                 type(item) is not AnalysisEvidence
                 or type(item.analyzer) is not str
@@ -477,7 +521,7 @@ class PolicyEngine:
             if steps[item.analyzer].status == "skipped":
                 raise PolicyInputError("skipped analyzers cannot contribute evidence")
             if item.analyzer == "F7":
-                if item.baseline_tier != report.baseline_tier:
+                if item.baseline_tier != baseline_tier:
                     raise PolicyInputError("F7 evidence baseline tier does not match report")
             elif item.baseline_tier is not None:
                 raise PolicyInputError("F8/F9 evidence cannot claim a baseline tier")
@@ -488,16 +532,16 @@ class PolicyEngine:
             seen_evidence.add(identity)
             if item.finding.rule == "analyzer_error":
                 analyzer_error_findings.add(item.analyzer)
-        analyzer_error_steps = {step.analyzer for step in report.steps if step.status == "error"}
+        analyzer_error_steps = {step.analyzer for step in steps_snapshot if step.status == "error"}
         if analyzer_error_steps != analyzer_error_findings:
             raise PolicyInputError("analyzer_error evidence must match error steps")
         try:
             aggregate = json.dumps(
                 {
-                    "analyzer_version": report.analyzer_version,
-                    "baseline_sha256": report.baseline_sha256,
-                    "baseline_tier": report.baseline_tier,
-                    "steps": [(step.analyzer, step.status, step.reason) for step in report.steps],
+                    "analyzer_version": analyzer_version,
+                    "baseline_sha256": baseline_sha256,
+                    "baseline_tier": baseline_tier,
+                    "steps": [(step.analyzer, step.status, step.reason) for step in steps_snapshot],
                     "evidence": [
                         (
                             item.analyzer,
@@ -512,12 +556,12 @@ class PolicyEngine:
                             item.finding.source,
                             item.finding.sink,
                         )
-                        for item in report.evidence
+                        for item in evidence_snapshot
                     ],
                     "file_diff": None
-                    if report.file_diff is None
+                    if report_file_diff is None
                     else {
-                        field_name: getattr(report.file_diff, field_name)
+                        field_name: getattr(report_file_diff, field_name)
                         for field_name in ("added", "changed", "removed")
                     },
                 },
@@ -530,3 +574,11 @@ class PolicyEngine:
             raise PolicyInputError("report is not canonically serializable") from exc
         if len(aggregate) > _MAX_REPORT_BYTES:
             raise PolicyInputError("analysis report is too large")
+        return (
+            steps_snapshot,
+            evidence_snapshot,
+            report_file_diff,
+            analyzer_version,
+            baseline_sha256,
+            baseline_tier,
+        )

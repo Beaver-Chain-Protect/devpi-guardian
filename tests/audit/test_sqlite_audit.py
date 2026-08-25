@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -238,11 +239,31 @@ def test_writer_rejects_same_name_noop_trigger_before_using_cache(tmp_path):
             SQLiteAuditWriter().append_in_transaction(connection, _event())
 
 
+@pytest.mark.parametrize(
+    "index_sql",
+    [
+        "CREATE UNIQUE INDEX audit_events_event_hash_unique_idx ON audit_events(sha256)",
+        (
+            "CREATE UNIQUE INDEX audit_events_event_hash_unique_idx "
+            "ON audit_events(event_hash) WHERE id > 0"
+        ),
+    ],
+)
+def test_writer_rejects_spoofed_unique_hash_index(tmp_path, index_sql):
+    factory = _db(tmp_path)
+    with closing(factory.connect()) as connection:
+        connection.execute("DROP INDEX audit_events_event_hash_unique_idx")
+        connection.execute(index_sql)
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            SQLiteAuditWriter().append_in_transaction(connection, _event())
+
+
 def test_writer_cache_verifies_one_new_row_per_sequential_append(tmp_path):
     traced = _TraceFactory(_db(tmp_path))
     writer = SQLiteAuditWriter()
-    for number in range(4):
-        with closing(traced.connect()) as connection:
+    with closing(traced.connect()) as connection:
+        for number in range(4):
             connection.execute("BEGIN IMMEDIATE")
             writer.append_in_transaction(connection, _event(number))
             connection.commit()
@@ -286,6 +307,47 @@ def test_cold_writer_detects_mid_chain_corruption_before_append(tmp_path):
         connection.execute("BEGIN IMMEDIATE")
         with pytest.raises(StoreUnavailable):
             SQLiteAuditWriter().append_in_transaction(connection, _event(3))
+
+
+def test_cached_writer_rejects_tampered_history_after_exact_trigger_restore(tmp_path):
+    factory = _db(tmp_path)
+    writer = SQLiteAuditWriter()
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        writer.append_in_transaction(connection, _event(1))
+        writer.append_in_transaction(connection, _event(2))
+        connection.commit()
+        connection.execute("DROP TRIGGER audit_events_update_guard")
+        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
+        connection.execute(
+            """
+            CREATE TRIGGER audit_events_update_guard
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit events are append-only');
+            END
+            """
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            writer.append_in_transaction(connection, _event(3))
+
+
+def test_cache_does_not_cross_same_path_database_replacement(tmp_path):
+    factory = _db(tmp_path)
+    replacement = _db(tmp_path / "replacement")
+    writer = SQLiteAuditWriter()
+    old_connection = factory.connect()
+    old_connection.execute("BEGIN IMMEDIATE")
+    writer.append_in_transaction(old_connection, _event(1))
+    old_connection.commit()
+    old_connection.close()
+    os.replace(replacement.path, factory.path)
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        writer.append_in_transaction(connection, _event(2))
+        connection.commit()
+    assert verify_audit_chain(factory).valid is True
 
 
 def test_persisted_fields_are_exact_and_expected_head_succeeds(tmp_path):

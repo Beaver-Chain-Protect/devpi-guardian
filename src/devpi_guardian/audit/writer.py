@@ -38,35 +38,14 @@ _REQUIRED_SCHEMA_OBJECTS = frozenset(
         ("trigger", "audit_events_delete_guard"),
     }
 )
-_REQUIRED_SCHEMA_FRAGMENTS = {
-    "audit_events_history_insert_guard": (
-        "before insert on audit_events",
-        "new.id",
-        "new.event_hash",
-        "immutable audit event history",
-    ),
-    "audit_events_chain_insert_guard": (
-        "before insert on audit_events",
-        "new.id",
-        "new.previous_hash",
-        "max(id) + 1",
-        "invalid audit chain head",
-    ),
-    "audit_events_update_guard": (
-        "before update on audit_events",
-        "raise(abort, 'audit events are append-only')",
-    ),
-    "audit_events_delete_guard": (
-        "before delete on audit_events",
-        "raise(abort, 'audit events are append-only')",
-    ),
-}
 
 
 @dataclass(frozen=True, slots=True)
 class _VerifiedPrefix:
-    identity: str
+    connection: sqlite3.Connection
     schema: tuple[tuple[str, str, str], ...]
+    schema_version: int
+    data_version: int
     count: int
     head: str
 
@@ -233,7 +212,9 @@ def _store_unavailable(connection_or_path: object, exc: BaseException) -> StoreU
     return StoreUnavailable(str(path))
 
 
-def _schema_contract(connection: sqlite3.Connection) -> tuple[tuple[str, str, str], ...]:
+def _schema_contract(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[tuple[str, str, str], ...], int, int]:
     raw_columns = connection.execute("PRAGMA table_info(audit_events)").fetchall()
     if any(type(row[1]) is not str or type(row[2]) is not str for row in raw_columns):
         raise StoreUnavailable("audit database")
@@ -271,26 +252,55 @@ def _schema_contract(connection: sqlite3.Connection) -> tuple[tuple[str, str, st
         raise StoreUnavailable("audit database")
     if any(type(sql) is not str or not sql for _kind, _name, sql in objects):
         raise StoreUnavailable("audit database")
-    definitions = {name: re.sub(r"\s+", " ", sql).strip().lower() for _kind, name, sql in objects}
-    for name, fragments in _REQUIRED_SCHEMA_FRAGMENTS.items():
-        definition = definitions.get(name, "")
-        if not all(fragment in definition for fragment in fragments):
-            raise StoreUnavailable("audit database")
-    for name, fragment in {
-        "audit_events_sha256_occurred_at_idx": "on audit_events(sha256, occurred_at)",
-        "audit_events_action_occurred_at_idx": "on audit_events(action, occurred_at)",
-        "audit_events_event_hash_unique_idx": "create unique index",
-    }.items():
-        if fragment not in definitions.get(name, ""):
-            raise StoreUnavailable("audit database")
-    return objects
-
-
-def _database_identity(connection: sqlite3.Connection) -> str | None:
-    row = connection.execute("PRAGMA database_list").fetchone()
-    if row is None or len(row) < 3 or type(row[2]) is not str or not row[2]:
-        return None
-    return row[2]
+    expected_definitions = {
+        "audit_events_action_occurred_at_idx": (
+            "create index audit_events_action_occurred_at_idx on audit_events(action, occurred_at)"
+        ),
+        "audit_events_event_hash_unique_idx": (
+            "create unique index audit_events_event_hash_unique_idx on audit_events(event_hash)"
+        ),
+        "audit_events_sha256_occurred_at_idx": (
+            "create index audit_events_sha256_occurred_at_idx on audit_events(sha256, occurred_at)"
+        ),
+        "audit_events_chain_insert_guard": (
+            "create trigger audit_events_chain_insert_guard before insert on audit_events "
+            "when new.id is not coalesce( (select max(id) + 1 from audit_events), 1 ) "
+            "or new.previous_hash is not coalesce( (select event_hash from audit_events "
+            "order by id desc limit 1), lower(hex(zeroblob(32))) ) begin select raise(abort, "
+            "'invalid audit chain head'); end"
+        ),
+        "audit_events_delete_guard": (
+            "create trigger audit_events_delete_guard before delete on audit_events "
+            "begin select raise(abort, 'audit events are append-only'); end"
+        ),
+        "audit_events_history_insert_guard": (
+            "create trigger audit_events_history_insert_guard before insert on audit_events "
+            "when exists(select 1 from audit_events where id = new.id) or "
+            "exists(select 1 from audit_events where event_hash = new.event_hash) "
+            "begin select raise(abort, 'immutable audit event history'); end"
+        ),
+        "audit_events_update_guard": (
+            "create trigger audit_events_update_guard before update on audit_events "
+            "begin select raise(abort, 'audit events are append-only'); end"
+        ),
+    }
+    definitions = {
+        name: re.sub(r"\s+", " ", sql).strip().lower()
+        for _kind, name, sql in objects
+        if name in expected_definitions
+    }
+    if definitions != expected_definitions:
+        raise StoreUnavailable("audit database")
+    schema_version = connection.execute("PRAGMA schema_version").fetchone()
+    data_version = connection.execute("PRAGMA data_version").fetchone()
+    if (
+        schema_version is None
+        or type(schema_version[0]) is not int
+        or data_version is None
+        or type(data_version[0]) is not int
+    ):
+        raise StoreUnavailable("audit database")
+    return objects, schema_version[0], data_version[0]
 
 
 def _verify_rows(
@@ -334,14 +344,13 @@ class SQLiteAuditWriter:
     def _verified_prefix(self, connection: sqlite3.Connection) -> tuple[int, str]:
         """Verify the visible prefix, caching only rows present before insertion.
 
-        The cache is instance-local and keyed by SQLite's stable database path plus
-        the immutable audit schema catalog. It is never advanced after this method
+        The cache is instance-local and bound to the live connection plus its
+        immutable audit schema catalog. It is never advanced after this method
         returns, so an outer transaction may roll back safely; a later count
-        regression forces a cold full scan.
+        regression or schema change forces a cold full scan.
         """
         with self._cache_lock:
-            schema = _schema_contract(connection)
-            identity = _database_identity(connection)
+            schema, schema_version, data_version = _schema_contract(connection)
             count_row = connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()
             if (
                 count_row is None
@@ -353,10 +362,11 @@ class SQLiteAuditWriter:
             count = count_row[0]
             cache = self._cache
             usable = (
-                identity is not None
-                and cache is not None
-                and cache.identity == identity
+                cache is not None
+                and cache.connection is connection
                 and cache.schema == schema
+                and cache.schema_version == schema_version
+                and cache.data_version == data_version
                 and count >= cache.count
             )
             if usable and cache.count:
@@ -393,8 +403,9 @@ class SQLiteAuditWriter:
                     head=ZERO_HASH,
                     expected_count=count,
                 )
-            if identity is not None:
-                self._cache = _VerifiedPrefix(identity, schema, verified_count, head)
+            self._cache = _VerifiedPrefix(
+                connection, schema, schema_version, data_version, verified_count, head
+            )
             return verified_count, head
 
     def append_in_transaction(

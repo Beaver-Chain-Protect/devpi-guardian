@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone
 from io import BytesIO
@@ -25,6 +26,33 @@ from devpi_guardian.worker.models import (
 SHA = "a" * 64
 BASELINE = "b" * 64
 NOW = datetime(2026, 8, 24, 1, 2, 3, tzinfo=UTC)
+
+
+class LyingMapping(Mapping[str, str]):
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return 0
+
+
+class FlippingTuple(tuple):
+    def __new__(cls, values):
+        value = super().__new__(cls, values)
+        value._first = True
+        return value
+
+    def __iter__(self):
+        if self._first:
+            self._first = False
+            return super().__iter__()
+        return iter(())
 
 
 def target() -> VerifiedArtifact:
@@ -563,6 +591,55 @@ def test_policy_cardinality_limits_are_explicit() -> None:
     )
     with pytest.raises(PolicyInputError, match="evidence"):
         engine().assess(report(evidence=evidence))
+
+
+def test_custom_mapping_is_snapshotted_before_cardinality_validation() -> None:
+    values = {f"rule-{i}": "REVIEW" for i in range(257)}
+    with pytest.raises(ValueError, match="rule escalations"):
+        PolicyConfig(rule_escalations=LyingMapping(values))
+
+
+def test_custom_evidence_tuple_is_snapshotted_once_before_assessment() -> None:
+    evidence = FlippingTuple(
+        (
+            AnalysisEvidence(
+                analyzer="F8",
+                finding=Finding("forged", "DENY", "x.py", 1, "x", "bad"),
+            ),
+        )
+    )
+    value = AnalysisReport(
+        analyzer_version="analyzer-1",
+        has_baseline=True,
+        baseline_sha256=BASELINE,
+        baseline_tier="same_tag",
+        evidence=evidence,
+        steps=(
+            AnalysisStep("F7", "completed"),
+            AnalysisStep("F8", "completed"),
+            AnalysisStep("F9", "completed"),
+        ),
+    )
+    assert engine().assess(value).decision is Decision.DENY
+
+
+def test_custom_file_diff_tuple_is_snapshotted_once() -> None:
+    diff = AnalysisFileDiff(added=("a.py",), changed=(), removed=())
+    object.__setattr__(diff, "added", FlippingTuple(("a.py",)))
+    value = AnalysisReport(
+        analyzer_version="analyzer-1",
+        has_baseline=True,
+        baseline_sha256=BASELINE,
+        baseline_tier="same_tag",
+        evidence=(),
+        steps=(
+            AnalysisStep("F7", "completed"),
+            AnalysisStep("F8", "completed"),
+            AnalysisStep("F9", "completed"),
+        ),
+        file_diff=diff,
+    )
+    assert engine().assess(value).decision is Decision.ALLOW
 
 
 def test_unknown_rule_ids_are_forward_compatible_and_escalatable() -> None:
