@@ -228,3 +228,18 @@ def test_service_fails_closed_when_optional_operation_provider_is_missing() -> N
     for operation in operations:
         with pytest.raises(AdminFeatureUnavailable):
             operation()
+
+
+def test_service_rejects_missing_core_capabilities() -> None:
+    with pytest.raises(TypeError):
+        GuardianAdminService(reader=object(), store=None)
+
+
+def test_service_mutations_require_none_completion() -> None:
+    class BadStore(Store):
+        def set_manual_override(self, override):
+            return False
+
+    service = GuardianAdminService(reader=Reader(), store=BadStore(), now=lambda: NOW)
+    with pytest.raises(RuntimeError):
+        service.approve(SHA256, actor="root", reason="reviewed")

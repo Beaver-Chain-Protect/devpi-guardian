@@ -2,6 +2,7 @@
 
 from .service import (
     AdminFeatureUnavailable,
+    AdminRequestError,
     ArtifactDiffReader,
     AuditReader,
     BaselineManager,
@@ -12,6 +13,7 @@ from .service import (
 
 __all__ = [
     "AdminFeatureUnavailable",
+    "AdminRequestError",
     "ArtifactDiffReader",
     "AuditReader",
     "BaselineManager",

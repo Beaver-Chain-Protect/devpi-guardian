@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+from io import BytesIO
+from urllib.error import HTTPError
 
 import pytest
 
@@ -204,10 +207,90 @@ def test_client_maps_malformed_success_json_to_sanitized_api_error(monkeypatch) 
         def read(self, *args):
             return b"not-json"
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("devpi_guardian.admin.client._open", lambda *args, **kwargs: Response())
 
     with pytest.raises(ApiError) as raised:
         GuardianApiClient(api_url="https://devpi.example").request("GET", "/health")
 
     assert raised.value.status == 502
     assert raised.value.code == "invalid_response"
+
+
+def test_client_requires_bounded_json_content_type_and_read_cap(monkeypatch) -> None:
+    calls = []
+
+    class Response:
+        def __init__(self):
+            self.headers = {"Content-Type": "application/json; charset=utf-8"}
+            self.status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, amount):
+            calls.append(amount)
+            return b'{"ok":true}'
+
+    monkeypatch.setattr("devpi_guardian.admin.client._open", lambda *args, **kwargs: Response())
+    result = GuardianApiClient(api_url="https://devpi.example").request("GET", "/health")
+    assert result == {"ok": True}
+    assert calls == [1024 * 1024 + 1]
+
+
+def test_client_sanitizes_http_error_shape(monkeypatch) -> None:
+    def fail(*args, **kwargs):
+        raise HTTPError(
+            "https://devpi.example/health",
+            409,
+            "Conflict",
+            {"Content-Type": "application/json"},
+            BytesIO(b'{"error":{"code":"transition_conflict","message":"state conflict"}}'),
+        )
+
+    monkeypatch.setattr("devpi_guardian.admin.client._open", fail)
+    with pytest.raises(ApiError) as raised:
+        GuardianApiClient(api_url="https://devpi.example").request("GET", "/health")
+    assert (raised.value.status, raised.value.code, str(raised.value)) == (
+        409,
+        "transition_conflict",
+        "state conflict",
+    )
+
+
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "ftp://devpi.example",
+        "https://user:pass@devpi.example",
+        "https://devpi.example/?x=1",
+        "https://devpi.example/#x",
+        "https://devpi.example\n",
+    ],
+)
+def test_client_rejects_unsafe_api_origins(api_url) -> None:
+    with pytest.raises(ValueError):
+        GuardianApiClient(api_url=api_url)
+
+
+@pytest.mark.parametrize("timeout", [0, -1, math.nan, math.inf, -math.inf, True])
+def test_client_rejects_non_finite_timeout(timeout) -> None:
+    with pytest.raises(ValueError):
+        GuardianApiClient(api_url="https://devpi.example", timeout=timeout)
+
+
+def test_client_rejects_invalid_request_shapes() -> None:
+    client = GuardianApiClient(api_url="https://devpi.example")
+    with pytest.raises(ValueError):
+        client.request("get", "/health")
+    with pytest.raises(ValueError):
+        client.request("GET", "health")
+    with pytest.raises(ValueError):
+        client.request("GET", "/health", body=[])
+
+
+def test_cli_invalid_timeout_is_usage_error(capsys) -> None:
+    assert main(["--api-url", "https://devpi.example", "--timeout", "nan", "health"]) == EXIT_USAGE
+    assert "timeout" in capsys.readouterr().err

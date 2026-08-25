@@ -8,6 +8,7 @@ from devpi_guardian.admin.views import (
     add_baseline,
     approve_artifact,
     artifact_diff,
+    configure_admin_routes,
     import_baselines,
     inspect_artifact,
     list_audit,
@@ -19,15 +20,18 @@ from devpi_guardian.admin.views import (
     revoke_artifact,
 )
 from devpi_guardian.verdicts.errors import ArtifactNotFound, TransitionConflict
-from devpi_guardian.verdicts.models import ArtifactState
+from devpi_guardian.verdicts.models import ArtifactState, QuarantinePage
 
 SHA256 = "a" * 64
 
 
 class Service:
+    def health(self):
+        return {"database": "ok"}
+
     def list_quarantine(self, *, states, limit, offset):
         self.list_call = states, limit, offset
-        return SimpleNamespace(items=(), total=0, limit=limit, offset=offset)
+        return QuarantinePage((), 0, limit, offset)
 
     def inspect(self, sha256):
         self.inspect_call = sha256
@@ -78,7 +82,7 @@ def request(service, *, sha256=SHA256, params=None, body=None, actor="root"):
         registry={ADMIN_SERVICE_REGISTRY_KEY: service},
         matchdict={"sha256": sha256},
         params=params or {},
-        json_body=body or {},
+        json_body={} if body is None else body,
         authenticated_userid=actor,
     )
 
@@ -193,3 +197,57 @@ def test_unconnected_feature_returns_specific_retryable_503() -> None:
             "message": "artifact_diff provider is unavailable",
         }
     }
+
+
+def test_missing_or_wrong_registry_service_is_sanitized_503() -> None:
+    missing = SimpleNamespace(registry={}, matchdict={"sha256": SHA256}, params={}, json_body={})
+    assert list_quarantine(missing).status_code == 503
+    wrong = request(object())
+    assert list_quarantine(wrong).status_code == 503
+
+
+def test_provider_value_errors_are_not_client_400s() -> None:
+    class BadService(Service):
+        def artifact_diff(self, sha256):
+            raise ValueError("secret provider internals")
+
+    response = artifact_diff(request(BadService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "provider_unavailable"
+    assert "secret" not in response.text
+
+
+def test_serialization_rejects_cycles_without_leaking_exception() -> None:
+    class CyclicService(Service):
+        def artifact_diff(self, sha256):
+            value = {}
+            value["self"] = value
+            return value
+
+    response = artifact_diff(request(CyclicService()))
+    assert response.status_code == 503
+    assert response.json_body["error"]["code"] == "serialization_unavailable"
+
+
+def test_falsey_body_is_not_replaced_by_an_empty_object() -> None:
+    response = approve_artifact(request(Service(), body=[]))
+    assert response.status_code == 400
+
+
+def test_admin_routes_register_expected_methods_and_permission() -> None:
+    class Pyramid:
+        def __init__(self):
+            self.routes = []
+            self.views = []
+
+        def add_route(self, name, path):
+            self.routes.append((name, path))
+
+        def add_view(self, view, **kwargs):
+            self.views.append((view, kwargs))
+
+    pyramid = Pyramid()
+    configure_admin_routes(pyramid)
+    assert any(name == "guardian_artifact_revoke" for name, _ in pyramid.routes)
+    assert all(kwargs["permission"] == "user_modify" for _, kwargs in pyramid.views)
+    assert any(kwargs["request_method"] == "DELETE" for _, kwargs in pyramid.views)

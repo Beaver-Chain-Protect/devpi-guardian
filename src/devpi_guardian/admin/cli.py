@@ -9,7 +9,9 @@ import urllib.error
 from pathlib import Path
 from typing import Any
 
-from .client import GuardianApiClient
+from devpi_guardian.verdicts.models import validate_sha256
+
+from .client import ApiError, GuardianApiClient, _controls, _json_snapshot
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -92,10 +94,20 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _json_file(path: str, *, array: bool) -> Any:
+    candidate = Path(path)
     try:
-        with Path(path).open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except (OSError, UnicodeError, ValueError) as exc:
+        stat = candidate.stat()
+        if not candidate.is_file() or stat.st_size > 1024 * 1024:
+            raise OSError("not a bounded regular file")
+        raw = candidate.read_bytes()
+        if len(raw) > 1024 * 1024:
+            raise OSError("file is too large")
+        payload = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        payload = _json_snapshot(payload)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
         raise CliInputError(f"could not read JSON input: {path}") from exc
     expected = list if array else dict
     if not isinstance(payload, expected):
@@ -108,12 +120,29 @@ def _auth_token(args: argparse.Namespace) -> str | None:
     if args.auth_token_file is None:
         return args.auth_token
     try:
-        token = Path(args.auth_token_file).read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError) as exc:
+        candidate = Path(args.auth_token_file)
+        if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size > 4096:
+            raise OSError("authentication token is not a safe regular file")
+        token = candidate.read_text(encoding="utf-8").strip()
+        if (
+            len(token) > 4096
+            or not token
+            or _controls(token)
+            or any(0xD800 <= ord(char) <= 0xDFFF for char in token)
+        ):
+            raise ValueError("authentication token is invalid")
+    except (OSError, UnicodeError, ValueError) as exc:
         raise CliInputError("could not read authentication token file") from exc
-    if not token:
-        raise CliInputError("authentication token file is empty")
     return token
+
+
+def _sha(value: object) -> str:
+    if not isinstance(value, str):
+        raise CliInputError("sha256 is required")
+    try:
+        return validate_sha256(value)
+    except ValueError as exc:
+        raise CliInputError("sha256 must be a lowercase 64-character hexadecimal digest") from exc
 
 
 def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]:
@@ -125,7 +154,7 @@ def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]
             query["state"] = args.state
         return client.request("GET", f"{_PREFIX}/quarantine", query=query)
     if args.group == "artifact":
-        base = f"{_PREFIX}/artifacts/{args.sha256}"
+        base = f"{_PREFIX}/artifacts/{_sha(args.sha256)}"
         if args.action == "inspect":
             return client.request("GET", base)
         if args.action == "diff":
@@ -136,9 +165,10 @@ def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]
             body={"reason": args.reason},
         )
     if args.group == "exception":
+        sha256 = _sha(args.sha256)
         return client.request(
             "POST",
-            f"{_PREFIX}/artifacts/{args.sha256}/exceptions",
+            f"{_PREFIX}/artifacts/{sha256}/exceptions",
             body={"reason": args.reason, "expires_at": args.expires_at},
         )
     if args.group == "audit":
@@ -146,7 +176,7 @@ def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]
         for key in ("sha256", "actor"):
             value = getattr(args, key)
             if value:
-                query[key] = value
+                query[key] = _sha(value) if key == "sha256" else value
         if args.action_name:
             query["action"] = args.action_name
         return client.request("GET", f"{_PREFIX}/audit", query=query)
@@ -154,15 +184,17 @@ def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]
         if args.action == "list":
             return client.request("GET", f"{_PREFIX}/baselines", query={"project": args.project})
         if args.action == "add":
+            sha256 = _sha(args.sha256)
             return client.request(
                 "POST",
                 f"{_PREFIX}/baselines",
-                body={"sha256": args.sha256, "reason": args.reason},
+                body={"sha256": sha256, "reason": args.reason},
             )
         if args.action == "remove":
+            sha256 = _sha(args.sha256)
             return client.request(
                 "DELETE",
-                f"{_PREFIX}/baselines/{args.sha256}",
+                f"{_PREFIX}/baselines/{sha256}",
                 body={"reason": args.reason},
             )
         return client.request(
@@ -173,19 +205,29 @@ def _call(client: GuardianApiClient, args: argparse.Namespace) -> dict[str, Any]
     policy = _json_file(args.path, array=False)
     body = {"policy": policy}
     if args.action == "simulate":
-        body["sha256"] = args.sha256
+        body["sha256"] = _sha(args.sha256)
     return client.request("POST", f"{_PREFIX}/policy/{args.action}", body=body)
 
 
 def _print(payload: dict[str, Any], *, as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    try:
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            indent=None if as_json else 2,
+        )
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise CliInputError("server returned invalid JSON") from exc
+    print(rendered)
 
 
 def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> int:
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code) if exc.code == 0 else EXIT_USAGE
     try:
         client = client_factory(
             api_url=args.api_url,
@@ -194,19 +236,24 @@ def main(argv: list[str] | None = None, *, client_factory=GuardianApiClient) -> 
         )
         _print(_call(client, args), as_json=args.as_json)
         return EXIT_OK
-    except CliInputError as exc:
+    except (CliInputError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
+    except ApiError as exc:
+        print(str(exc), file=sys.stderr)
+        if exc.status in (401, 403):
+            return EXIT_AUTH
+        return EXIT_DOMAIN
     except Exception as exc:
         status = getattr(exc, "status", None)
-        print(str(exc), file=sys.stderr)
+        print(str(exc) if isinstance(status, int) else "guardian request failed", file=sys.stderr)
         if status in (401, 403):
             return EXIT_AUTH
         if isinstance(status, int):
             return EXIT_DOMAIN
         if isinstance(exc, (OSError, TimeoutError, urllib.error.URLError)):
             return EXIT_NETWORK
-        raise
+        return EXIT_DOMAIN
 
 
 if __name__ == "__main__":

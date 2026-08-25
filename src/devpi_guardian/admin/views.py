@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -15,9 +17,14 @@ from devpi_guardian.verdicts.errors import (
     StoreUnavailable,
     TransitionConflict,
 )
-from devpi_guardian.verdicts.models import ArtifactState
+from devpi_guardian.verdicts.models import (
+    ArtifactAdminDetails,
+    ArtifactState,
+    QuarantinePage,
+    validate_sha256,
+)
 
-from .service import AdminFeatureUnavailable, AdminMutationsUnavailable
+from .service import AdminFeatureUnavailable, AdminMutationsUnavailable, AdminRequestError
 
 ADMIN_SERVICE_REGISTRY_KEY = "devpi_guardian.admin_service"
 _DEFAULT_STATES = (
@@ -27,24 +34,88 @@ _DEFAULT_STATES = (
     ArtifactState.DENY,
     ArtifactState.ERROR,
 )
+_MAX_JSON_BYTES = 1024 * 1024
+_MAX_TEXT = 4096
 
 
-def _json_value(value: Any) -> Any:
+class SerializationError(ValueError):
+    """A provider returned a value outside the bounded JSON contract."""
+
+
+class RegistryUnavailable(RuntimeError):
+    """The admin service registry entry is absent or malformed."""
+
+
+def _json_value(
+    value: Any, *, depth: int = 0, seen: set[int] | None = None, count: list[int] | None = None
+) -> Any:
+    if depth > 32:
+        raise SerializationError("response is too deeply nested")
+    seen = set() if seen is None else seen
+    count = [0] if count is None else count
+    count[0] += 1
+    if count[0] > 10_000:
+        raise SerializationError("response contains too many values")
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > _MAX_TEXT or any(
+            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
+            for char in value
+        ):
+            raise SerializationError("response contains invalid text")
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise SerializationError("response contains a non-finite number")
+        return value
     if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise SerializationError("response contains a naive datetime")
         return value.isoformat()
     if isinstance(value, Enum):
-        return value.value
-    if is_dataclass(value):
-        return {key: _json_value(item) for key, item in asdict(value).items()}
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    return value
+        return _json_value(value.value, depth=depth + 1, seen=seen, count=count)
+    identity = id(value)
+    if identity in seen:
+        raise SerializationError("response contains a cycle")
+    seen.add(identity)
+    try:
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: _json_value(
+                    getattr(value, field.name), depth=depth + 1, seen=seen, count=count
+                )
+                for field in fields(value)
+            }
+        if isinstance(value, Mapping):
+            result = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise SerializationError("response object keys must be strings")
+                result[key] = _json_value(item, depth=depth + 1, seen=seen, count=count)
+            return result
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return [_json_value(item, depth=depth + 1, seen=seen, count=count) for item in value]
+    except (RecursionError, TypeError, ValueError) as exc:
+        if isinstance(exc, SerializationError):
+            raise
+        raise SerializationError("response serialization failed") from exc
+    finally:
+        seen.discard(identity)
+    raise SerializationError("response contains an unsupported value")
 
 
 def _response(payload: dict[str, Any], status: int = 200) -> Response:
-    return Response(json_body=_json_value(payload), status=status)
+    converted = _json_value(payload)
+    try:
+        import json
+
+        encoded = json.dumps(converted, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise SerializationError("response serialization failed") from exc
+    if len(encoded.encode("utf-8")) > _MAX_JSON_BYTES:
+        raise SerializationError("response is too large")
+    return Response(json_body=converted, status=status)
 
 
 def _error(status: int, code: str, message: str) -> Response:
@@ -57,78 +128,146 @@ def _domain_error(exc: Exception) -> Response:
     if isinstance(exc, TransitionConflict):
         return _error(409, "transition_conflict", "artifact state does not allow the operation")
     if isinstance(exc, AdminMutationsUnavailable):
-        return _error(503, "mutations_unavailable", str(exc))
+        return _error(503, "mutations_unavailable", "guardian mutations are unavailable")
     if isinstance(exc, AdminFeatureUnavailable):
         return _error(503, f"{exc.feature}_unavailable", str(exc))
-    if isinstance(exc, StoreUnavailable):
+    if isinstance(exc, (StoreUnavailable, RegistryUnavailable)):
         return _error(503, "store_unavailable", "guardian store is unavailable")
-    if isinstance(exc, (InvalidSha256, ValueError, TypeError)):
+    if isinstance(exc, (AdminRequestError, InvalidSha256)):
         return _error(400, "invalid_request", str(exc))
-    raise exc
+    if isinstance(exc, SerializationError):
+        return _error(503, "serialization_unavailable", "guardian response is unavailable")
+    return _error(503, "provider_unavailable", "guardian provider is unavailable")
 
 
 def _service(request):
-    return request.registry[ADMIN_SERVICE_REGISTRY_KEY]
+    try:
+        service = request.registry[ADMIN_SERVICE_REGISTRY_KEY]
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise RegistryUnavailable from exc
+    required = ("list_quarantine", "inspect", "health")
+    if not all(callable(getattr(service, name, None)) for name in required):
+        raise RegistryUnavailable
+    return service
 
 
 def _actor(request) -> str:
     actor = request.authenticated_userid
-    if not isinstance(actor, str) or not actor.strip():
-        raise ValueError("authenticated actor is required")
+    if (
+        not isinstance(actor, str)
+        or not actor.strip()
+        or len(actor) > _MAX_TEXT
+        or any(
+            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
+            for char in actor
+        )
+    ):
+        raise AdminRequestError("authenticated actor is required")
     return actor
-
-
-def _reason(request) -> str:
-    body = request.json_body
-    reason = body.get("reason") if isinstance(body, dict) else None
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("reason is required")
-    return reason
 
 
 def _body(request) -> dict[str, Any]:
     body = request.json_body
     if not isinstance(body, dict):
-        raise ValueError("JSON object body is required")
-    return body
+        raise AdminRequestError("JSON object body is required")
+    try:
+        snapshot = _json_value(body)
+    except SerializationError as exc:
+        raise AdminRequestError("request JSON is invalid") from exc
+    if not isinstance(snapshot, dict):
+        raise AdminRequestError("JSON object body is required")
+    return snapshot
 
 
-def _policy(request) -> dict[str, Any]:
-    policy = _body(request).get("policy")
+def _reason(body: Mapping[str, Any]) -> str:
+    reason = body.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason.strip()
+        or len(reason) > _MAX_TEXT
+        or any(
+            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
+            for char in reason
+        )
+    ):
+        raise AdminRequestError("reason is required")
+    return reason
+
+
+def _policy(body: Mapping[str, Any]) -> dict[str, Any]:
+    policy = body.get("policy")
     if not isinstance(policy, dict):
-        raise ValueError("policy object is required")
+        raise AdminRequestError("policy object is required")
     return policy
 
 
+def _sha(value: Any) -> str:
+    if not isinstance(value, str):
+        raise AdminRequestError("sha256 is required")
+    try:
+        return validate_sha256(value)
+    except InvalidSha256:
+        raise
+
+
 def _states(value: str | None) -> tuple[ArtifactState, ...]:
-    if value is None or not value.strip():
+    if value is None:
         return _DEFAULT_STATES
-    result = tuple(ArtifactState(item.strip().upper()) for item in value.split(","))
+    if not isinstance(value, str):
+        raise AdminRequestError("invalid quarantine state filter")
+    if not value.strip():
+        return _DEFAULT_STATES
+    try:
+        result = tuple(
+            dict.fromkeys(ArtifactState(item.strip().upper()) for item in value.split(","))
+        )
+    except (TypeError, ValueError) as exc:
+        raise AdminRequestError("invalid quarantine state filter") from exc
     if not result or ArtifactState.ALLOW in result or ArtifactState.MISSING in result:
-        raise ValueError("invalid quarantine state filter")
+        raise AdminRequestError("invalid quarantine state filter")
     return result
 
 
 def _bounded_int(value: str | None, *, default: int, minimum: int, maximum: int) -> int:
-    result = default if value is None else int(value)
+    try:
+        result = default if value is None else int(value)
+    except (TypeError, ValueError) as exc:
+        raise AdminRequestError("pagination value is out of range") from exc
     if result < minimum or result > maximum:
-        raise ValueError("pagination value is out of range")
+        raise AdminRequestError("pagination value is out of range")
     return result
+
+
+def _filter_text(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > _MAX_TEXT
+        or any(
+            ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
+            for char in value
+        )
+    ):
+        raise AdminRequestError(f"{name} is invalid")
+    return value
 
 
 def list_quarantine(request) -> Response:
     try:
         states = _states(request.params.get("state"))
-        limit = _bounded_int(request.params.get("limit"), default=50, minimum=1, maximum=200)
-        offset = _bounded_int(request.params.get("offset"), default=0, minimum=0, maximum=1_000_000)
-        page = _service(request).list_quarantine(states=states, limit=limit, offset=offset)
+        page = _service(request).list_quarantine(
+            states=states,
+            limit=_bounded_int(request.params.get("limit"), default=50, minimum=1, maximum=200),
+            offset=_bounded_int(
+                request.params.get("offset"), default=0, minimum=0, maximum=1_000_000
+            ),
+        )
+        if not isinstance(page, QuarantinePage):
+            raise SerializationError("invalid quarantine response")
         return _response(
-            {
-                "items": page.items,
-                "total": page.total,
-                "limit": page.limit,
-                "offset": page.offset,
-            }
+            {"items": page.items, "total": page.total, "limit": page.limit, "offset": page.offset}
         )
     except Exception as exc:
         return _domain_error(exc)
@@ -136,7 +275,9 @@ def list_quarantine(request) -> Response:
 
 def inspect_artifact(request) -> Response:
     try:
-        details = _service(request).inspect(request.matchdict["sha256"])
+        details = _service(request).inspect(_sha(request.matchdict["sha256"]))
+        if not isinstance(details, ArtifactAdminDetails):
+            raise SerializationError("invalid artifact response")
         return _response({"artifact": details})
     except Exception as exc:
         return _domain_error(exc)
@@ -144,7 +285,9 @@ def inspect_artifact(request) -> Response:
 
 def artifact_diff(request) -> Response:
     try:
-        result = _service(request).artifact_diff(request.matchdict["sha256"])
+        result = _service(request).artifact_diff(_sha(request.matchdict["sha256"]))
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid diff response")
         return _response({"diff": result})
     except Exception as exc:
         return _domain_error(exc)
@@ -152,20 +295,20 @@ def artifact_diff(request) -> Response:
 
 def list_audit(request) -> Response:
     try:
+        sha256 = request.params.get("sha256")
+        if sha256 is not None:
+            sha256 = _sha(sha256)
         limit = _bounded_int(request.params.get("limit"), default=50, minimum=1, maximum=200)
-        offset = _bounded_int(
-            request.params.get("offset"),
-            default=0,
-            minimum=0,
-            maximum=1_000_000,
-        )
+        offset = _bounded_int(request.params.get("offset"), default=0, minimum=0, maximum=1_000_000)
         result = _service(request).list_audit(
-            sha256=request.params.get("sha256"),
-            actor=request.params.get("actor"),
-            action=request.params.get("action"),
+            sha256=sha256,
+            actor=_filter_text(request.params.get("actor"), "actor"),
+            action=_filter_text(request.params.get("action"), "action"),
             limit=limit,
             offset=offset,
         )
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid audit response")
         return _response({**result, "limit": limit, "offset": offset})
     except Exception as exc:
         return _domain_error(exc)
@@ -174,19 +317,31 @@ def list_audit(request) -> Response:
 def list_baselines(request) -> Response:
     try:
         project = request.params.get("project")
-        if not isinstance(project, str) or not project.strip():
-            raise ValueError("project is required")
-        return _response({"items": _service(request).list_baselines(project)})
+        if (
+            not isinstance(project, str)
+            or not project.strip()
+            or len(project) > _MAX_TEXT
+            or any(
+                ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
+                for char in project
+            )
+        ):
+            raise AdminRequestError("project is required")
+        result = _service(request).list_baselines(project)
+        if isinstance(result, (str, bytes, bytearray)) or not isinstance(result, Sequence):
+            raise SerializationError("invalid baseline response")
+        return _response({"items": result})
     except Exception as exc:
         return _domain_error(exc)
 
 
 def add_baseline(request) -> Response:
     try:
-        sha256 = _body(request).get("sha256")
-        if not isinstance(sha256, str):
-            raise ValueError("sha256 is required")
-        _service(request).add_baseline(sha256, actor=_actor(request), reason=_reason(request))
+        body = _body(request)
+        sha256 = _sha(body.get("sha256"))
+        result = _service(request).add_baseline(sha256, actor=_actor(request), reason=_reason(body))
+        if result is not None:
+            raise AdminMutationsUnavailable("guardian mutation did not complete safely")
         return _response({"sha256": sha256, "status": "baseline_added"})
     except Exception as exc:
         return _domain_error(exc)
@@ -194,12 +349,13 @@ def add_baseline(request) -> Response:
 
 def remove_baseline(request) -> Response:
     try:
-        sha256 = request.matchdict["sha256"]
-        _service(request).remove_baseline(
-            sha256,
-            actor=_actor(request),
-            reason=_reason(request),
+        body = _body(request)
+        sha256 = _sha(request.matchdict["sha256"])
+        result = _service(request).remove_baseline(
+            sha256, actor=_actor(request), reason=_reason(body)
         )
+        if result is not None:
+            raise AdminMutationsUnavailable("guardian mutation did not complete safely")
         return _response({"sha256": sha256, "status": "baseline_removed"})
     except Exception as exc:
         return _domain_error(exc)
@@ -207,18 +363,20 @@ def remove_baseline(request) -> Response:
 
 def import_baselines(request) -> Response:
     try:
-        records = _body(request).get("records")
+        body = _body(request)
+        records = body.get("records")
         if (
             not isinstance(records, list)
             or not records
+            or len(records) > 1000
             or not all(isinstance(item, dict) for item in records)
         ):
-            raise ValueError("non-empty records array is required")
+            raise AdminRequestError("non-empty records array is required")
         result = _service(request).import_baselines(
-            tuple(records),
-            actor=_actor(request),
-            reason=_reason(request),
+            tuple(records), actor=_actor(request), reason=_reason(body)
         )
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid baseline import response")
         return _response(dict(result))
     except Exception as exc:
         return _domain_error(exc)
@@ -226,7 +384,11 @@ def import_baselines(request) -> Response:
 
 def policy_validate(request) -> Response:
     try:
-        return _response(dict(_service(request).validate_policy(_policy(request))))
+        body = _body(request)
+        result = _service(request).validate_policy(_policy(body))
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid policy response")
+        return _response(dict(result))
     except Exception as exc:
         return _domain_error(exc)
 
@@ -234,53 +396,70 @@ def policy_validate(request) -> Response:
 def policy_simulate(request) -> Response:
     try:
         body = _body(request)
-        sha256 = body.get("sha256")
-        if not isinstance(sha256, str):
-            raise ValueError("sha256 is required")
-        return _response(dict(_service(request).simulate_policy(_policy(request), sha256=sha256)))
+        result = _service(request).simulate_policy(_policy(body), sha256=_sha(body.get("sha256")))
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid policy response")
+        return _response(dict(result))
     except Exception as exc:
         return _domain_error(exc)
 
 
 def _mutation(request, operation, status: str) -> Response:
     try:
-        sha256 = request.matchdict["sha256"]
-        operation(sha256, actor=_actor(request), reason=_reason(request))
+        body = _body(request)
+        sha256 = _sha(request.matchdict["sha256"])
+        result = operation(sha256, actor=_actor(request), reason=_reason(body))
+        if result is not None:
+            raise AdminMutationsUnavailable("guardian mutation did not complete safely")
         return _response({"sha256": sha256, "status": status})
     except Exception as exc:
         return _domain_error(exc)
 
 
 def approve_artifact(request) -> Response:
-    return _mutation(request, _service(request).approve, "approved")
+    try:
+        return _mutation(request, _service(request).approve, "approved")
+    except Exception as exc:
+        return _domain_error(exc)
 
 
 def block_artifact(request) -> Response:
-    return _mutation(request, _service(request).block, "blocked")
+    try:
+        return _mutation(request, _service(request).block, "blocked")
+    except Exception as exc:
+        return _domain_error(exc)
 
 
 def rescan_artifact(request) -> Response:
-    return _mutation(request, _service(request).rescan, "rescan_requested")
+    try:
+        return _mutation(request, _service(request).rescan, "rescan_requested")
+    except Exception as exc:
+        return _domain_error(exc)
 
 
 def revoke_artifact(request) -> Response:
-    return _mutation(request, _service(request).revoke, "override_revoked")
+    try:
+        return _mutation(request, _service(request).revoke, "override_revoked")
+    except Exception as exc:
+        return _domain_error(exc)
 
 
 def add_exception(request) -> Response:
     try:
-        body = request.json_body
-        raw_expiry = body.get("expires_at") if isinstance(body, dict) else None
-        if not isinstance(raw_expiry, str):
-            raise ValueError("expires_at is required")
-        expires_at = datetime.fromisoformat(raw_expiry)
-        sha256 = request.matchdict["sha256"]
-        _service(request).add_exception(
-            sha256,
-            actor=_actor(request),
-            reason=_reason(request),
-            expires_at=expires_at,
+        body = _body(request)
+        raw_expiry = body.get("expires_at")
+        if not isinstance(raw_expiry, str) or len(raw_expiry) > _MAX_TEXT:
+            raise AdminRequestError("expires_at is required")
+        try:
+            expires_at = datetime.fromisoformat(raw_expiry)
+        except ValueError as exc:
+            raise AdminRequestError("expires_at is invalid") from exc
+        sha256 = _sha(request.matchdict["sha256"])
+        result = _service(request).add_exception(
+            sha256, actor=_actor(request), reason=_reason(body), expires_at=expires_at
         )
+        if result is not None:
+            raise AdminMutationsUnavailable("guardian mutation did not complete safely")
         return _response({"sha256": sha256, "status": "exception_added"})
     except Exception as exc:
         return _domain_error(exc)
@@ -288,7 +467,10 @@ def add_exception(request) -> Response:
 
 def health(request) -> Response:
     try:
-        return _response(_service(request).health())
+        result = _service(request).health()
+        if not isinstance(result, Mapping):
+            raise SerializationError("invalid health response")
+        return _response(dict(result))
     except Exception as exc:
         return _domain_error(exc)
 
@@ -303,10 +485,7 @@ def configure_admin_routes(pyramid_config) -> None:
         ("guardian_artifact_block", f"{prefix}/artifacts/{{sha256}}/block"),
         ("guardian_artifact_rescan", f"{prefix}/artifacts/{{sha256}}/rescan"),
         ("guardian_artifact_revoke", f"{prefix}/artifacts/{{sha256}}/revoke"),
-        (
-            "guardian_artifact_exception",
-            f"{prefix}/artifacts/{{sha256}}/exceptions",
-        ),
+        ("guardian_artifact_exception", f"{prefix}/artifacts/{{sha256}}/exceptions"),
         ("guardian_health", f"{prefix}/health"),
         ("guardian_audit", f"{prefix}/audit"),
         ("guardian_baselines", f"{prefix}/baselines"),
@@ -337,8 +516,5 @@ def configure_admin_routes(pyramid_config) -> None:
         pyramid_config.add_route(name, path)
     for route_name, view, method in views:
         pyramid_config.add_view(
-            view,
-            route_name=route_name,
-            request_method=method,
-            permission="user_modify",
+            view, route_name=route_name, request_method=method, permission="user_modify"
         )
