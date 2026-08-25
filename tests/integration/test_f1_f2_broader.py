@@ -5,6 +5,7 @@ from devpi_guardian import plugin
 from devpi_guardian.verdicts.db import ConnectionFactory
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.models import Decision
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
 from pathlib import Path
 from tests.conftest import RecordingAuditWriter
@@ -13,6 +14,7 @@ from tests.integration.test_direct_download import _build_wheel
 from tests.integration.test_direct_download import _discover
 from tests.integration.test_direct_download import _manual_allow
 from tests.integration.test_direct_download import _record_verdict
+from tests.integration.test_direct_download import _wait_for_terminal_artifact
 from tests.integration.test_pytest_devpi_server import _request
 import hashlib
 import os
@@ -367,6 +369,10 @@ def test_pip_and_uv_install_only_the_allowed_version(
     )
     # The production worker may consume the discovery claim immediately;
     # exercise the public administrator override instead of racing its lease.
+    _wait_for_terminal_artifact(
+        SQLiteVerdictReader(ConnectionFactory(db_path)),
+        allowed["sha256"],
+    )
     _manual_allow(store, allowed["sha256"], "installer integration allow")
 
     index_url = urllib.parse.urljoin(base_url, f"/{guardian_stage}/+simple/")

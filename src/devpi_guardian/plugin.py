@@ -303,12 +303,6 @@ def _build_components(
     *,
     activation=None,
 ) -> _Components:
-    audit_writer = SQLiteAuditWriter()
-    store = SQLiteArtifactStore(factory, audit_writer)
-    reader = SQLiteVerdictReader(factory)
-    queue = FileDiscoverySink(settings.db_path.parent / "discovery")
-    policy = PolicyEngine()
-    metrics = InMemoryBlockMetricRecorder()
     primary = not _is_replica(xom)
     session = None
     quarantine = None
@@ -319,9 +313,25 @@ def _build_components(
     try:
         if primary:
             assert settings.quarantine_root is not None
-            quarantine = QuarantineStore(settings.quarantine_root, max_size_bytes=1_000_000_000)
+            quarantine = QuarantineStore(
+                settings.quarantine_root,
+                max_size_bytes=1_000_000_000,
+                initialize=activation is None,
+            )
             if activation is not None:
                 activation()
+                quarantine.initialize()
+        elif activation is not None:
+            activation()
+        # Activation is the publication boundary: component construction
+        # below may create SQLite files and other durable state.
+        audit_writer = SQLiteAuditWriter()
+        store = SQLiteArtifactStore(factory, audit_writer)
+        reader = SQLiteVerdictReader(factory)
+        queue = FileDiscoverySink(settings.db_path.parent / "discovery")
+        policy = PolicyEngine()
+        metrics = InMemoryBlockMetricRecorder()
+        if primary:
             session = requests.Session()
             session.headers["User-Agent"] = f"devpi-guardian/{__version__}"
             worker_build_started = True
@@ -343,8 +353,6 @@ def _build_components(
             upload_connector = PrivateUploadConnector(
                 quarantine=quarantine, store=store, base_url=settings.base_url
             )
-        elif activation is not None:
-            activation()
         providers = ProductionAdminProviders(
             factory=factory,
             reader=reader,
@@ -496,7 +504,7 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
                 _close_components_resources(components, primary)
                 raise
 
-        action("devpi-guardian-final-publication", callable=publish, order=9999)
+        action("devpi-guardian-final-publication", callable=publish, order=math.inf)
         return
 
     # Small fake configurators used by unit tests do not implement Pyramid's

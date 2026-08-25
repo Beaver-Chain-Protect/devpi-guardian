@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from devpi_guardian.admin.providers import ProductionAdminProviders
+from devpi_guardian.admin.service import AdminProviderError, AdminRequestError
 from devpi_guardian.audit import SQLiteAuditWriter
 from devpi_guardian.policy import PolicyEngine
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
@@ -13,6 +15,7 @@ from devpi_guardian.verdicts.models import (
     ArtifactInput,
     Decision,
     EvidenceInput,
+    EvidenceRecord,
     ReleaseInput,
     VerdictInput,
 )
@@ -141,6 +144,30 @@ def test_providers_expose_audit_diff_policy_and_worker_health(tmp_path) -> None:
     assert health["audit_chain"]["valid"] is True
     assert health["audit_chain"]["count"] == 3
     assert health["audit_chain"]["reason"] is None
+
+
+def test_policy_input_is_client_error_but_corrupt_report_is_provider_error(tmp_path, monkeypatch):
+    providers, store, reader = _providers(tmp_path)
+    _record(store, sha256=REVIEW_SHA, version="2.0", decision=Decision.REVIEW)
+
+    with pytest.raises(AdminRequestError, match="invalid policy"):
+        providers.validate_policy({"unexpected": "field"})
+
+    details = reader.get_artifact_details(REVIEW_SHA)
+    corrupt = replace(
+        details,
+        evidence=(
+            replace(
+                details.evidence[0]
+                if details.evidence
+                else EvidenceRecord("corrupt", Decision.DENY, None, None, "corrupt", {}),
+                details={"analyzer": "F10"},
+            ),
+        ),
+    )
+    monkeypatch.setattr(reader, "get_artifact_details", lambda _sha256: corrupt)
+    with pytest.raises(AdminProviderError, match="stored analysis report"):
+        providers.simulate_policy({}, sha256=REVIEW_SHA)
 
 
 def test_baseline_management_is_separate_from_install_decision_and_audited(tmp_path) -> None:

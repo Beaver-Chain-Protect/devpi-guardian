@@ -82,7 +82,13 @@ def close_owned(stream, label: str, primary: BaseException | None = None) -> Non
 class QuarantineStore:
     """Secure CAS rooted at an absolute, private directory."""
 
-    def __init__(self, root: Path | str, *, max_size_bytes: int) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        max_size_bytes: int,
+        initialize: bool = True,
+    ) -> None:
         if type(max_size_bytes) is not int or max_size_bytes <= 0:
             raise ValueError("max_size_bytes must be positive")
         path = Path(root)
@@ -90,10 +96,17 @@ class QuarantineStore:
             raise ValueError("quarantine root must be absolute")
         self._root_path = path
         self._max_size_bytes = max_size_bytes
-        self._root_fd = self._open_root(path)
+        self._root_fd = self._open_root(path, create=initialize)
         self._objects_fd: int | None = None
         self._sha256_fd: int | None = None
         self._incoming_fd: int | None = None
+        if initialize:
+            self.initialize()
+
+    def initialize(self) -> None:
+        """Create and retain CAS directories after root validation/activation."""
+        if self._objects_fd is not None:
+            return
         try:
             self._objects_fd = self._open_or_create_dir(self._root_fd, "objects")
             self._sha256_fd = self._open_or_create_dir(self._objects_fd, "sha256")
@@ -307,7 +320,7 @@ class QuarantineStore:
         )
 
     @staticmethod
-    def _open_root(path: Path) -> int:
+    def _open_root(path: Path, *, create: bool = True) -> int:
         fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         parts = path.parts[1:]
         if not parts:
@@ -326,7 +339,7 @@ class QuarantineStore:
                     dir_fd=fd,
                 )
             except FileNotFoundError:
-                if not final:
+                if not final or not create:
                     _close_fd(fd)
                     raise QuarantineError("quarantine root parent does not exist") from None
                 try:

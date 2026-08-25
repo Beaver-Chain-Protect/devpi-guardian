@@ -237,6 +237,63 @@ def test_real_configurator_conflict_does_not_publish_or_build(monkeypatch, tmp_p
     assert plugin.ADMIN_SERVICE_REGISTRY_KEY not in pyramid.registry
 
 
+def test_final_publication_runs_after_later_finite_actions(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    events = []
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("build probe")),
+    )
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.action("later-finite", callable=lambda: events.append("later"), order=9999)
+
+    with pytest.raises(Exception, match="build probe"):
+        pyramid.commit()
+
+    assert events == ["later"]
+
+
+def test_activation_failure_after_quarantine_open_has_no_component_side_effects(tmp_path):
+    import devpi_guardian.plugin as plugin
+
+    root = tmp_path / "quarantine"
+    root.mkdir()
+    root.chmod(0o700)
+    settings = plugin._GuardianSettings(
+        db_path=tmp_path / "guardian.db",
+        quarantine_root=root,
+        base_url="http://127.0.0.1:3141",
+        cooldown_duration=timedelta(hours=24),
+        poll_interval=0.1,
+    )
+    xom = SimpleNamespace(is_replica=lambda: False)
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        plugin._build_components(
+            settings,
+            ConnectionFactory(tmp_path / "unused.db"),
+            xom,
+            activation=lambda: (_ for _ in ()).throw(RuntimeError("activation failed")),
+        )
+
+    assert not (tmp_path / "discovery").exists()
+    assert list(root.iterdir()) == []
+
+
 NOW = datetime(2026, 8, 24, tzinfo=UTC)
 DEVPI_UUID = "devpi-test-uuid"
 

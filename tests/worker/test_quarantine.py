@@ -42,6 +42,18 @@ def test_store_uses_absolute_digest_path_and_verified_descriptor(tmp_path: Path)
     store.close()
 
 
+def test_uninitialized_store_retains_root_descriptor_without_creating_cas(tmp_path: Path) -> None:
+    root = tmp_path / "q"
+    root.mkdir(mode=0o700)
+    store = QuarantineStore(root, max_size_bytes=100, initialize=False)
+
+    assert list(root.iterdir()) == []
+    store.initialize()
+    assert (root / "objects" / "sha256").is_dir()
+    assert (root / ".incoming").is_dir()
+    store.close()
+
+
 def test_relative_root_and_symlink_root_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         QuarantineStore(Path("relative"), max_size_bytes=100)

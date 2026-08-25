@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 
-from devpi_guardian.admin.service import AdminProviderError
+from devpi_guardian.admin.service import AdminProviderError, AdminRequestError
 from devpi_guardian.analyzers import Finding
 from devpi_guardian.audit import verify_audit_chain
 from devpi_guardian.baseline import artifact_kind
@@ -174,6 +174,13 @@ class ProductionAdminProviders:
         return {"items": [dict(row) for row in rows], "total": total}
 
     def artifact_diff(self, sha256: str) -> Mapping[str, object]:
+        digest = validate_sha256(sha256)
+        try:
+            return self._artifact_diff(digest)
+        except ValueError as exc:
+            raise AdminProviderError("artifact diff is unavailable") from exc
+
+    def _artifact_diff(self, sha256: str) -> Mapping[str, object]:
         details = self._reader.get_artifact_details(sha256)
         findings = []
         changed_files: set[str] = set()
@@ -250,7 +257,10 @@ class ProductionAdminProviders:
         return {"imported": len(dict.fromkeys(digests))}
 
     def validate_policy(self, policy: Mapping[str, object]) -> Mapping[str, object]:
-        engine = PolicyEngine(_policy_config(policy))
+        try:
+            engine = PolicyEngine(_policy_config(policy))
+        except (TypeError, ValueError) as exc:
+            raise AdminRequestError("invalid policy") from exc
         return {
             "valid": True,
             "policy_version": engine.policy_version,
@@ -263,8 +273,15 @@ class ProductionAdminProviders:
         *,
         sha256: str,
     ) -> Mapping[str, object]:
-        engine = PolicyEngine(_policy_config(policy))
-        report = self._stored_report(validate_sha256(sha256))
+        try:
+            engine = PolicyEngine(_policy_config(policy))
+        except (TypeError, ValueError) as exc:
+            raise AdminRequestError("invalid policy") from exc
+        digest = validate_sha256(sha256)
+        try:
+            report = self._stored_report(digest)
+        except ValueError as exc:
+            raise AdminProviderError("stored analysis report is unavailable") from exc
         result = engine.assess(report)
         return {
             "sha256": sha256,
