@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from collections.abc import Iterator
@@ -1010,6 +1011,38 @@ def test_record_verdict_redacts_nested_credential_fields_at_persistence_boundary
     details_json = fetchall(store, "SELECT details_json FROM evidence")[0][0]
 
     assert details_json == (f'{{"message":{{"client_secret":"[REDACTED]","sha256":"{digest}"}}}}')
+
+
+def test_record_verdict_redacts_entire_evidence_details_at_persistence_boundary(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    digest = "a" * 64
+    store.record_verdict(
+        claim,
+        verdict(),
+        [
+            evidence(
+                details={
+                    "path": "/Users/alice/My Secret/file.whl",
+                    "url": "https://user:secret@example.invalid/a?token=query-secret",
+                    "exception": "failed https://user:secret@example.invalid/a",
+                    "sha256": digest,
+                }
+            )
+        ],
+    )
+
+    details_json = fetchall(store, "SELECT details_json FROM evidence")[0][0]
+    details = json.loads(details_json)
+
+    assert details == {
+        "exception": "failed [URL]",
+        "path": "[PATH]",
+        "sha256": digest,
+        "url": "[URL]",
+    }
 
 
 @pytest.mark.parametrize(

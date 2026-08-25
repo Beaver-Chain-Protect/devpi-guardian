@@ -58,34 +58,40 @@ _AUTH_SCHEME = re.compile(
     r")"
 )
 _DIGEST = re.compile(r"(?i)\b[0-9a-f]{64}\b")
+_PATH_STRUCTURAL_DELIMITERS = r",;:'\"<>{}=\[\]()|`"
+_PATH_BODY_EXCLUDED = rf"\n{_PATH_STRUCTURAL_DELIMITERS}"
 _POSIX_PATH_WITH_SPACES = re.compile(
-    r"(?<![\w:])/(?!\+)"
-    r"(?=[^\n,;:'\"<>{}=]*\s)"
-    r"[^\n,;:'\"<>{}=]*?\.[A-Za-z0-9]+(?=\s|$)"
+    rf"(?<![\w:])/(?!\+)"
+    rf"(?=[^{_PATH_BODY_EXCLUDED}]*\s)"
+    rf"[^{_PATH_BODY_EXCLUDED}]*?\.[A-Za-z0-9]+"
+    rf"(?=[{_PATH_STRUCTURAL_DELIMITERS}]|\s|$)"
 )
 _POSIX_PATH_WITH_SPACES_TERMINAL = re.compile(
-    r"(?<![\w:])/(?!\+)"
-    r"(?=[^\n,;:'\"<>{}=]*\s)"
-    r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
-    r"[^\n,;:'\"<>{}=]+$"
+    rf"(?<![\w:])/(?!\+)"
+    rf"(?=[^{_PATH_BODY_EXCLUDED}]*\s)"
+    rf"(?![^{_PATH_BODY_EXCLUDED}]*\.[A-Za-z0-9]+[{_PATH_STRUCTURAL_DELIMITERS}]|"
+    rf"[^{_PATH_BODY_EXCLUDED}]*\.[A-Za-z0-9]+\s)"
+    rf"[^{_PATH_BODY_EXCLUDED}]+?(?=[{_PATH_STRUCTURAL_DELIMITERS}]|$)"
 )
-_POSIX_PATH = re.compile(r"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s,;:'\"]+")
+_POSIX_PATH = re.compile(rf"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s{_PATH_STRUCTURAL_DELIMITERS}]+")
 _POSIX_SINGLE_COMPONENT_PATH = re.compile(
-    r"(?<![\w:])/(?!\+)[^\s/,;:'\"<>{}=]+"
-    r"(?=[\s,;:'\"<>{}=]|$)"
+    rf"(?<![\w:])/(?!\+)[^\s/{_PATH_STRUCTURAL_DELIMITERS}]+"
+    rf"(?=[\s{_PATH_STRUCTURAL_DELIMITERS}]|$)"
 )
 _WINDOWS_PATH_WITH_SPACES = re.compile(
-    r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
-    r"(?=[^\n,;:'\"<>{}=]*\s)"
-    r"[^\n,;:'\"<>{}=]*?\.[A-Za-z0-9]+(?=\s|$)"
+    rf"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
+    rf"(?=[^{_PATH_BODY_EXCLUDED}]*\s)"
+    rf"[^{_PATH_BODY_EXCLUDED}]*?\.[A-Za-z0-9]+"
+    rf"(?=[{_PATH_STRUCTURAL_DELIMITERS}]|\s|$)"
 )
 _WINDOWS_PATH_WITH_SPACES_TERMINAL = re.compile(
-    r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
-    r"(?=[^\n,;:'\"<>{}=]*\s)"
-    r"(?![^\n,;:'\"<>{}=]*\.[A-Za-z0-9]+\s)"
-    r"[^\n,;:'\"<>{}=]+$"
+    rf"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)"
+    rf"(?=[^{_PATH_BODY_EXCLUDED}]*\s)"
+    rf"(?![^{_PATH_BODY_EXCLUDED}]*\.[A-Za-z0-9]+[{_PATH_STRUCTURAL_DELIMITERS}]|"
+    rf"[^{_PATH_BODY_EXCLUDED}]*\.[A-Za-z0-9]+\s)"
+    rf"[^{_PATH_BODY_EXCLUDED}]+?(?=[{_PATH_STRUCTURAL_DELIMITERS}]|$)"
 )
-_WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;:'\"]+")
+_WINDOWS_PATH = re.compile(rf"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s{_PATH_STRUCTURAL_DELIMITERS}]+")
 _DIAGNOSTIC_FIELDS = frozenset(
     {
         "diagnostic",
@@ -97,6 +103,9 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "origin",
         "source",
         "sink",
+        "details",
+        "reason",
+        "failure_reason",
     }
 )
 _IDENTITY_FIELDS = frozenset({"sha256", "baseline_sha256", "fingerprint"})
@@ -248,3 +257,9 @@ def sanitize_diagnostic_fields(
         finally:
             seen.discard(identity)
     return sanitize_diagnostic(value) if _diagnostic_context and isinstance(value, str) else value
+
+
+def sanitize_diagnostic_graph(value: object) -> object:
+    """Sanitize a complete structured diagnostic graph at a trust boundary."""
+
+    return sanitize_diagnostic_fields(value, _diagnostic_context=True)

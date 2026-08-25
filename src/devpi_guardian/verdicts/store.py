@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from devpi_common.metadata import normalize_name
 
-from devpi_guardian.privacy import sanitize_diagnostic, sanitize_diagnostic_fields
+from devpi_guardian.privacy import sanitize_diagnostic, sanitize_diagnostic_graph
 
 from .db import ConnectionFactory
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
@@ -196,7 +196,7 @@ def _prepare_evidence(
             raw_message = _require_stored_string(item.message, "message")
             message = sanitize_diagnostic(raw_message)
             try:
-                details_json = _serialize_details(sanitize_diagnostic_fields(item.details))
+                details_json = _serialize_details(sanitize_diagnostic_graph(item.details))
             except (
                 TypeError,
                 ValueError,

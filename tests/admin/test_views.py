@@ -130,6 +130,48 @@ def test_response_defense_in_depth_sanitizes_structured_escaped_credentials_and_
     assert response.json_body["artifact"]["summary"]["baseline_sha256"] == digest
 
 
+def test_response_defense_in_depth_sanitizes_entire_evidence_details_subtree() -> None:
+    digest = "a" * 64
+    response = _response(
+        {
+            "artifact": {
+                "summary": {"sha256": digest},
+                "evidence": [
+                    {
+                        "details": {
+                            "path": "/Users/alice/My Secret/file.whl",
+                            "url": "https://user:secret@example.invalid/a?token=query-secret",
+                            "exception": "failed https://user:secret@example.invalid/a",
+                            "sha256": digest,
+                        }
+                    }
+                ],
+            }
+        }
+    )
+
+    details = response.json_body["artifact"]["evidence"][0]["details"]
+
+    assert details["path"] == "[PATH]"
+    assert details["url"] == "[URL]"
+    assert details["exception"] == "failed [URL]"
+    assert details["sha256"] == digest
+
+
+def test_response_defense_in_depth_sanitizes_reason_fields() -> None:
+    response = _response(
+        {
+            "reason": "X-Devpi-Auth: audit-secret /Users/alice/private/file.whl",
+            "failure_reason": "failed https://user:secret@example.invalid/a",
+        }
+    )
+
+    assert response.json_body == {
+        "reason": "X-Devpi-Auth: [REDACTED] [PATH]",
+        "failure_reason": "failed [URL]",
+    }
+
+
 class Service:
     def health(self):
         return {"database": "ok"}
@@ -249,7 +291,7 @@ def test_inspect_allows_allow_details_and_large_nested_evidence_text() -> None:
     response = inspect_artifact(request(DetailsService()))
     assert response.status_code == 200
     assert response.json_body["artifact"]["allowed"] is True
-    assert response.json_body["artifact"]["evidence"][0]["details"]["note"] == "x" * 5000
+    assert response.json_body["artifact"]["evidence"][0]["details"]["note"] == "x" * 4096
 
 
 def test_inspect_rejects_baseline_tier_without_sha() -> None:

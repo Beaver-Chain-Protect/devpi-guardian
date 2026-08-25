@@ -186,6 +186,132 @@ def test_sanitize_diagnostic_redacts_spaced_path_but_preserves_following_prose(
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "failed /tmp/My Secret/a.whl, retrying",
+            "failed [PATH], retrying",
+        ),
+        (
+            "failed /tmp/My Secret/cache dir; retrying",
+            "failed [PATH]; retrying",
+        ),
+        (
+            'failed /tmp/My Secret/a.whl" retrying',
+            'failed [PATH]" retrying',
+        ),
+        (
+            "failed /tmp/My Secret/cache dir] retrying",
+            "failed [PATH]] retrying",
+        ),
+        (
+            "failed /tmp/My Secret/cache dir) retrying",
+            "failed [PATH]) retrying",
+        ),
+        (
+            "failed /tmp/My Secret/cache dir} retrying",
+            "failed [PATH]} retrying",
+        ),
+        (
+            "failed /tmp/My Secret/cache dir| retrying",
+            "failed [PATH]| retrying",
+        ),
+        (
+            "failed /tmp/My Secret/cache dir` retrying",
+            "failed [PATH]` retrying",
+        ),
+        (
+            "failed C:/My Secret/a.whl, retrying",
+            "failed [PATH], retrying",
+        ),
+        (
+            "failed C:/My Secret/cache dir; retrying",
+            "failed [PATH]; retrying",
+        ),
+        (
+            'failed C:/My Secret/a.whl" retrying',
+            'failed [PATH]" retrying',
+        ),
+        (
+            "failed C:/My Secret/cache dir] retrying",
+            "failed [PATH]] retrying",
+        ),
+        (
+            "failed C:/My Secret/cache dir) retrying",
+            "failed [PATH]) retrying",
+        ),
+        (
+            "failed C:/My Secret/cache dir} retrying",
+            "failed [PATH]} retrying",
+        ),
+        (
+            "failed C:/My Secret/cache dir| retrying",
+            "failed [PATH]| retrying",
+        ),
+        (
+            "failed C:/My Secret/cache dir` retrying",
+            "failed [PATH]` retrying",
+        ),
+        (
+            r"failed \\server\Share Name/a.whl, retrying",
+            r"failed [PATH], retrying",
+        ),
+        (
+            r"failed \\server\Share Name/cache dir; retrying",
+            r"failed [PATH]; retrying",
+        ),
+        (
+            r'failed \\server\Share Name/a.whl" retrying',
+            r'failed [PATH]" retrying',
+        ),
+        (
+            r"failed \\server\Share Name/cache dir] retrying",
+            r"failed [PATH]] retrying",
+        ),
+        (
+            r"failed \\server\Share Name/cache dir) retrying",
+            r"failed [PATH]) retrying",
+        ),
+        (
+            r"failed \\server\Share Name/cache dir} retrying",
+            r"failed [PATH]} retrying",
+        ),
+        (
+            r"failed \\server\Share Name/cache dir| retrying",
+            r"failed [PATH]| retrying",
+        ),
+        (
+            r"failed \\server\Share Name/cache dir` retrying",
+            r"failed [PATH]` retrying",
+        ),
+    ],
+)
+def test_sanitize_diagnostic_redacts_spaced_paths_before_structure_delimiters(
+    value: str, expected: str
+) -> None:
+    assert sanitize_diagnostic(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("failed path=/tmp, retrying", "failed path=[PATH], retrying"),
+        ("failed path=/tmp; retrying", "failed path=[PATH]; retrying"),
+        ('failed path=/tmp" retrying', 'failed path=[PATH]" retrying'),
+        ("failed path=/tmp] retrying", "failed path=[PATH]] retrying"),
+        ("failed path=/tmp) retrying", "failed path=[PATH]) retrying"),
+        ("failed path=/tmp} retrying", "failed path=[PATH]} retrying"),
+        ("failed path=/tmp| retrying", "failed path=[PATH]| retrying"),
+        ("failed path=/tmp` retrying", "failed path=[PATH]` retrying"),
+    ],
+)
+def test_sanitize_diagnostic_redacts_single_component_before_structure_delimiters(
+    value: str, expected: str
+) -> None:
+    assert sanitize_diagnostic(value) == expected
+
+
+@pytest.mark.parametrize(
     ("value", "secrets"),
     [
         (r"{\"client_secret\":\"abc\\\"def\"}", ("abc", "def")),
