@@ -306,6 +306,7 @@ class EnforcementDecision:
     policy_version: str | None
     cooldown_until: datetime | None = None
     cooldown_finished: bool = True
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1181,8 +1181,36 @@ def test_manual_allow_bypasses_automated_cooldown_but_automated_allow_does_not(t
 
     assert manual.allowed is True
     assert manual.source is DecisionSource.MANUAL_OVERRIDE
+    assert manual.reason is None
     assert automated.allowed is False
     assert automated.source is DecisionSource.AUTOMATED
+    assert automated.reason == "automated_allow_cooldown"
+
+
+def test_expired_manual_allow_resumes_automated_allow_cooldown_reason(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    cooldown = NOW + timedelta(hours=1)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        manual=Decision.ALLOW,
+        expires=NOW + timedelta(minutes=1),
+        cooldown_until=cooldown,
+    )
+
+    reader = SQLiteVerdictReader(
+        factory,
+        now=lambda: NOW + timedelta(minutes=2),
+    )
+    result = reader.get_effective_decision(SHA_ALLOW)
+
+    assert result.allowed is False
+    assert result.effective_decision is Decision.ALLOW
+    assert result.source is DecisionSource.AUTOMATED
+    assert result.reason == "automated_allow_cooldown"
 
 
 def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:
@@ -1207,6 +1235,7 @@ def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:
     assert result.effective_decision is Decision.DENY
     assert result.source is DecisionSource.AUTOMATED
     assert result.artifact_state is ArtifactState.REVIEW
+    assert result.reason is None
 
 
 def test_missing_and_batch_results_are_fail_closed(tmp_path) -> None:

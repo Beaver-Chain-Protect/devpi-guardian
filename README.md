@@ -470,7 +470,7 @@ uv run pytest -m performance -s -v
 Bootstrap the locked test environment, then run the complete checks:
 
 ```console
-uv sync --extra test
+uv sync --locked --extra test
 uv run pytest -q
 uv run ruff format --check .
 uv run ruff check .

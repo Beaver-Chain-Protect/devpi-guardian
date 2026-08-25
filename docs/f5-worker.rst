@@ -14,8 +14,11 @@ Configure a primary devpi process with an explicit absolute quarantine root::
       --guardian-base-url https://devpi.example.test
 
 The quarantine root must be a dedicated directory owned by the devpi service account,
-mode ``0700``, and outside ``--serverdir``. The worker creates the following content-
-addressed layout::
+mode ``0700``, and outside ``--serverdir``. Every existing ancestor is checked before
+activation: it must be owned by root or the devpi service account and must not be writable
+by group or other users. A root-owned sticky ancestor (for example ``/tmp``) is the sole
+permitted shared-writable exception; an unsafe writable ancestor is rejected. The worker
+creates the following content-addressed layout::
 
     <root>/objects/sha256/<first-2>/<next-2>/<sha256>
 

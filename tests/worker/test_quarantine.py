@@ -581,6 +581,9 @@ def test_existing_corrupt_close_failure_is_fail_closed(tmp_path: Path, monkeypat
         def close(self):
             raise OSError("existing close failed")
 
+        def __del__(self):
+            BytesIO.close(self)
+
     def open_verified(*args, **kwargs):
         nonlocal calls
         calls += 1

@@ -36,6 +36,12 @@ class FailingCloseStream(TrackingStream):
         self.close_calls += 1
         raise RuntimeError("close failed")
 
+    def __del__(self) -> None:
+        # BytesIO.__del__ calls the overridden close() during GC.  Keep the
+        # failure-injection behavior for explicit closes without creating an
+        # unraisable exception when pytest collects the test double.
+        BytesIO.close(self)
+
 
 class EventuallyCloseStream(TrackingStream):
     def close(self) -> None:

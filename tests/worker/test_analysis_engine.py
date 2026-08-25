@@ -244,6 +244,10 @@ class CloseFailStream(BytesIO):
         self.close_attempts += 1
         raise RuntimeError(self.message)
 
+    def __del__(self) -> None:
+        # Preserve explicit close failures while making finalization safe.
+        BytesIO.close(self)
+
 
 class ClosePropertyRaises:
     def __init__(self) -> None:

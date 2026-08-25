@@ -515,6 +515,13 @@ class SQLiteVerdictReader:
         context: PersistedStateContext,
     ) -> EnforcementDecision:
         allowed = context.effective_decision is Decision.ALLOW and context.cooldown_finished
+        reason = None
+        if (
+            context.source is DecisionSource.AUTOMATED
+            and context.effective_decision is Decision.ALLOW
+            and not context.cooldown_finished
+        ):
+            reason = "automated_allow_cooldown"
         return EnforcementDecision(
             sha256=sha256,
             allowed=allowed,
@@ -524,4 +531,5 @@ class SQLiteVerdictReader:
             policy_version=context.policy_version,
             cooldown_until=context.cooldown_until,
             cooldown_finished=context.cooldown_finished,
+            reason=reason,
         )
