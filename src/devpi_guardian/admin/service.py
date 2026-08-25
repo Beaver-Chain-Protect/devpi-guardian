@@ -72,6 +72,8 @@ class AuditReader(Protocol):
         offset: int,
     ) -> Mapping[str, object]: ...
 
+    def audit_health(self) -> Mapping[str, object]: ...
+
 
 class ArtifactDiffReader(Protocol):
     def artifact_diff(self, sha256: str) -> Mapping[str, object]: ...
@@ -222,6 +224,12 @@ class GuardianAdminService:
             "baseline": self._baseline_manager is not None,
             "policy": self._policy_manager is not None,
         }
+        audit_health = {"status": "unavailable"}
+        if self._audit_reader is not None:
+            checker = getattr(self._audit_reader, "audit_health", None)
+            if callable(checker):
+                audit_health = dict(self._mapping_result(checker(), "audit"))
+        result["audit_chain"] = audit_health
         return result
 
     def list_audit(

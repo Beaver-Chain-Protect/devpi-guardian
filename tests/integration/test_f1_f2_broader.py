@@ -11,6 +11,7 @@ from tests.conftest import RecordingAuditWriter
 from tests.integration.test_direct_download import Links
 from tests.integration.test_direct_download import _build_wheel
 from tests.integration.test_direct_download import _discover
+from tests.integration.test_direct_download import _manual_allow
 from tests.integration.test_direct_download import _record_verdict
 from tests.integration.test_pytest_devpi_server import _request
 import hashlib
@@ -34,6 +35,13 @@ def simple_artifacts(response):
 
 def make_guardian_testapp(makemapp, maketestapp, makexom):
     xom = makexom(plugins=[plugin])
+    quarantine_root = Path(xom.config.server_path).parent.resolve() / "guardian-quarantine"
+    quarantine_root.mkdir(parents=True, exist_ok=False)
+    os.chmod(quarantine_root, 0o700)
+    xom.config.args.guardian_quarantine_root = str(quarantine_root)
+    host = getattr(xom.config.args, "host", "127.0.0.1") or "127.0.0.1"
+    port = getattr(xom.config.args, "port", 3141) or 3141
+    xom.config.args.guardian_base_url = f"http://{host}:{port}"
     testapp = maketestapp(xom)
     mapp = makemapp(testapp)
     mapp.create_and_login_user("guard", password="123")
@@ -357,7 +365,9 @@ def test_pip_and_uv_install_only_the_allowed_version(
         direct_url=direct_urls[allowed["sha256"]],
         stage=base_stage,
     )
-    _record_verdict(store, allowed["sha256"], Decision.ALLOW)
+    # The production worker may consume the discovery claim immediately;
+    # exercise the public administrator override instead of racing its lease.
+    _manual_allow(store, allowed["sha256"], "installer integration allow")
 
     index_url = urllib.parse.urljoin(base_url, f"/{guardian_stage}/+simple/")
     environment = os.environ.copy()

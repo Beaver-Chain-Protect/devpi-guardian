@@ -196,6 +196,8 @@ def _domain_error(exc: Exception) -> Response:
         return _error(503, "serialization_unavailable", "guardian response is unavailable")
     if isinstance(exc, AdminProviderError):
         return _error(503, "provider_unavailable", "guardian provider is unavailable")
+    if isinstance(exc, ValueError):
+        return _error(400, "invalid_request", "administrator request is invalid")
     raise exc
 
 

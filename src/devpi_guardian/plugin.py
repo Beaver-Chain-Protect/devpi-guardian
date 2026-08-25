@@ -214,9 +214,12 @@ def _safe_path(path: Path, *, label: str, server_path: Path) -> Path:
     if not path.exists() or not path.is_dir():
         raise Fatal(f"{label} must already exist as a directory")
     try:
-        mode = path.stat().st_mode & 0o777
+        stat_result = path.stat()
     except OSError as exc:
         raise Fatal(f"{label} cannot be inspected") from exc
+    if stat_result.st_uid != os.geteuid():
+        raise Fatal(f"{label} owner is unsafe")
+    mode = stat_result.st_mode & 0o777
     if mode != 0o700:
         raise Fatal(f"{label} mode must be 0700")
     return path
@@ -281,7 +284,25 @@ class _Components:
     quarantine: QuarantineStore | None
 
 
-def _build_components(settings: _GuardianSettings, factory: ConnectionFactory, xom) -> _Components:
+def _close_components_resources(components: _Components, primary: BaseException) -> None:
+    for resource in (components.session, components.quarantine):
+        close = getattr(resource, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as cleanup:
+                primary.add_note(
+                    f"Guardian resource cleanup failed: {type(cleanup).__name__}: {cleanup}"
+                )
+
+
+def _build_components(
+    settings: _GuardianSettings,
+    factory: ConnectionFactory,
+    xom,
+    *,
+    activation=None,
+) -> _Components:
     audit_writer = SQLiteAuditWriter()
     store = SQLiteArtifactStore(factory, audit_writer)
     reader = SQLiteVerdictReader(factory)
@@ -299,6 +320,8 @@ def _build_components(settings: _GuardianSettings, factory: ConnectionFactory, x
         if primary:
             assert settings.quarantine_root is not None
             quarantine = QuarantineStore(settings.quarantine_root, max_size_bytes=1_000_000_000)
+            if activation is not None:
+                activation()
             session = requests.Session()
             session.headers["User-Agent"] = f"devpi-guardian/{__version__}"
             worker_build_started = True
@@ -320,6 +343,8 @@ def _build_components(settings: _GuardianSettings, factory: ConnectionFactory, x
             upload_connector = PrivateUploadConnector(
                 quarantine=quarantine, store=store, base_url=settings.base_url
             )
+        elif activation is not None:
+            activation()
         providers = ProductionAdminProviders(
             factory=factory,
             reader=reader,
@@ -365,7 +390,7 @@ def _build_components(settings: _GuardianSettings, factory: ConnectionFactory, x
         raise
 
 
-def _publish_components(components: _Components, pyramid_config, xom) -> None:
+def _publish_components(components: _Components, pyramid_config, xom, *, configure=True) -> None:
     thread_pool = getattr(xom, "thread_pool", None)
     if components.worker is not None and thread_pool is None:
         raise Fatal("Guardian primary requires a devpi thread pool")
@@ -390,12 +415,6 @@ def _publish_components(components: _Components, pyramid_config, xom) -> None:
     list_before = {
         name: list(value) for name, value in vars(pyramid_config).items() if isinstance(value, list)
     }
-    registered_before = (
-        list(thread_pool.registered)
-        if components.worker is not None
-        and isinstance(getattr(thread_pool, "registered", None), list)
-        else None
-    )
     try:
         set_discovery_sink(xom, components.queue)
         setattr(xom, _VERDICT_READER_XOM_ATTRIBUTE, components.reader)
@@ -404,13 +423,14 @@ def _publish_components(components: _Components, pyramid_config, xom) -> None:
         registry[VERDICT_READER_REGISTRY_KEY] = components.reader
         registry[BLOCK_METRIC_REGISTRY_KEY] = components.block_metrics
         registry[ADMIN_SERVICE_REGISTRY_KEY] = components.admin_service
-        configure_admin_routes(pyramid_config)
+        if configure:
+            configure_admin_routes(pyramid_config)
+            pyramid_config.add_tween(
+                "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
+                under="devpi_server.views.tween_keyfs_transaction",
+            )
         if components.worker is not None:
             thread_pool.register(components.worker)
-        pyramid_config.add_tween(
-            "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
-            under="devpi_server.views.tween_keyfs_transaction",
-        )
     except BaseException:
         for key, value in registry_before.items():
             if value is sentinel:
@@ -427,8 +447,6 @@ def _publish_components(components: _Components, pyramid_config, xom) -> None:
             current = getattr(pyramid_config, name, None)
             if isinstance(current, list):
                 current[:] = values
-        if registered_before is not None:
-            thread_pool.registered[:] = registered_before
         raise
 
 
@@ -447,28 +465,48 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
         raise Fatal("guardian audit chain verification failed") from exc
     if not verification.valid:
         raise Fatal("guardian audit chain verification failed")
-    try:
-        ensure_guardian_activation(
-            factory,
-            config.nodeinfo["uuid"],
-            lambda: find_existing_artifact_candidate(xom),
-            now=lambda: datetime.now(UTC),
+
+    def activate() -> None:
+        try:
+            ensure_guardian_activation(
+                factory,
+                config.nodeinfo["uuid"],
+                lambda: find_existing_artifact_candidate(xom),
+                now=lambda: datetime.now(UTC),
+            )
+        except GuardianActivationError as exc:
+            raise Fatal(str(exc)) from None
+
+    action = getattr(pyramid_config, "action", None)
+    if callable(action):
+        # Register all route/tween actions first.  Pyramid resolves their
+        # conflicts before this final action runs, so a conflict cannot leave
+        # a worker registered or Guardian state published.
+        configure_admin_routes(pyramid_config)
+        pyramid_config.add_tween(
+            "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
+            under="devpi_server.views.tween_keyfs_transaction",
         )
-    except GuardianActivationError as exc:
-        raise Fatal(str(exc)) from None
+
+        def publish() -> None:
+            components = _build_components(settings, factory, xom, activation=activate)
+            try:
+                _publish_components(components, pyramid_config, xom, configure=False)
+            except BaseException as primary:
+                _close_components_resources(components, primary)
+                raise
+
+        action("devpi-guardian-final-publication", callable=publish, order=9999)
+        return
+
+    # Small fake configurators used by unit tests do not implement Pyramid's
+    # deferred action API; preserve their direct, deterministic behavior.
+    activate()
     components = _build_components(settings, factory, xom)
     try:
         _publish_components(components, pyramid_config, xom)
     except BaseException as primary:
-        for resource in (components.session, components.quarantine):
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except BaseException as cleanup:
-                    primary.add_note(
-                        f"Guardian resource cleanup failed: {type(cleanup).__name__}: {cleanup}"
-                    )
+        _close_components_resources(components, primary)
         raise
 
 

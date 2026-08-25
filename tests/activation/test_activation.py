@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,48 @@ def test_primary_rejects_missing_quarantine_before_migration_or_publication(tmp_
 
     assert xom.thread_pool.registered == []
     assert plugin.VERDICT_READER_REGISTRY_KEY not in pyramid.registry
+    assert pyramid.tweens == []
+
+
+@pytest.mark.parametrize("kind", ["relative", "contained", "symlink", "mode", "owner"])
+def test_primary_rejects_unsafe_quarantine_roots_before_migration(tmp_path, monkeypatch, kind):
+    import os
+
+    import devpi_guardian.plugin as plugin
+
+    server = tmp_path / "server"
+    server.mkdir()
+    target = tmp_path / "quarantine-target"
+    target.mkdir()
+    target.chmod(0o700)
+    if kind == "relative":
+        root = Path("relative-quarantine")
+    elif kind == "contained":
+        root = server / "quarantine"
+        root.mkdir()
+        root.chmod(0o700)
+    elif kind == "symlink":
+        root = tmp_path / "quarantine-link"
+        root.symlink_to(target, target_is_directory=True)
+    else:
+        root = target
+        if kind == "mode":
+            root.chmod(0o755)
+        elif kind == "owner":
+            owner_uid = os.geteuid()
+            monkeypatch.setattr(plugin.os, "geteuid", lambda: owner_uid + 1)
+
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    config.server_path = str(server)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    assert xom.thread_pool.registered == []
+    assert pyramid.registry == {"xom": xom}
     assert pyramid.tweens == []
 
 
@@ -124,6 +167,74 @@ def test_publish_failure_rolls_back_registry_xom_and_thread_registration(monkeyp
     assert pyramid.routes == []
     assert pyramid.views == []
     assert pyramid.tweens == []
+
+
+def test_publish_add_tween_failure_precedes_real_thread_registration(monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    class Pool:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, worker):
+            self.registered.append(worker)
+
+    pool = Pool()
+    xom = SimpleNamespace(thread_pool=pool)
+    pyramid = SimpleNamespace(registry={}, routes=[], views=[], tweens=[])
+    components = SimpleNamespace(
+        queue=SimpleNamespace(discover=lambda _candidate: None, discover_many=lambda _items: None),
+        reader=object(),
+        block_metrics=object(),
+        admin_service=object(),
+        upload_connector=object(),
+        worker=object(),
+    )
+    monkeypatch.setattr(plugin, "configure_admin_routes", lambda _config: None)
+    monkeypatch.setattr(
+        pyramid,
+        "add_tween",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("tween conflict")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="tween conflict"):
+        plugin._publish_components(components, pyramid, xom)
+
+    assert pool.registered == []
+
+
+def test_real_configurator_conflict_does_not_publish_or_build(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+    from pyramid.exceptions import ConfigurationConflictError
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args: pytest.fail("components must not build before commit conflict resolution"),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.add_route("guardian_health", "/different-conflicting-route")
+
+    with pytest.raises(ConfigurationConflictError):
+        pyramid.commit()
+
+    assert xom.thread_pool._objects == []
+    assert not hasattr(xom, "_devpi_guardian_verdict_reader")
+    assert plugin.ADMIN_SERVICE_REGISTRY_KEY not in pyramid.registry
 
 
 NOW = datetime(2026, 8, 24, tzinfo=UTC)

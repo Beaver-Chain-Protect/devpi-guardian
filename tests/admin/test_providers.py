@@ -138,6 +138,9 @@ def test_providers_expose_audit_diff_policy_and_worker_health(tmp_path) -> None:
     assert health["status"] == "not_registered"
     assert health["queue"]["pending"] == 0
     assert health["artifacts"]["review"] == 1
+    assert health["audit_chain"]["valid"] is True
+    assert health["audit_chain"]["count"] == 3
+    assert health["audit_chain"]["reason"] is None
 
 
 def test_baseline_management_is_separate_from_install_decision_and_audited(tmp_path) -> None:

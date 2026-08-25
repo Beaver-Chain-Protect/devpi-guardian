@@ -34,20 +34,33 @@ class FakeParser:
 
 class FakePyramidConfig:
     def __init__(self, xom=None):
-        self.xom = SimpleNamespace() if xom is None else xom
+        self.xom = SimpleNamespace(is_replica=lambda: True) if xom is None else xom
         self.registry = {"xom": self.xom}
         self.tweens = []
 
     def add_tween(self, name, **kwargs):
         self.tweens.append((name, kwargs))
 
+    def add_route(self, *_args, **_kwargs):
+        return None
+
+    def add_view(self, *_args, **_kwargs):
+        return None
+
 
 def _config(tmp_path, *, guardian_db=None):
     if guardian_db is None:
         guardian_db = tmp_path / "guardian.db"
+    quarantine_root = tmp_path / "quarantine"
+    quarantine_root.mkdir(exist_ok=True)
+    quarantine_root.chmod(0o700)
     return SimpleNamespace(
         args=SimpleNamespace(
             guardian_db=str(guardian_db),
+            guardian_quarantine_root=str(quarantine_root),
+            guardian_base_url="http://127.0.0.1:3141",
+            guardian_cooldown_hours=24.0,
+            guardian_worker_poll_interval=0.25,
         ),
         nodeinfo={"uuid": "devpi-test-uuid"},
         server_path=Path(tmp_path / "server"),
@@ -166,22 +179,21 @@ def test_guardian_stage_accepts_a_valid_base() -> None:
     assert customizer.validate_config({}, {"bases": ["root/pypi"]}) is None
 
 
-def test_parser_exposes_guardian_db_option() -> None:
+def test_parser_exposes_guardian_options() -> None:
     parser = FakeParser()
     help_text = "path to the persistent devpi-guardian SQLite database"
 
     devpiserver_add_parser_options(parser)
 
-    assert parser.calls == [
-        (
-            ("--guardian-db",),
-            {
-                "action": "store",
-                "dest": "guardian_db",
-                "default": None,
-                "help": help_text,
-            },
-        )
+    assert parser.calls[0] == (
+        ("--guardian-db",),
+        {"action": "store", "dest": "guardian_db", "default": None, "help": help_text},
+    )
+    assert [call[0] for call in parser.calls[1:]] == [
+        ("--guardian-quarantine-root",),
+        ("--guardian-base-url",),
+        ("--guardian-cooldown-hours",),
+        ("--guardian-worker-poll-interval",),
     ]
 
 
@@ -274,7 +286,7 @@ def test_migration_failure_has_no_registry_or_tween_side_effects(
 
     monkeypatch.setattr("devpi_guardian.plugin.migrate", fail_migration)
 
-    with pytest.raises(RuntimeError, match="migration failed"):
+    with pytest.raises(Fatal, match="guardian migration failed"):
         devpiserver_pyramid_configure(config, pyramid)
 
     assert pyramid.registry == {"xom": pyramid.xom}
@@ -293,6 +305,10 @@ def test_pyramid_hook_runs_activation_before_registry_side_effects(
     monkeypatch.setattr(
         "devpi_guardian.plugin.migrate",
         lambda factory: events.append("migrate"),
+    )
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.verify_audit_chain",
+        lambda factory: SimpleNamespace(valid=True),
     )
 
     def activate(factory, devpi_uuid, find_candidate, *, now):
@@ -313,6 +329,15 @@ def test_pyramid_hook_runs_activation_before_registry_side_effects(
     class Reader:
         def __init__(self, factory):
             events.append("reader")
+
+        def list_quarantine(self, **_kwargs):
+            return None
+
+        def get_artifact_details(self, _sha256):
+            return None
+
+        def health(self):
+            return {}
 
     class Metrics:
         def __init__(self):
@@ -336,6 +361,8 @@ def test_pyramid_hook_runs_activation_before_registry_side_effects(
         def __setitem__(self, key, value):
             if key == VERDICT_READER_REGISTRY_KEY:
                 registry_event = "registry-reader"
+            elif key == plugin.ADMIN_SERVICE_REGISTRY_KEY:
+                registry_event = "registry-admin"
             else:
                 registry_event = "registry-metrics"
             events.append(registry_event)
@@ -353,6 +380,7 @@ def test_pyramid_hook_runs_activation_before_registry_side_effects(
         "metrics",
         "registry-reader",
         "registry-metrics",
+        "registry-admin",
         "tween",
     ]
 
@@ -378,6 +406,10 @@ def test_activation_failures_are_fatal_before_registry_mutation(
     pyramid = FakePyramidConfig()
     config = _config(tmp_path)
     monkeypatch.setattr("devpi_guardian.plugin.migrate", lambda factory: None)
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.verify_audit_chain",
+        lambda factory: SimpleNamespace(valid=True),
+    )
 
     def activate(factory, devpi_uuid, find_candidate, *, now):
         raise GuardianActivationError(ActivationFailureCategory(category))
@@ -404,6 +436,10 @@ def test_non_guardian_startup_exception_is_not_downgraded(
     failure = f"{tmp_path / 'guardian.db'} devpi-test-uuid activation-secret"
     expected = RuntimeError(failure)
     monkeypatch.setattr("devpi_guardian.plugin.migrate", lambda factory: None)
+    monkeypatch.setattr(
+        "devpi_guardian.plugin.verify_audit_chain",
+        lambda factory: SimpleNamespace(valid=True),
+    )
 
     def activate(factory, devpi_uuid, find_candidate, *, now):
         raise expected

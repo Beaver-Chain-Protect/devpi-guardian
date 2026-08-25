@@ -58,6 +58,9 @@ def test_thread_runner_sleeps_only_when_no_work_is_available() -> None:
         def __init__(self) -> None:
             self.sleeps = []
 
+        def exit_if_shutdown(self):
+            return None
+
         def sleep(self, seconds):
             self.sleeps.append(seconds)
             raise KeyboardInterrupt
@@ -70,7 +73,7 @@ def test_thread_runner_sleeps_only_when_no_work_is_available() -> None:
     assert runner.thread.sleeps == [0.25]
 
 
-def test_thread_runner_reports_health_and_closes_session() -> None:
+def test_thread_runner_reports_health_and_closes_session_from_worker_finally() -> None:
     from devpi_guardian.worker.runtime import GuardianWorkerThread
 
     coordinator = Cycles(SimpleNamespace(status=CoordinatorStatus.IDLE))
@@ -85,8 +88,73 @@ def test_thread_runner_reports_health_and_closes_session() -> None:
         def is_alive(self):
             return False
 
+        def exit_if_shutdown(self):
+            raise KeyboardInterrupt
+
     runner.thread = RegisteredThread()
 
     assert runner.worker_health()["status"] == "registered"
-    runner.thread_shutdown()
+    with contextlib.suppress(KeyboardInterrupt):
+        runner.thread_run()
+    assert closed == [True]
+
+
+def test_thread_runner_retries_recovery_and_redacts_error_details() -> None:
+    from devpi_guardian.worker.runtime import GuardianWorkerThread
+
+    class RecoveringCoordinator:
+        def __init__(self):
+            self.recoveries = 0
+
+        def recover_expired_claims(self):
+            self.recoveries += 1
+            if self.recoveries == 1:
+                raise RuntimeError("credential=/secret/path sha256=" + "a" * 64)
+            return 0
+
+        def run_once(self):
+            raise RuntimeError("origin=https://user:password@example.invalid")
+
+    class StopAfterTwoSleeps:
+        def __init__(self):
+            self.sleeps = 0
+
+        def sleep(self, _seconds):
+            self.sleeps += 1
+            if self.sleeps == 2:
+                raise KeyboardInterrupt
+
+        def exit_if_shutdown(self):
+            return None
+
+    coordinator = RecoveringCoordinator()
+    runner = GuardianWorkerThread(coordinator, poll_interval=0.01)
+    runner.thread = StopAfterTwoSleeps()
+
+    with contextlib.suppress(KeyboardInterrupt):
+        runner.thread_run()
+
+    assert coordinator.recoveries == 2
+    assert runner.worker_health()["last_error"] == "RuntimeError"
+
+
+def test_real_thread_pool_shutdown_closes_resources_in_worker_finally() -> None:
+    from devpi_server.mythread import ThreadPool
+
+    from devpi_guardian.worker.runtime import GuardianWorkerThread
+
+    closed = []
+    coordinator = Cycles(SimpleNamespace(status=CoordinatorStatus.IDLE))
+    runner = GuardianWorkerThread(
+        coordinator,
+        poll_interval=0.01,
+        shutdown=lambda: closed.append(True),
+    )
+    pool = ThreadPool()
+    pool.register(runner)
+    pool.start()
+    pool.shutdown()
+    runner.thread.join(timeout=2)
+
+    assert not runner.thread.is_alive()
     assert closed == [True]

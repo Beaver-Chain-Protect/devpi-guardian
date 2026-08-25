@@ -86,31 +86,49 @@ class GuardianWorkerThread:
             }
 
     def thread_run(self) -> None:
-        with self._health_lock:
-            self._started_at = datetime.now(UTC)
-        self._coordinator.recover_expired_claims()
-        while True:
-            try:
-                cycle = self._coordinator.run_once()
-            except Exception as exc:
+        try:
+            with self._health_lock:
+                self._started_at = datetime.now(UTC)
+            recovered = False
+            while True:
+                # MyThread raises its pool's Shutdown exception here.  Keep
+                # this outside the recover/run exception boundary so shutdown
+                # cannot be mistaken for a transient worker failure.
+                exit_if_shutdown = getattr(self.thread, "exit_if_shutdown", None)
+                if callable(exit_if_shutdown):
+                    exit_if_shutdown()
+                try:
+                    if not recovered:
+                        self._coordinator.recover_expired_claims()
+                        recovered = True
+                    cycle = self._coordinator.run_once()
+                except Exception as exc:
+                    with self._health_lock:
+                        self._last_cycle_at = datetime.now(UTC)
+                        self._last_error = type(exc).__name__
+                        self._cycles += 1
+                    self.thread.sleep(self._poll_interval)
+                    continue
                 with self._health_lock:
                     self._last_cycle_at = datetime.now(UTC)
-                    self._last_error = f"{type(exc).__name__}: {str(exc)[:512]}"
+                    self._last_error = None
                     self._cycles += 1
-                self.thread.sleep(self._poll_interval)
-                continue
-            with self._health_lock:
-                self._last_cycle_at = datetime.now(UTC)
-                self._last_error = None
-                self._cycles += 1
-                if cycle.status is not CoordinatorStatus.IDLE:
-                    self._completed += 1
-            if cycle.status is CoordinatorStatus.IDLE:
-                self.thread.sleep(self._poll_interval)
+                    if cycle.status is not CoordinatorStatus.IDLE:
+                        self._completed += 1
+                if cycle.status is CoordinatorStatus.IDLE:
+                    self.thread.sleep(self._poll_interval)
+        finally:
+            # The worker owns these resources.  devpi invokes
+            # thread_shutdown before joining workers, so closing here keeps
+            # an in-flight cycle from racing its HTTP/session or quarantine
+            # descriptor teardown.
+            if self._shutdown is not None:
+                self._shutdown()
 
     def thread_shutdown(self) -> None:
-        if self._shutdown is not None:
-            self._shutdown()
+        # Shutdown is signalled by devpi's ThreadPool.  Resource ownership
+        # remains with thread_run's finally block.
+        return None
 
 
 def _close_resources(session, quarantine: QuarantineStore, primary: BaseException) -> None:

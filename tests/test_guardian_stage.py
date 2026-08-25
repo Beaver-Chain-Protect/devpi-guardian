@@ -2,6 +2,7 @@
 # Keep devpi's no-section, from-first style in this integration-facing test.
 # ruff: noqa: I001
 from devpi_guardian.verdicts.errors import StoreUnavailable
+from devpi_guardian.worker.discovery import DiscoveryUnavailable
 from devpi_guardian.verdicts.models import ArtifactState
 from devpi_guardian.verdicts.models import Decision
 from devpi_guardian.verdicts.models import DecisionSource
@@ -30,6 +31,20 @@ class RecordingReader:
         return self.decisions
 
 
+class RecordingSink:
+    def __init__(self, error=None):
+        self.batches = []
+        self.error = error
+
+    def discover(self, candidate):
+        self.discover_many((candidate,))
+
+    def discover_many(self, candidates):
+        if self.error is not None:
+            raise self.error
+        self.batches.append(tuple(candidates))
+
+
 class SinglePassLinks:
     def __init__(self, links):
         self.links = links
@@ -53,11 +68,13 @@ class UnusableProject:
         raise AssertionError("project must not participate in F2 policy")
 
 
-def make_stage(reader=None, *, initialized=True):
+def make_stage(reader=None, *, initialized=True, sink=None):
     plugin_manager = get_pluginmanager()
     xom = SimpleNamespace(config=SimpleNamespace(hook=plugin_manager.hook))
     if initialized:
         setattr(xom, _READER_ATTRIBUTE, reader)
+    if sink is not None:
+        xom._devpi_guardian_discovery_sink = sink
     customizer_class = get_stage_customizer_class(xom, "guardian")
     return customizer_class(SimpleNamespace(xom=xom))
 
@@ -218,6 +235,76 @@ def test_filter_skips_reader_when_no_link_has_a_valid_sha256() -> None:
 
     assert decisions == [False, False, False, False]
     assert reader.calls == []
+
+
+def test_filter_enqueues_only_initialized_missing_decisions() -> None:
+    digests = {name: name * 64 for name in "abcd"}
+    links = [
+        make_link("demo-1.0.whl", f"#sha256={digests['a']}"),
+        make_link("demo-2.0.whl", f"#sha256={digests['b']}"),
+        make_link("demo-3.0.whl", f"#sha256={digests['c']}"),
+        make_link("missing-hash.whl", "#sha256=not-a-sha256"),
+    ]
+    reader = RecordingReader(
+        {
+            digests["a"]: make_decision(
+                digests["a"],
+                allowed=True,
+                decision=Decision.ALLOW,
+                source=DecisionSource.AUTOMATED,
+                state=ArtifactState.ALLOW,
+            ),
+            digests["b"]: make_decision(
+                digests["b"],
+                allowed=False,
+                decision=Decision.REVIEW,
+                source=DecisionSource.AUTOMATED,
+                state=ArtifactState.REVIEW,
+            ),
+            digests["c"]: make_decision(
+                digests["c"],
+                allowed=False,
+                decision=Decision.DENY,
+                source=DecisionSource.MISSING,
+                state=ArtifactState.MISSING,
+            ),
+        }
+    )
+    sink = RecordingSink()
+
+    decisions = run_filter(make_stage(reader, sink=sink), "demo", links)
+
+    assert decisions == [True, False, False, False]
+    assert len(sink.batches) == 1
+    [(candidate,)] = sink.batches
+    assert candidate.sha256 == digests["c"]
+    assert candidate.project == "demo"
+    assert reader.calls == [(digests["a"], digests["b"], digests["c"])]
+
+
+def test_filter_missing_decision_queue_failure_is_retryable_503() -> None:
+    digest = "a" * 64
+    reader = RecordingReader(
+        {
+            digest: make_decision(
+                digest,
+                allowed=False,
+                decision=Decision.DENY,
+                source=DecisionSource.MISSING,
+                state=ArtifactState.MISSING,
+            )
+        }
+    )
+
+    with pytest.raises(HTTPServiceUnavailable) as caught:
+        run_filter(
+            make_stage(reader, sink=RecordingSink(DiscoveryUnavailable("queue unavailable"))),
+            "demo",
+            [make_link("demo-1.0.whl", f"#sha256={digest}")],
+        )
+
+    assert caught.value.status_code == 503
+    assert caught.value.headers["Retry-After"] == "5"
 
 
 @pytest.mark.parametrize("failure_source", ["bootstrap", "batch"])

@@ -6,7 +6,9 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 
+from devpi_guardian.admin.service import AdminProviderError
 from devpi_guardian.analyzers import Finding
+from devpi_guardian.audit import verify_audit_chain
 from devpi_guardian.baseline import artifact_kind
 from devpi_guardian.policy import PolicyConfig, PolicyEngine
 from devpi_guardian.verdicts.db import ConnectionFactory
@@ -14,7 +16,7 @@ from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.models import Decision, validate_sha256
 from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
-from devpi_guardian.worker.discovery import FileDiscoverySink
+from devpi_guardian.worker.discovery import DiscoveryUnavailable, FileDiscoverySink
 from devpi_guardian.worker.models import AnalysisEvidence, AnalysisReport, AnalysisStep
 
 _POLICY_FIELDS = frozenset(
@@ -93,13 +95,34 @@ class ProductionAdminProviders:
                     "SELECT state, COUNT(*) AS count FROM artifacts GROUP BY state"
                 ).fetchall()
             artifacts = {str(row["state"]).lower(): row["count"] for row in rows}
+        except DiscoveryUnavailable as exc:
+            raise AdminProviderError("worker health is unavailable") from exc
         except (OSError, sqlite3.Error) as exc:
             raise StoreUnavailable("guardian database unavailable") from exc
         runtime = {"status": "not_registered"}
         health = getattr(self._worker, "worker_health", None)
         if callable(health):
             runtime = dict(health())
-        return {**runtime, "queue": queue, "artifacts": artifacts}
+        return {
+            **runtime,
+            "queue": queue,
+            "artifacts": artifacts,
+            "audit_chain": self.audit_health(),
+        }
+
+    def audit_health(self) -> Mapping[str, object]:
+        """Return bounded audit-chain status for the F11 health endpoint."""
+        try:
+            verification = verify_audit_chain(self._factory)
+        except (StoreUnavailable, OSError, sqlite3.Error) as exc:
+            raise AdminProviderError("audit verification is unavailable") from exc
+        reason = None if verification.valid else "audit_chain_invalid"
+        return {
+            "valid": verification.valid,
+            "count": verification.count,
+            "head": verification.head,
+            "reason": reason,
+        }
 
     def list_audit(
         self,
@@ -129,6 +152,9 @@ class ProductionAdminProviders:
         where = "" if not conditions else " WHERE " + " AND ".join(conditions)
         try:
             with closing(self._factory.connect()) as connection:
+                # A deferred SQLite transaction otherwise permits COUNT and
+                # page reads to observe different commits.
+                connection.execute("BEGIN")
                 total = connection.execute(
                     f"SELECT COUNT(*) FROM audit_events{where}", parameters
                 ).fetchone()[0]
