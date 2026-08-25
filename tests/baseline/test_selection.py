@@ -202,7 +202,8 @@ def test_unparsable_versions_are_dropped_with_a_reason(caplog):
     candidate = release("acme", "v1-beta!!", "acme-weird-py3-none-any.whl")
     with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
         assert eligible_candidates(target, [candidate]) == []
-    assert "v1-beta!!" in caplog.text
+    assert "category=invalid_version" in caplog.text
+    assert "v1-beta!!" not in caplog.text
 
 
 def test_an_unparsable_target_version_selects_nothing(caplog):
@@ -210,7 +211,8 @@ def test_an_unparsable_target_version_selects_nothing(caplog):
     older = release("acme", "1.0.0", "acme-1.0.0-py3-none-any.whl")
     with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
         assert choose(target, older) is None
-    assert "not-a-version" in caplog.text
+    assert "category=invalid_version" in caplog.text
+    assert "not-a-version" not in caplog.text
 
 
 def test_the_target_itself_is_never_its_own_baseline():
@@ -230,7 +232,8 @@ def test_other_projects_are_rejected_defensively(caplog):
     other = release("other", "1.0.0", "other-1.0.0-py3-none-any.whl")
     with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
         assert eligible_candidates(target, [other]) == []
-    assert "other" in caplog.text
+    assert "category=project_mismatch" in caplog.text
+    assert "other" not in caplog.text
 
 
 def test_project_names_are_compared_after_normalization():
@@ -395,7 +398,8 @@ def test_an_unclassifiable_target_selects_nothing(caplog):
     older = release("acme", "1.0.0", "acme-1.0.0.tar.gz")
     with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
         assert choose(target, older) is None
-    assert "acme-2.0.0.egg" in caplog.text
+    assert "category=unsupported_artifact" in caplog.text
+    assert "acme-2.0.0.egg" not in caplog.text
 
 
 def test_a_wheel_target_with_an_unreadable_tag_skips_only_tier_one(caplog):
@@ -405,7 +409,7 @@ def test_a_wheel_target_with_an_unreadable_tag_skips_only_tier_one(caplog):
         selection = choose(target, universal)
     assert selection is not None
     assert selection.tier == "universal_wheel"
-    assert "same_tag" in caplog.text
+    assert "category=unreadable_target_tag" in caplog.text
 
 
 def test_a_candidate_wheel_with_an_unreadable_tag_matches_no_wheel_tier():
@@ -443,7 +447,8 @@ def test_an_unreadable_candidate_tag_is_rejected_by_the_universal_tier(filename,
     with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
         assert choose(target, broken) is None
     assert "universal_wheel" in caplog.text
-    assert filename in caplog.text
+    assert "category=unreadable_candidate_tag" in caplog.text
+    assert filename not in caplog.text
 
 
 def test_an_unreadable_candidate_tag_never_outranks_a_real_universal_wheel():
@@ -465,3 +470,111 @@ def test_an_unreadable_candidate_tag_does_not_block_the_sdist_tier():
     assert selection is not None
     assert selection.tier == "sdist"
     assert selection.release == sdist
+
+
+def test_selection_debug_logs_use_only_bounded_categories_and_tiers(caplog):
+    """Selection diagnostics never expose release metadata.
+
+    The release records deliberately contain URL, credential, path, and full
+    digest sentinels.  Each branch that emits a selection diagnostic is
+    exercised against the real module logger so a future log argument cannot
+    accidentally turn release metadata into a log record.
+    """
+
+    project = "https://user:project-secret@example.invalid/pkg"
+    other_project = "https://user:other-secret@example.invalid/other"
+    invalid_version = "https://user:version-secret@example.invalid/not-a-version"
+    digest_sentinel = "deadbeef" * 8
+    filenames = {
+        "invalid-target": "/private/guardian/invalid target.whl",
+        "invalid-candidate": "/private/guardian/invalid candidate.whl",
+        "unknown-target": "/private/guardian/unknown target.egg",
+        "unreadable-target": "/private/guardian/unreadable target.whl",
+        "unreadable-candidate": "/private/guardian/unreadable candidate.whl",
+        "non-older-candidate": "/private/guardian/non-older candidate.whl",
+        "mismatched-project": "/private/guardian/mismatched project.whl",
+        "selected-target": (
+            "/private/guardian/selected target-2.0.0-cp311-cp311-manylinux_2_17_x86_64.whl"
+        ),
+        "selected-candidate": (
+            "/private/guardian/selected candidate-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl"
+        ),
+    }
+
+    invalid_target = release(
+        project,
+        invalid_version,
+        filenames["invalid-target"],
+        sha256=digest_sentinel,
+    )
+    invalid_candidate = release(
+        project,
+        invalid_version,
+        filenames["invalid-candidate"],
+        sha256=digest("invalid-candidate"),
+    )
+    unknown_target = release(
+        project,
+        "2.0.0",
+        filenames["unknown-target"],
+        sha256=digest("unknown-target"),
+    )
+    unreadable_target = release(
+        project,
+        "2.0.0",
+        filenames["unreadable-target"],
+        sha256=digest("unreadable-target"),
+    )
+    unreadable_candidate = release(
+        project,
+        "1.0.0",
+        filenames["unreadable-candidate"],
+        sha256=digest("unreadable-candidate"),
+    )
+    non_older_candidate = release(
+        project,
+        "2.1.0",
+        filenames["non-older-candidate"],
+        sha256=digest("non-older-candidate"),
+    )
+    mismatched_project = release(
+        other_project,
+        "1.0.0",
+        filenames["mismatched-project"],
+        sha256=digest("mismatched-project"),
+    )
+    selected_target = release(
+        project,
+        "2.0.0",
+        filenames["selected-target"],
+        sha256=digest("selected-target"),
+    )
+    selected_candidate = release(
+        project,
+        "1.0.0",
+        filenames["selected-candidate"],
+        sha256=digest("selected-candidate"),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="devpi_guardian.baseline"):
+        assert choose(invalid_target) is None
+        assert choose(release(project, "2.0.0", "known-target.whl"), invalid_candidate) is None
+        assert choose(unknown_target) is None
+        assert choose(unreadable_target, release(project, "1.0.0", PURE)) is not None
+        assert choose(release(project, "2.0.0", PLATFORM), unreadable_candidate) is None
+        assert choose(release(project, "2.0.0", PURE), non_older_candidate) is None
+        assert eligible_candidates(release(project, "2.0.0", PURE), [mismatched_project]) == []
+        selection = choose(selected_target, selected_candidate)
+
+    assert selection is not None
+    assert selection.tier == "same_tag"
+    assert "category=invalid_version" in caplog.text
+    assert "category=unsupported_artifact" in caplog.text
+    assert "category=unreadable_target_tag" in caplog.text
+    assert "category=unreadable_candidate_tag" in caplog.text
+    assert "category=non_older_candidate" in caplog.text
+    assert "category=project_mismatch" in caplog.text
+    assert "category=selected" in caplog.text
+    assert "tier=same_tag" in caplog.text
+    for sentinel in (*filenames.values(), project, other_project, invalid_version, digest_sentinel):
+        assert sentinel not in caplog.text

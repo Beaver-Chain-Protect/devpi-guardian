@@ -153,11 +153,7 @@ def _parse_version(release: ReleaseRecord) -> Version | None:
     try:
         return Version(release.version)
     except InvalidVersion:
-        logger.debug(
-            "baseline 후보 제외: PEP 440으로 파싱할 수 없는 버전 %r (%s)",
-            release.version,
-            release.filename,
-        )
+        logger.debug("baseline 후보 제외: category=invalid_version")
         return None
 
 
@@ -167,8 +163,8 @@ def _tier_chain(target: ReleaseRecord) -> tuple[BaselineTier, ...]:
         return _SDIST_TIER_CHAIN
     if kind != "wheel":
         logger.debug(
-            "baseline 선택 생략: wheel도 sdist도 아닌 대상 %s",
-            target.filename,
+            "baseline 선택 생략: category=unsupported_artifact artifact_kind=%s",
+            kind,
         )
         return ()
     if parse_wheel_tag(target.filename) is None:
@@ -176,8 +172,7 @@ def _tier_chain(target: ReleaseRecord) -> tuple[BaselineTier, ...]:
         # compared against a pure-Python wheel or an sdist; only the exact-tag
         # tier is impossible.
         logger.debug(
-            "대상 wheel의 tag를 읽을 수 없어 same_tag 단계를 건너뜀: %s",
-            target.filename,
+            "대상 wheel의 tag를 읽을 수 없어 category=unreadable_target_tag artifact_kind=wheel",
         )
         return _WHEEL_TIER_CHAIN[1:]
     return _WHEEL_TIER_CHAIN
@@ -196,9 +191,8 @@ def _matches_tier(tier: BaselineTier, target: ReleaseRecord, candidate: ReleaseR
         # rejected from every wheel tier. This is a decision, not a skipped
         # check: an unclassifiable wheel must never reach a tier by default.
         logger.debug(
-            "baseline 후보 제외: wheel tag를 읽을 수 없어 %s 티어에서 탈락 (%s)",
+            "baseline 후보 제외: category=unreadable_candidate_tag tier=%s",
             tier,
-            candidate.filename,
         )
         return False
     if tier == "universal_wheel":
@@ -219,18 +213,13 @@ def eligible_candidates(
 
     target_version = _parse_version(target)
     if target_version is None:
-        logger.debug("baseline 선택 생략: 대상 버전 %r을 파싱할 수 없음", target.version)
         return []
     project_key = canonical_project_name(target.project)
 
     eligible: list[tuple[Version, ReleaseRecord]] = []
     for candidate in releases:
         if canonical_project_name(candidate.project) != project_key:
-            logger.debug(
-                "baseline 후보 제외: 다른 프로젝트 %r (대상 %r)",
-                candidate.project,
-                target.project,
-            )
+            logger.debug("baseline 후보 제외: category=project_mismatch")
             continue
         if candidate.sha256 == target.sha256:
             continue
@@ -238,11 +227,7 @@ def eligible_candidates(
         if version is None:
             continue
         if not version < target_version:
-            logger.debug(
-                "baseline 후보 제외: 대상보다 낮지 않은 버전 %s (%s)",
-                candidate.version,
-                candidate.filename,
-            )
+            logger.debug("baseline 후보 제외: category=non_older_candidate")
             continue
         eligible.append((version, candidate))
     return eligible
@@ -289,10 +274,8 @@ def select_baseline(target: ReleaseRecord, lookup: ReleaseLookup) -> BaselineSel
         selection = _best_in_tier(tier, target, candidates)
         if selection is not None:
             logger.debug(
-                "baseline 선택: %s (tier=%s, 대상=%s)",
-                selection.release.filename,
+                "baseline 선택: category=selected tier=%s",
                 tier,
-                target.filename,
             )
             return selection
     return None
