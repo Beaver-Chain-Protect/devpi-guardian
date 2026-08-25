@@ -495,8 +495,8 @@ class PolicyEngine:
                     raise PolicyInputError("file diff paths must be sorted and unique")
             if len(all_paths) > _MAX_DIFF_PATHS or len(set(all_paths)) != len(all_paths):
                 raise PolicyInputError("file diff paths must be globally unique")
-        seen_evidence: set[tuple[object, ...]] = set()
-        analyzer_error_steps: set[str] = set()
+        seen_evidence: dict[tuple[object, ...], tuple[object, ...]] = {}
+        deduplicated_evidence: list[AnalysisEvidence] = []
         analyzer_error_findings: set[str] = set()
         for item in evidence_snapshot:
             if (
@@ -527,14 +527,32 @@ class PolicyEngine:
                 raise PolicyInputError("F8/F9 evidence cannot claim a baseline tier")
             fingerprint = finding_fingerprint(item.finding)
             identity = (item.analyzer, fingerprint, item.origin, item.baseline_tier)
-            if identity in seen_evidence:
-                raise PolicyInputError("duplicate analysis evidence")
-            seen_evidence.add(identity)
+            evidence_value = (
+                item.analyzer,
+                item.origin,
+                item.baseline_tier,
+                item.finding.rule,
+                item.finding.action,
+                item.finding.file,
+                item.finding.line,
+                item.finding.snippet,
+                item.finding.message,
+                item.finding.source,
+                item.finding.sink,
+            )
+            previous_value = seen_evidence.get(identity)
+            if previous_value is not None:
+                if previous_value != evidence_value:
+                    raise PolicyInputError("conflicting analysis evidence")
+                continue
+            seen_evidence[identity] = evidence_value
+            deduplicated_evidence.append(item)
             if item.finding.rule == "analyzer_error":
                 analyzer_error_findings.add(item.analyzer)
         analyzer_error_steps = {step.analyzer for step in steps_snapshot if step.status == "error"}
-        if analyzer_error_steps != analyzer_error_findings:
+        if not analyzer_error_findings <= analyzer_error_steps:
             raise PolicyInputError("analyzer_error evidence must match error steps")
+        evidence_snapshot = tuple(deduplicated_evidence)
         try:
             aggregate = json.dumps(
                 {

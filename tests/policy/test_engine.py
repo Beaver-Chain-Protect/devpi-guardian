@@ -88,26 +88,12 @@ def report(
         else step
         for step in selected_steps
     )
-    selected_evidence = list(evidence)
-    for step in selected_steps:
-        if step.status == "error" and not any(
-            item.analyzer == step.analyzer and item.finding.rule == "analyzer_error"
-            for item in selected_evidence
-        ):
-            error_item = finding("analyzer_error", analyzer=step.analyzer)
-            if step.analyzer == "F7" and baseline:
-                error_item = AnalysisEvidence(
-                    analyzer="F7",
-                    finding=error_item.finding,
-                    baseline_tier=baseline_tier,
-                )
-            selected_evidence.append(error_item)
     return AnalysisReport(
         analyzer_version=analyzer_version,
         has_baseline=baseline,
         baseline_sha256=BASELINE if baseline else None,
         baseline_tier=baseline_tier if baseline else None,
-        evidence=tuple(selected_evidence),
+        evidence=evidence,
         steps=selected_steps,
         file_diff=file_diff,
     )
@@ -491,10 +477,11 @@ def test_scores_use_maximum_and_are_cardinality_invariant() -> None:
     one = engine().assess(report(baseline=False, steps=steps))
     assert one.decision is Decision.REVIEW
     assert one.score == 90
-    with pytest.raises(PolicyInputError, match="duplicate"):
-        engine().assess(
-            report(baseline=False, steps=steps, evidence=(finding("same"), finding("same")))
-        )
+    one = engine().assess(report(baseline=False, steps=steps, evidence=(finding("same"),)))
+    duplicate = engine().assess(
+        report(baseline=False, steps=steps, evidence=(finding("same"), finding("same")))
+    )
+    assert duplicate == one
 
 
 def test_analyzer_error_finding_requires_matching_error_step() -> None:
@@ -524,7 +511,7 @@ def test_analyzer_error_finding_requires_matching_error_step() -> None:
 
 
 @pytest.mark.parametrize("analyzer", ["F7", "F8", "F9"])
-def test_each_analyzer_error_step_requires_error_evidence_and_scores_floor(analyzer: str) -> None:
+def test_each_analyzer_error_step_without_evidence_scores_floor(analyzer: str) -> None:
     steps = tuple(
         AnalysisStep(name, "error" if name == analyzer else "completed")
         for name in ("F7", "F8", "F9")
@@ -534,13 +521,21 @@ def test_each_analyzer_error_step_requires_error_evidence_and_scores_floor(analy
     assert f"coverage.error:{analyzer}" in assessed.reason_codes
 
 
+def test_exact_duplicate_evidence_is_order_independent_and_idempotent() -> None:
+    item = finding("same")
+    duplicate = engine().assess(report(evidence=(item, item)))
+    single = engine().assess(report(evidence=(item,)))
+    reversed_duplicate = engine().assess(report(evidence=(item, item, item)))
+    assert duplicate == single == reversed_duplicate
+
+
 def test_conflicting_same_fingerprint_evidence_is_rejected() -> None:
     first = finding("same", "REVIEW")
     conflicting = AnalysisEvidence(
         analyzer="F8",
         finding=Finding("same", "DENY", "x.py", 1, "x", "different message"),
     )
-    with pytest.raises(PolicyInputError, match="duplicate"):
+    with pytest.raises(PolicyInputError, match="conflicting"):
         engine().assess(report(evidence=(first, conflicting)))
 
 
