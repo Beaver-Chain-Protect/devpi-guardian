@@ -33,6 +33,18 @@ mapping. Mirror discovery validates the canonical source-stage entry and acquire
 devpi's internal stage/mirror client. It never requests Guardian's protected public
 ``+f``/``+e`` route as a worker bypass.
 
+Hashless ``+e`` handling has a separate identity gate. Guardian does not fetch an
+uncached hashless upstream link merely to manufacture an Artifact identity. Until
+devpi has materialized an authoritative cached ``FileEntry`` whose file, stage,
+project, version, and SHA-256 agree with the requested link, the ordinary Guardian
+Simple response hides the link and F3 blocks direct ``GET``/``HEAD`` as identity
+unavailable. Once that cached entry is present, Guardian Simple queues discovery
+using the independently validated FileEntry SHA. The worker then acquires bytes
+through devpi's internal stage client/upstream stream, never through the public
+``+e`` route. The link remains hidden and direct-blocked until an effective
+``ALLOW``; after ``ALLOW`` the original link is exposed and may remain hashless,
+while direct authorization continues to use the resolved FileEntry SHA.
+
 The F11 health endpoint reports bounded worker, queue, artifact, and audit-chain state at
 ``/+guardian/api/v1/health``. Operators should poll this observable state (and the Artifact
 details endpoint) for discovery and terminal verdict transitions rather than relying on a

@@ -47,9 +47,10 @@ public `+f`/`+e` storage as a worker input. Devpi may store and serve approved
 artifacts, but F5 never uses public `+f`/`+e` for unapproved worker input.
 
 The private upload connector copies a verified FileEntry read stream into the
-quarantine writer. The mirror discovery connector downloads an upstream candidate
-and verifies its supplied upstream hash before publishing. Existing devpi data is
-not copied through this path; it is offline backfill-only work deferred beyond PR1.
+quarantine writer. The mirror discovery connector downloads a queued,
+SHA-identified upstream candidate through devpi's internal stage client and verifies
+its supplied upstream hash before publishing. Existing devpi data is not copied
+through this path; it is offline backfill-only work deferred beyond PR1.
 
 Writers create an exclusive temporary file under `.incoming` on the same filesystem,
 hash and size the stream, and fsync the file. The final object must have the expected
@@ -91,8 +92,11 @@ dedicated process is delivered.
 ## Implemented features
 
 - A read-only `guardian` index type that requires at least one devpi base index.
-- Batched SHA-256 filtering for HTML and PEP 691 Simple responses: only links with
-  an effective `ALLOW` verdict are visible to pip and uv.
+- Batched SHA-256 filtering for HTML and PEP 691 Simple responses: links are visible
+  only when their independently resolved Artifact has an effective `ALLOW` verdict.
+  An ordinary cached hashless `+e` link may retain its original hashless href after
+  that `ALLOW`; it is queued and evaluated using the validated SHA-256 from devpi's
+  authoritative cached FileEntry.
 - Fail-closed direct release enforcement for `+f`/`+e`, `GET`/`HEAD`, and PEP 658
   `.metadata` requests.
 - SHA-256 SQLite verdict persistence with migrations, bounded reads, immutable
@@ -103,15 +107,22 @@ dedicated process is delivered.
 - F6 project lookup of effective `ALLOW` releases through the public
   `VerdictReader.list_allowed_releases()` API and exported `AllowedRelease` model.
 - A devpi plugin with sanitized structured block logs and bounded in-process metrics.
-- The real devpi subprocess suite covers pip/uv, restarts, concurrency, direct URLs, and
-  hashless mirror identity-unavailable fail-closed behavior. Identity failure remains
-  `503` even when a matching `ALLOW` exists.
+- The real devpi subprocess suite covers pip/uv, restarts, concurrency, direct URLs,
+  and hashless mirror identity-unavailable fail-closed behavior. An uncached,
+  malformed, or otherwise identity-unavailable hashless link remains hidden and
+  direct-blocked; identity failure remains `503` even when a matching `ALLOW` exists.
+  A cached hashless `+e` link is queued only after its FileEntry supplies validated
+  file, stage, project, version, and SHA-256 identity, and its original href may be
+  exposed only after effective `ALLOW`.
 - A narrower official `pytest-devpi-server` fixture smoke test exercises the installed
   plugin.
 - The integrated F5 runtime proof exercises private upload → CAS → discovery → terminal
   verdict and verifies that only an effective `ALLOW` enables `GET`/`HEAD`, including
-  protected metadata. Mirror bytes are proven to arrive through the internal stage client,
-  while the hashless mirror `+e` path stays fail-closed.
+  protected metadata. Mirror bytes are proven to arrive through the internal stage
+  client. An uncached hashless mirror `+e` path stays hidden and direct-blocked; once
+  devpi materializes an authoritative SHA-bearing FileEntry, the cached hashless link
+  follows the same queue/verdict gate and may be exposed with its original href after
+  `ALLOW`.
 
 ## Safe PR5/PR9 integration provenance
 
@@ -176,16 +187,25 @@ pip install --index-url https://devpi.example.com/root/guardian/+simple/ PACKAGE
 uv pip install --index-url https://devpi.example.com/root/guardian/+simple/ PACKAGE
 ```
 
-Only canonical SHA-256 links with an effective `ALLOW` verdict are returned.
+Links whose Artifact has an effective `ALLOW` verdict are returned. For an ordinary
+hashless `+e` link, Guardian first requires devpi's already-materialized FileEntry to
+provide validated file, stage, project, version, and SHA-256 identity. That resolved
+SHA-256 is used for discovery and verdict lookup while the original link remains
+hidden until effective `ALLOW`; after `ALLOW`, the original href may remain hashless.
+Direct `GET`/`HEAD` authorization uses the independently resolved FileEntry SHA, not
+the filename or URL fragment.
 Verdict-store failures during a required lookup return `503 Service Unavailable`
 with `Retry-After: 5`.
 
 F1/F2 do not periodically download or discover new PyPI Artifacts, run security
-analysis, or implement a time-based cooldown. F5 must discover and persist an
-Artifact and its release mapping before F4 can return a verdict. Until that
-pipeline exists, an unknown Artifact remains hidden. F3 separately protects
-direct `+f`/`+e` URLs across all indexes, so bypassing the Guardian Simple page
-does not bypass enforcement.
+analysis, or implement a time-based cooldown. Guardian Simple filtering does not
+fetch an uncached hashless upstream link to manufacture identity: such a link stays
+hidden and its direct `+f`/`+e` request stays blocked as identity unavailable. Once
+devpi has materialized an authoritative cached FileEntry, F5 can discover and persist
+the Artifact and release mapping before F4 returns a verdict. Until that pipeline
+reaches effective `ALLOW`, the link remains hidden. F3 separately protects direct
+`+f`/`+e` URLs across all indexes, so bypassing the Guardian Simple page does not
+bypass enforcement.
 
 The batching, failure, metadata-preservation, and completion contracts are
 defined once in the
@@ -502,7 +522,9 @@ uv build
   `tests/integration/test_pytest_devpi_server.py` verify direct-route blocking,
   allow behavior, restart persistence, and `+e` failure handling. A controlled
   stopped-server KeyFS cache-entry proof also verifies the genuine hashless `+e`
-  lifecycle after SHA metadata is committed through devpi's internal cache path. The broader
+  lifecycle: an authoritative cached FileEntry supplies the SHA-256, discovery uses
+  the internal stage client rather than the public route, and the original link is
+  exposed only after effective `ALLOW` even when its href remains hashless. The broader
   integration proof verifies 64 concurrent blocked requests (8 workers over 8
   rounds), exact-version pip behavior when an Artifact is allowed or revoked,
   uv direct URL lock/sync behavior, and `%2Bf`/`%2Be` route-marker compatibility
