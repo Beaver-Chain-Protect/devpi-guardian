@@ -64,6 +64,17 @@ def test_package_exposes_devpi_server_entry_point() -> None:
     assert matches[0].value == "devpi_guardian.plugin"
 
 
+def test_package_exposes_guardian_admin_console_script() -> None:
+    matches = [
+        entry_point
+        for entry_point in metadata.entry_points(group="console_scripts")
+        if entry_point.name == "guardian"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].value == "devpi_guardian.admin.cli:main"
+
+
 def test_package_declares_requests_as_direct_runtime_dependency() -> None:
     requirements = [Requirement(value) for value in metadata.requires("devpi-guardian") or []]
 

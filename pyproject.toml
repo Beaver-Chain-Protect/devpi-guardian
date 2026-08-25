@@ -27,6 +27,9 @@ test = [
 [project.entry-points.devpi_server]
 guardian = "devpi_guardian.plugin"
 
+[project.scripts]
+guardian = "devpi_guardian.admin.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
