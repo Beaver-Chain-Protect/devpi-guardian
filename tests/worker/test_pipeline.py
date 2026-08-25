@@ -382,6 +382,38 @@ def test_analysis_bundle_retries_an_open_stream_on_later_close() -> None:
     assert stream.closed
 
 
+def test_analysis_bundle_deduplicates_failed_shared_stream_per_close_call() -> None:
+    shared = FailingCloseStream(b"shared")
+    target = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.whl",
+        sha256=SHA256,
+        size_bytes=6,
+        _stream=shared,
+    )
+    sdist = VerifiedArtifact(
+        stage="root/pypi",
+        project="demo",
+        version="1.0",
+        filename="demo.tar.gz",
+        sha256="b" * 64,
+        size_bytes=6,
+        _stream=shared,
+    )
+    bundle = AnalysisBundle(target=target, same_release_sdist=sdist)
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        bundle.close()
+    assert shared.close_calls == 2
+    assert not shared.closed
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        bundle.close()
+    assert shared.close_calls == 4
+
+
 def test_worker_finally_closes_all_bundle_streams_after_analyzer_failure(tmp_path) -> None:
     now = datetime(2026, 8, 21, tzinfo=UTC)
     target = artifact(tmp_path)

@@ -146,12 +146,14 @@ class AnalysisBundle:
     def close(self) -> None:
         """Close every distinct owned stream exactly once."""
         errors: list[BaseException] = []
+        attempted_streams: set[int] = set()
         for artifact in (self.target, self.same_release_sdist, self.same_release_wheel):
             if artifact is None:
                 continue
             stream_id = id(artifact._stream)
-            if stream_id in self._closed_streams:
+            if stream_id in self._closed_streams or stream_id in attempted_streams:
                 continue
+            attempted_streams.add(stream_id)
             try:
                 already_closed = artifact._stream.closed
             except BaseException as error:
