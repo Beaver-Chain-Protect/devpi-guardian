@@ -1122,7 +1122,7 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
         "credential=/Users/alice/private/file.whl "
         "X-Devpi-Auth: dXNlcjpzZWNyZXQ= Authorization: Bearer bearer-secret "
         "Authorization: Basic dXNlcjpwYXNz auth_token=secret-token "
-        "C:/Users/alice/private/file.whl sha256="
+        "client_secret=client-secret C:/Users/alice/private/file.whl sha256="
         + "a" * 64
         + "\nline two\x00\t"
         + "x" * 5000
@@ -1157,6 +1157,7 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert "bearer-secret" not in row["last_error"]
     assert "dXNlcjpwYXNz" not in row["last_error"]
     assert "secret-token" not in row["last_error"]
+    assert "client-secret" not in row["last_error"]
     assert "C:/Users/alice/private/file.whl" not in row["last_error"]
     assert "a" * 64 not in row["last_error"]
 
@@ -1166,6 +1167,7 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert "bearer-secret" not in serialized
     assert "dXNlcjpwYXNz" not in serialized
     assert "secret-token" not in serialized
+    assert "client-secret" not in serialized
     assert "C:/Users/alice/private/file.whl" not in serialized
     assert len(audit_writer.events) == 1
     event = audit_writer.events[0]

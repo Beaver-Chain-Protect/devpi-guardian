@@ -36,6 +36,9 @@ def test_sanitize_diagnostic_redacts_secrets_paths_urls_controls_digests_and_bou
         ("AUTHORIZATION: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
         ("auth_token=secret-token", "secret-token"),
         ("Auth-Token: 'quoted secret'", "quoted secret"),
+        ("client_secret=client-secret", "client-secret"),
+        ("client-secret: client-secret-value", "client-secret-value"),
+        ("client secret=client-secret-space", "client-secret-space"),
         ("C:/Users/alice/private/file.whl", "C:/Users/alice/private/file.whl"),
         (r"C:\\Users\\alice\\private\\file.whl", r"C:\\Users\\alice\\private\\file.whl"),
         ("token=secret-at-string-boundary", "secret-at-string-boundary"),
@@ -52,5 +55,11 @@ def test_sanitize_diagnostic_redacts_credential_variants_and_windows_paths(
 
 def test_sanitize_diagnostic_preserves_harmless_security_prose() -> None:
     value = "The token bucket was empty; authorization policy was reviewed."
+
+    assert sanitize_diagnostic(value) == value
+
+
+def test_sanitize_diagnostic_preserves_public_guardian_route_text() -> None:
+    value = "route=/+guardian/api/v1/health"
 
     assert sanitize_diagnostic(value) == value

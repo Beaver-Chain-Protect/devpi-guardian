@@ -10,11 +10,12 @@ _URL = re.compile(r"(?i)(?<![\w])(?:https?|ftp)://[^\s<>'\"`]+")
 _SENSITIVE_KEY = (
     r"(?:"
     r"x[-_ ]?devpi[-_ ]?auth"
-    r"|auth[-_ ]?(?:token|key)"
-    r"|access[-_ ]?token"
-    r"|refresh[-_ ]?token"
-    r"|bearer[-_ ]?token"
-    r"|session[-_ ]?token"
+    r"|auth[-_ ]?(?:token|key|secret)"
+    r"|client[-_ ]?(?:secret|token|key)"
+    r"|access[-_ ]?(?:token|secret|key)"
+    r"|refresh[-_ ]?(?:token|secret|key)"
+    r"|bearer[-_ ]?(?:token|secret|key)"
+    r"|session[-_ ]?(?:token|secret|key)"
     r"|token"
     r"|password"
     r"|passwd"
@@ -51,7 +52,7 @@ _AUTH_SCHEME = re.compile(
     r")"
 )
 _DIGEST = re.compile(r"(?i)\b[0-9a-f]{64}\b")
-_POSIX_PATH = re.compile(r"(?<![\w:])/(?:[^\s/]+/)+[^\s,;:'\"]+")
+_POSIX_PATH = re.compile(r"(?<![\w:])/(?!\+)(?:[^\s/]+/)+[^\s,;:'\"]+")
 _WINDOWS_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;:'\"]+")
 
 
