@@ -278,6 +278,25 @@ def test_writer_cache_verifies_one_new_row_per_sequential_append(tmp_path):
     assert suffix_scans == 3
 
 
+def test_writer_cache_reuses_verified_prefix_across_fresh_connections(tmp_path):
+    traced = _TraceFactory(_db(tmp_path))
+    writer = SQLiteAuditWriter()
+    for number in range(4):
+        with closing(traced.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            writer.append_in_transaction(connection, _event(number))
+            connection.commit()
+    full_scans = sum(
+        "FROM audit_events ORDER BY id" in statement and "WHERE" not in statement
+        for statement in traced.statements
+    )
+    suffix_scans = sum(
+        "FROM audit_events WHERE id >" in statement for statement in traced.statements
+    )
+    assert full_scans == 1
+    assert suffix_scans == 3
+
+
 def test_writer_cache_regression_after_outer_rollback_is_repaired(tmp_path):
     factory = _db(tmp_path)
     writer = SQLiteAuditWriter()

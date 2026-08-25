@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -42,10 +43,9 @@ _REQUIRED_SCHEMA_OBJECTS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class _VerifiedPrefix:
-    connection: sqlite3.Connection
+    identity: tuple[object, ...]
     schema: tuple[tuple[str, str, str], ...]
     schema_version: int
-    data_version: int
     count: int
     head: str
 
@@ -212,9 +212,30 @@ def _store_unavailable(connection_or_path: object, exc: BaseException) -> StoreU
     return StoreUnavailable(str(path))
 
 
+def _database_identity(connection: sqlite3.Connection) -> tuple[object, ...]:
+    try:
+        rows = connection.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error as exc:
+        raise _store_unavailable(connection, exc) from exc
+    main = next((row for row in rows if len(row) >= 3 and row[1] == "main"), None)
+    if main is None or type(main[2]) is not str:
+        raise StoreUnavailable("audit database")
+    database_path = main[2]
+    if not database_path:
+        return ("connection", connection)
+    try:
+        canonical_path = os.path.realpath(os.path.abspath(database_path))
+        stat_result = os.stat(canonical_path)
+    except (OSError, ValueError):
+        return ("connection", connection)
+    if type(stat_result.st_dev) is not int or type(stat_result.st_ino) is not int:
+        return ("connection", connection)
+    return ("file", canonical_path, stat_result.st_dev, stat_result.st_ino)
+
+
 def _schema_contract(
     connection: sqlite3.Connection,
-) -> tuple[tuple[tuple[str, str, str], ...], int, int]:
+) -> tuple[tuple[tuple[str, str, str], ...], int]:
     raw_columns = connection.execute("PRAGMA table_info(audit_events)").fetchall()
     if any(type(row[1]) is not str or type(row[2]) is not str for row in raw_columns):
         raise StoreUnavailable("audit database")
@@ -292,15 +313,9 @@ def _schema_contract(
     if definitions != expected_definitions:
         raise StoreUnavailable("audit database")
     schema_version = connection.execute("PRAGMA schema_version").fetchone()
-    data_version = connection.execute("PRAGMA data_version").fetchone()
-    if (
-        schema_version is None
-        or type(schema_version[0]) is not int
-        or data_version is None
-        or type(data_version[0]) is not int
-    ):
+    if schema_version is None or type(schema_version[0]) is not int:
         raise StoreUnavailable("audit database")
-    return objects, schema_version[0], data_version[0]
+    return objects, schema_version[0]
 
 
 def _verify_rows(
@@ -344,13 +359,14 @@ class SQLiteAuditWriter:
     def _verified_prefix(self, connection: sqlite3.Connection) -> tuple[int, str]:
         """Verify the visible prefix, caching only rows present before insertion.
 
-        The cache is instance-local and bound to the live connection plus its
-        immutable audit schema catalog. It is never advanced after this method
-        returns, so an outer transaction may roll back safely; a later count
-        regression or schema change forces a cold full scan.
+        The cache is instance-local and bound to the canonical database file
+        identity plus its immutable audit schema catalog. It is never advanced
+        after this method returns, so an outer transaction may roll back safely;
+        a later count regression or schema change forces a cold full scan.
         """
         with self._cache_lock:
-            schema, schema_version, data_version = _schema_contract(connection)
+            identity = _database_identity(connection)
+            schema, schema_version = _schema_contract(connection)
             count_row = connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()
             if (
                 count_row is None
@@ -363,10 +379,9 @@ class SQLiteAuditWriter:
             cache = self._cache
             usable = (
                 cache is not None
-                and cache.connection is connection
+                and cache.identity == identity
                 and cache.schema == schema
                 and cache.schema_version == schema_version
-                and cache.data_version == data_version
                 and count >= cache.count
             )
             if usable and cache.count:
@@ -403,9 +418,7 @@ class SQLiteAuditWriter:
                     head=ZERO_HASH,
                     expected_count=count,
                 )
-            self._cache = _VerifiedPrefix(
-                connection, schema, schema_version, data_version, verified_count, head
-            )
+            self._cache = _VerifiedPrefix(identity, schema, schema_version, verified_count, head)
             return verified_count, head
 
     def append_in_transaction(
