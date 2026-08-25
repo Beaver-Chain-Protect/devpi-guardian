@@ -10,7 +10,7 @@ from devpi_guardian.admin.service import AdminProviderError, AdminRequestError
 from devpi_guardian.analyzers import Finding
 from devpi_guardian.audit import verify_audit_chain
 from devpi_guardian.baseline import artifact_kind
-from devpi_guardian.policy import PolicyConfig, PolicyEngine
+from devpi_guardian.policy import PolicyConfig, PolicyEngine, PolicyInputError
 from devpi_guardian.verdicts.db import ConnectionFactory
 from devpi_guardian.verdicts.errors import StoreUnavailable
 from devpi_guardian.verdicts.models import Decision, validate_sha256
@@ -222,6 +222,8 @@ class ProductionAdminProviders:
         }
 
     def list_baselines(self, project: str) -> Sequence[Mapping[str, object]]:
+        if not isinstance(project, str) or not project.strip():
+            raise AdminRequestError("invalid project")
         return tuple(
             {
                 "stage": release.stage,
@@ -248,10 +250,13 @@ class ProductionAdminProviders:
         reason: str,
     ) -> Mapping[str, object]:
         digests = []
-        for record in records:
-            if set(record) != {"sha256"}:
-                raise ValueError("baseline records must contain only sha256")
-            digests.append(validate_sha256(record["sha256"]))
+        try:
+            for record in records:
+                if set(record) != {"sha256"}:
+                    raise ValueError("baseline records must contain only sha256")
+                digests.append(validate_sha256(record["sha256"]))
+        except (TypeError, ValueError) as exc:
+            raise AdminRequestError("invalid baseline records") from exc
         for digest in dict.fromkeys(digests):
             self.add_baseline(digest, actor=actor, reason=reason)
         return {"imported": len(dict.fromkeys(digests))}
@@ -282,7 +287,10 @@ class ProductionAdminProviders:
             report = self._stored_report(digest)
         except ValueError as exc:
             raise AdminProviderError("stored analysis report is unavailable") from exc
-        result = engine.assess(report)
+        try:
+            result = engine.assess(report)
+        except (PolicyInputError, TypeError, ValueError) as exc:
+            raise AdminProviderError("stored analysis report is unavailable") from exc
         return {
             "sha256": sha256,
             "decision": result.decision.value,

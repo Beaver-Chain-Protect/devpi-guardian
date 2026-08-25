@@ -169,6 +169,13 @@ def test_policy_input_is_client_error_but_corrupt_report_is_provider_error(tmp_p
     with pytest.raises(AdminProviderError, match="stored analysis report"):
         providers.simulate_policy({}, sha256=REVIEW_SHA)
 
+    with pytest.raises(AdminRequestError, match="baseline records"):
+        providers.import_baselines(
+            ({"sha256": "not-a-digest", "extra": True},), actor="root", reason="bad"
+        )
+    with pytest.raises(AdminRequestError, match="invalid project"):
+        providers.list_baselines("")
+
 
 def test_baseline_management_is_separate_from_install_decision_and_audited(tmp_path) -> None:
     providers, store, reader = _providers(tmp_path)

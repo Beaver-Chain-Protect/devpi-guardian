@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -52,6 +53,28 @@ def test_uninitialized_store_retains_root_descriptor_without_creating_cas(tmp_pa
     assert (root / "objects" / "sha256").is_dir()
     assert (root / ".incoming").is_dir()
     store.close()
+
+
+def test_uninitialized_and_closed_store_never_fall_back_to_cwd(tmp_path: Path, monkeypatch):
+    root = tmp_path / "q"
+    root.mkdir(mode=0o700)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    store = QuarantineStore(root, max_size_bytes=100, initialize=False)
+    item = candidate(b"lifecycle")
+
+    with pytest.raises(QuarantineError, match="not initialized"):
+        store.persist(item, [b"lifecycle"])
+    with pytest.raises(QuarantineError, match="not initialized"):
+        store.get_verified(item)
+    assert list(cwd.iterdir()) == []
+
+    store.close()
+    with pytest.raises(QuarantineError, match="closed"):
+        store.initialize()
+    with pytest.raises(QuarantineError, match="not initialized"):
+        store.persist(item, [b"lifecycle"])
 
 
 def test_relative_root_and_symlink_root_rejected(tmp_path: Path) -> None:
@@ -143,6 +166,34 @@ def test_close_attempts_all_descriptors_and_preserves_first_error(
     assert store._root_fd is None
     monkeypatch.undo()
     store.close()
+    assert store._incoming_fd is None
+
+
+def test_close_failure_cannot_reinitialize_or_escape_to_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    sentinel = tmp_path / "sentinel"
+    sentinel.mkdir()
+    monkeypatch.chdir(sentinel)
+    incoming_fd = store._incoming_fd
+    real_close = os.close
+
+    def close(fd: int) -> None:
+        if fd == incoming_fd:
+            raise OSError("incoming close failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(OSError, match="incoming close failed"):
+        store.close()
+    with pytest.raises(QuarantineError, match="closed"):
+        store.initialize()
+    assert list(sentinel.iterdir()) == []
+
+    monkeypatch.undo()
+    store.close()
+    assert store._incoming_fd is None
 
 
 def test_context_exit_preserves_active_body_error_when_close_fails(
@@ -234,6 +285,87 @@ def test_identical_concurrent_publishers_are_idempotent(tmp_path: Path) -> None:
     store.close()
 
 
+def test_loser_retries_while_winner_is_between_link_and_unlink(tmp_path: Path, monkeypatch):
+    from devpi_guardian.worker import quarantine as quarantine_module
+
+    payload = b"forced concurrent publication"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    barrier = threading.Barrier(2)
+    winner_linked = threading.Event()
+    release_winner = threading.Event()
+    results = []
+    errors = []
+    real_link = os.link
+    real_sleep = quarantine_module.time.sleep
+    first_link = True
+
+    def link(*args, **kwargs):
+        nonlocal first_link
+        result = real_link(*args, **kwargs)
+        if first_link:
+            first_link = False
+            winner_linked.set()
+            assert release_winner.wait(1)
+        return result
+
+    def sleep(seconds):
+        release_winner.set()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(quarantine_module.time, "sleep", sleep)
+
+    def publish() -> None:
+        try:
+            barrier.wait()
+            results.append(store.persist(item, [payload]))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=publish) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert winner_linked.wait(1)
+    for thread in threads:
+        thread.join(2)
+    assert errors == []
+    assert len(results) == 2
+    for result in results:
+        result._stream.close()
+    store.close()
+
+
+def test_persistent_extra_hardlink_fails_within_bounded_retry(tmp_path: Path, monkeypatch):
+    payload = b"persistent extra link"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    verified = store.persist(item, [payload])
+    verified._stream.close()
+    path = store.root_path / store.object_relative_path(item.sha256)
+    extra = tmp_path / "persistent-link"
+    os.link(path, extra)
+    real_hash = hashlib.sha256
+    monkeypatch.setattr(hashlib, "sha256", lambda: pytest.fail("must not hash unsafe object"))
+    leaf_fd = store._open_leaf(item.sha256, create=False)
+    assert leaf_fd is not None
+    started = time.monotonic()
+    try:
+        with pytest.raises(QuarantineError):
+            store._open_verified_fd(
+                leaf_fd,
+                item.sha256,
+                item,
+                None,
+                retry_transient_links=True,
+            )
+    finally:
+        os.close(leaf_fd)
+        store.close()
+        monkeypatch.setattr(hashlib, "sha256", real_hash)
+    assert time.monotonic() - started < 0.5
+
+
 def test_verified_descriptor_is_bound_when_cas_name_is_replaced(tmp_path: Path) -> None:
     payload = b"descriptor binding"
     store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
@@ -258,6 +390,44 @@ def test_hard_linked_object_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(QuarantineError):
         store.get_verified(item)
     store.close()
+
+
+def test_transient_staging_link_is_retried_before_full_verification(tmp_path: Path, monkeypatch):
+    payload = b"transient staging link"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    verified = store.persist(item, [payload])
+    verified._stream.close()
+    leaf_fd = store._open_leaf(item.sha256, create=False)
+    assert leaf_fd is not None
+    real_fstat = os.fstat
+    calls = 0
+
+    def fstat(fd):
+        nonlocal calls
+        result = real_fstat(fd)
+        calls += 1
+        if calls == 1:
+            values = list(result)
+            values[3] = 2
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    try:
+        stream = store._open_verified_fd(
+            leaf_fd,
+            item.sha256,
+            item,
+            None,
+            retry_transient_links=True,
+        )
+        assert stream is not None
+        with stream:
+            assert stream.read() == payload
+    finally:
+        os.close(leaf_fd)
+        store.close()
 
 
 def test_hard_link_added_during_hash_is_rejected(tmp_path: Path, monkeypatch) -> None:

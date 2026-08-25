@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import time
 import uuid
 from collections.abc import Iterable
 from pathlib import Path
@@ -22,6 +23,8 @@ from .models import ArtifactCandidate, VerifiedArtifact
 _DIR_MODE = 0o700
 _OBJECT_MODE = 0o600
 _CHUNK_SIZE = 1024 * 1024
+_TRANSIENT_LINK_WINDOW = 0.1
+_TRANSIENT_LINK_DELAY = 0.001
 
 
 class QuarantineError(RuntimeError):
@@ -100,24 +103,33 @@ class QuarantineStore:
         self._objects_fd: int | None = None
         self._sha256_fd: int | None = None
         self._incoming_fd: int | None = None
+        self._state = "open_uninitialized"
         if initialize:
             self.initialize()
 
     def initialize(self) -> None:
         """Create and retain CAS directories after root validation/activation."""
-        if self._objects_fd is not None:
-            return
+        if self._state != "open_uninitialized":
+            if self._state == "open":
+                return
+            raise QuarantineError("quarantine store is closed")
         try:
             self._objects_fd = self._open_or_create_dir(self._root_fd, "objects")
             self._sha256_fd = self._open_or_create_dir(self._objects_fd, "sha256")
             self._incoming_fd = self._open_or_create_dir(self._root_fd, ".incoming")
+            self._state = "open"
         except BaseException as error:
             for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd"):
                 fd = getattr(self, name)
                 if fd is not None:
                     setattr(self, name, None)
                     _close_fd(fd, error)
+            self._state = "closed"
             raise
+
+    def _require_open(self) -> None:
+        if self._state != "open":
+            raise QuarantineError("quarantine store is not initialized")
 
     @property
     def root_path(self) -> Path:
@@ -126,6 +138,12 @@ class QuarantineStore:
         return self._root_path
 
     def close(self) -> None:
+        if self._state == "closed" and all(
+            getattr(self, name, None) is None
+            for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd")
+        ):
+            return
+        self._state = "closing"
         first_error: BaseException | None = None
         for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd"):
             fd = getattr(self, name, None)
@@ -139,6 +157,14 @@ class QuarantineStore:
                         _note_cleanup(first_error, "descriptor", error)
                 else:
                     setattr(self, name, None)
+        self._state = (
+            "closed"
+            if all(
+                getattr(self, name, None) is None
+                for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd")
+            )
+            else "closing"
+        )
         if first_error is not None:
             raise first_error
 
@@ -167,6 +193,7 @@ class QuarantineStore:
     ) -> VerifiedArtifact:
         """Verify and atomically publish bytes, without ever overwriting."""
 
+        self._require_open()
         digest = validate_sha256(candidate.sha256)
         leaf_fd = self._open_leaf(digest, create=True)
         staging_name: str | None = f"artifact-{uuid.uuid4().hex}"
@@ -241,7 +268,13 @@ class QuarantineStore:
                 os.unlink(staging_name, dir_fd=self._incoming_fd)
                 staging_name = None
                 os.fsync(self._incoming_fd)
-                existing = self._open_verified_fd(leaf_fd, digest, candidate, size)
+                existing = self._open_verified_fd(
+                    leaf_fd,
+                    digest,
+                    candidate,
+                    size,
+                    retry_transient_links=True,
+                )
                 if existing is None:
                     raise QuarantineError("existing quarantine object is corrupt") from None
                 close_owned(existing, "existing quarantine object")
@@ -278,6 +311,7 @@ class QuarantineStore:
     def get_verified(self, candidate: ArtifactCandidate) -> VerifiedArtifact | None:
         """Open and verify a CAS object, returning its owning descriptor."""
 
+        self._require_open()
         digest = validate_sha256(candidate.sha256)
         leaf_fd = self._open_leaf(digest, create=False)
         if leaf_fd is None:
@@ -452,6 +486,8 @@ class QuarantineStore:
         digest: str,
         candidate: ArtifactCandidate,
         expected_size: int | None,
+        *,
+        retry_transient_links: bool = False,
     ) -> BinaryIO | None:
         try:
             entry = os.stat(digest, dir_fd=leaf_fd, follow_symlinks=False)
@@ -474,6 +510,23 @@ class QuarantineStore:
         stream: BinaryIO | None = None
         try:
             st = os.fstat(fd)
+            if retry_transient_links and st.st_nlink == 2:
+                deadline = time.monotonic() + _TRANSIENT_LINK_WINDOW
+                while time.monotonic() < deadline:
+                    _close_fd(fd)
+                    fd = -1
+                    time.sleep(min(_TRANSIENT_LINK_DELAY, max(0, deadline - time.monotonic())))
+                    try:
+                        fd = os.open(
+                            digest,
+                            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                            dir_fd=leaf_fd,
+                        )
+                    except FileNotFoundError:
+                        return None
+                    st = os.fstat(fd)
+                    if st.st_nlink != 2:
+                        break
             if (
                 not stat.S_ISREG(st.st_mode)
                 or st.st_uid != os.geteuid()
