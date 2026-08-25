@@ -7,12 +7,15 @@ so replacing a name in the CAS cannot change the bytes an analyzer receives.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
+import re
 import stat
 import time
 import uuid
 from collections.abc import Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
 
@@ -25,6 +28,7 @@ _OBJECT_MODE = 0o600
 _CHUNK_SIZE = 1024 * 1024
 _TRANSIENT_LINK_WINDOW = 0.1
 _TRANSIENT_LINK_DELAY = 0.001
+_STAGING_NAME = re.compile(r"artifact-[0-9a-f]{32}\Z")
 
 
 class QuarantineError(RuntimeError):
@@ -268,18 +272,26 @@ class QuarantineStore:
                 os.unlink(staging_name, dir_fd=self._incoming_fd)
                 staging_name = None
                 os.fsync(self._incoming_fd)
-                existing = self._open_verified_fd(
-                    leaf_fd,
-                    digest,
-                    candidate,
-                    size,
-                    retry_transient_links=True,
-                )
+                try:
+                    existing = self._open_verified_fd(
+                        leaf_fd,
+                        digest,
+                        candidate,
+                        size,
+                        retry_transient_links=True,
+                    )
+                except QuarantineError:
+                    if not self._recover_crash_link(leaf_fd, digest, candidate, size):
+                        raise
+                    existing = self._open_verified_fd(leaf_fd, digest, candidate, size)
+                if existing is None and self._recover_crash_link(leaf_fd, digest, candidate, size):
+                    existing = self._open_verified_fd(leaf_fd, digest, candidate, size)
                 if existing is None:
                     raise QuarantineError("existing quarantine object is corrupt") from None
                 close_owned(existing, "existing quarantine object")
             if staging_name is not None:
-                os.unlink(staging_name, dir_fd=self._incoming_fd)
+                with suppress(FileNotFoundError):
+                    os.unlink(staging_name, dir_fd=self._incoming_fd)
                 staging_name = None
             os.fsync(self._incoming_fd)
             os.fsync(leaf_fd)
@@ -319,7 +331,18 @@ class QuarantineStore:
         primary_error: BaseException | None = None
         result: VerifiedArtifact | None = None
         try:
-            stream = self._open_verified_fd(leaf_fd, digest, candidate, None)
+            try:
+                stream = self._open_verified_fd(
+                    leaf_fd,
+                    digest,
+                    candidate,
+                    None,
+                    retry_transient_links=True,
+                )
+            except QuarantineError:
+                if not self._recover_crash_link(leaf_fd, digest, candidate, None):
+                    raise
+                stream = self._open_verified_fd(leaf_fd, digest, candidate, None)
             if stream is None:
                 return None
             try:
@@ -351,6 +374,103 @@ class QuarantineStore:
             sha256=candidate.sha256,
             size_bytes=size,
             _stream=stream,
+        )
+
+    def _recover_crash_link(
+        self,
+        leaf_fd: int,
+        digest: str,
+        candidate: ArtifactCandidate,
+        expected_size: int | None,
+    ) -> bool:
+        """Remove one verified Guardian post-link staging link."""
+
+        try:
+            final_fd = os.open(
+                digest,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=leaf_fd,
+            )
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise QuarantineError("unable to inspect quarantine object") from error
+        try:
+            final = os.fstat(final_fd)
+            if not self._is_recoverable_link_stat(final):
+                return False
+            try:
+                names = os.listdir(self._incoming_fd)
+            except OSError as error:
+                raise QuarantineError("unable to inspect quarantine staging") from error
+            for name in names:
+                if _STAGING_NAME.fullmatch(name) is None:
+                    continue
+                try:
+                    staging_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                        dir_fd=self._incoming_fd,
+                    )
+                except OSError as error:
+                    if error.errno in (errno.ENOENT, errno.ELOOP):
+                        continue
+                    raise QuarantineError("unable to inspect quarantine staging") from error
+                try:
+                    staging = os.fstat(staging_fd)
+                    if not self._is_recoverable_link_stat(staging):
+                        continue
+                    if (
+                        staging.st_dev != final.st_dev
+                        or staging.st_ino != final.st_ino
+                        or staging.st_size != final.st_size
+                    ):
+                        continue
+                    expected = candidate.expected_size_bytes
+                    if (expected_size is not None and staging.st_size != expected_size) or (
+                        expected is not None and staging.st_size != expected
+                    ):
+                        continue
+                    hasher = hashlib.sha256()
+                    while True:
+                        chunk = os.read(staging_fd, _CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        hasher.update(chunk)
+                    after = os.fstat(staging_fd)
+                    current_final = os.fstat(final_fd)
+                    if (
+                        hasher.hexdigest() != digest
+                        or not self._is_recoverable_link_stat(after)
+                        or after.st_dev != staging.st_dev
+                        or after.st_ino != staging.st_ino
+                        or after.st_size != staging.st_size
+                        or not self._is_recoverable_link_stat(current_final)
+                        or current_final.st_dev != staging.st_dev
+                        or current_final.st_ino != staging.st_ino
+                        or current_final.st_size != staging.st_size
+                    ):
+                        continue
+                    try:
+                        os.unlink(name, dir_fd=self._incoming_fd)
+                    except FileNotFoundError:
+                        continue
+                    os.fsync(self._incoming_fd)
+                    os.fsync(leaf_fd)
+                    return True
+                finally:
+                    _close_fd(staging_fd)
+            return False
+        finally:
+            _close_fd(final_fd)
+
+    @staticmethod
+    def _is_recoverable_link_stat(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and value.st_uid == os.geteuid()
+            and stat.S_IMODE(value.st_mode) == _OBJECT_MODE
+            and value.st_nlink == 2
         )
 
     @staticmethod

@@ -4,6 +4,7 @@ import hashlib
 import os
 import threading
 import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 
@@ -27,6 +28,34 @@ def candidate(payload: bytes, *, size: int | None = None) -> ArtifactCandidate:
         origin_url="https://devpi.invalid/root/pypi/+f/demo.whl",
         expected_size_bytes=size,
     )
+
+
+def seed_post_link_residue(store: QuarantineStore, item: ArtifactCandidate, payload: bytes) -> str:
+    leaf_fd = store._open_leaf(item.sha256, create=True)
+    assert leaf_fd is not None
+    staging_name = f"artifact-{uuid.uuid4().hex}"
+    staging_fd = os.open(
+        staging_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=store._incoming_fd,
+    )
+    try:
+        os.write(staging_fd, payload)
+        os.fsync(staging_fd)
+    finally:
+        os.close(staging_fd)
+    os.link(
+        staging_name,
+        item.sha256,
+        src_dir_fd=store._incoming_fd,
+        dst_dir_fd=leaf_fd,
+        follow_symlinks=False,
+    )
+    os.fsync(store._incoming_fd)
+    os.fsync(leaf_fd)
+    os.close(leaf_fd)
+    return staging_name
 
 
 def test_store_uses_absolute_digest_path_and_verified_descriptor(tmp_path: Path) -> None:
@@ -291,6 +320,133 @@ def test_identical_concurrent_publishers_are_idempotent(tmp_path: Path) -> None:
         with result.open_for_analysis() as stream:
             assert stream.read() == payload
     store.close()
+
+
+def test_restart_recovers_guardian_post_link_crash_residue(tmp_path: Path) -> None:
+    payload = b"post-link crash residue"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    seed_post_link_residue(store, item, payload)
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    verified = restarted.get_verified(item)
+    assert verified is not None
+    with verified.open_for_analysis() as stream:
+        assert stream.read() == payload
+    assert not list((root / ".incoming").iterdir())
+    final_path = root / QuarantineStore.object_relative_path(item.sha256)
+    assert final_path.stat().st_nlink == 1
+    persisted = restarted.persist(item, [payload])
+    with persisted.open_for_analysis() as stream:
+        assert stream.read() == payload
+    restarted.close()
+
+
+def test_persist_recovers_post_link_crash_residue(tmp_path: Path) -> None:
+    payload = b"persist crash residue"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    seed_post_link_residue(store, item, payload)
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    persisted = restarted.persist(item, [payload])
+    with persisted.open_for_analysis() as stream:
+        assert stream.read() == payload
+    assert not list((root / ".incoming").iterdir())
+    assert (root / QuarantineStore.object_relative_path(item.sha256)).stat().st_nlink == 1
+    restarted.close()
+
+
+def test_invalid_post_link_residue_remains_fail_closed(tmp_path: Path) -> None:
+    payload = b"invalid crash residue"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    staging_name = seed_post_link_residue(store, item, payload)
+    staging_path = root / ".incoming" / staging_name
+    staging_path.write_bytes(b"tampered")
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    with pytest.raises(QuarantineError):
+        restarted.get_verified(item)
+    assert staging_path.exists()
+    assert (root / QuarantineStore.object_relative_path(item.sha256)).stat().st_nlink == 2
+    restarted.close()
+
+
+def test_non_guardian_staging_name_remains_fail_closed(tmp_path: Path) -> None:
+    payload = b"wrong staging name"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    staging_name = seed_post_link_residue(store, item, payload)
+    (root / ".incoming" / staging_name).rename(root / ".incoming" / "external-link")
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    with pytest.raises(QuarantineError):
+        restarted.get_verified(item)
+    assert (root / ".incoming" / "external-link").exists()
+    restarted.close()
+
+
+def test_different_inode_staging_remains_fail_closed(tmp_path: Path) -> None:
+    payload = b"different inode"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    staging_name = seed_post_link_residue(store, item, payload)
+    final_path = root / QuarantineStore.object_relative_path(item.sha256)
+    os.link(final_path, root / "external-link")
+    (root / ".incoming" / staging_name).unlink()
+    (root / ".incoming" / staging_name).write_bytes(payload)
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    with pytest.raises(QuarantineError):
+        restarted.get_verified(item)
+    assert (root / ".incoming" / staging_name).exists()
+    restarted.close()
+
+
+def test_unsafe_mode_staging_remains_fail_closed(tmp_path: Path) -> None:
+    payload = b"unsafe mode staging"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    staging_name = seed_post_link_residue(store, item, payload)
+    (root / ".incoming" / staging_name).chmod(0o644)
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    with pytest.raises(QuarantineError):
+        restarted.get_verified(item)
+    assert (root / ".incoming" / staging_name).exists()
+    restarted.close()
+
+
+def test_symlink_staging_remains_fail_closed(tmp_path: Path) -> None:
+    payload = b"symlink staging"
+    item = candidate(payload)
+    root = tmp_path / "q"
+    store = QuarantineStore(root, max_size_bytes=100)
+    staging_name = seed_post_link_residue(store, item, payload)
+    final_path = root / QuarantineStore.object_relative_path(item.sha256)
+    os.link(final_path, root / "external-link")
+    (root / ".incoming" / staging_name).unlink()
+    (root / ".incoming" / staging_name).symlink_to(tmp_path / "outside")
+    store.close()
+
+    restarted = QuarantineStore(root, max_size_bytes=100)
+    with pytest.raises(QuarantineError):
+        restarted.get_verified(item)
+    assert (root / ".incoming" / staging_name).is_symlink()
+    restarted.close()
 
 
 def test_loser_retries_while_winner_is_between_link_and_unlink(tmp_path: Path, monkeypatch):
