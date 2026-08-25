@@ -7,7 +7,6 @@ import os
 import socket
 import stat
 from contextlib import suppress
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,7 +15,7 @@ import requests
 from devpi_server.main import Fatal
 from pluggy import HookimplMarker
 from pyramid.httpexceptions import HTTPServiceUnavailable
-from pyramid.interfaces import IRoutesMapper, ITweens
+from pyramid.interfaces import IRouteRequest, IRoutesMapper, ITweens
 
 from . import __version__
 from .activation import GuardianActivationError, ensure_guardian_activation
@@ -304,80 +303,210 @@ class _Components:
 
 @dataclass(slots=True)
 class _PyramidState:
-    registry_values: dict
-    utility_registrations: dict
-    adapter_registrations: dict
-    mutable_utilities: tuple
-    introspector_categories: dict
-    introspector_refs: dict
-    introspector_counter: int
+    routes_mapper: object | None
+    baseline_routes: dict
+    baseline_routelist: tuple
+    baseline_static_routes: tuple
+    baseline_utility_keys: frozenset
+    baseline_introspection_categories: frozenset
+    tweens: object | None
+    baseline_tween_names: frozenset
+    baseline_action_ids: frozenset
+    guardian_route_names: frozenset = frozenset()
+    guardian_introspectables: tuple = ()
+    guardian_tween_names: frozenset = frozenset()
 
 
 def _snapshot_pyramid_state(pyramid_config) -> _PyramidState:
     registry = pyramid_config.registry
-    mutable_utilities = []
-    for interface in (IRoutesMapper, ITweens):
-        utility = registry.queryUtility(interface)
-        if utility is not None:
-            mutable_utilities.append((utility, deepcopy(vars(utility))))
-    introspector = pyramid_config.introspector
+    routes_mapper = registry.queryUtility(IRoutesMapper)
+    tweens = registry.queryUtility(ITweens)
+    action_state = getattr(pyramid_config, "action_state", None)
+    actions = getattr(action_state, "actions", ()) if action_state is not None else ()
     return _PyramidState(
-        registry_values=dict(registry),
-        utility_registrations=dict(registry._utility_registrations),
-        adapter_registrations=dict(registry._adapter_registrations),
-        mutable_utilities=tuple(mutable_utilities),
-        introspector_categories={
-            category: dict(entries) for category, entries in introspector._categories.items()
-        },
-        introspector_refs=dict(introspector._refs),
-        introspector_counter=introspector._counter,
+        routes_mapper=routes_mapper,
+        baseline_routes=dict(getattr(routes_mapper, "routes", {})),
+        baseline_routelist=tuple(getattr(routes_mapper, "routelist", ())),
+        baseline_static_routes=tuple(getattr(routes_mapper, "static_routes", ())),
+        baseline_utility_keys=frozenset(registry._utility_registrations),
+        baseline_introspection_categories=frozenset(
+            getattr(getattr(pyramid_config, "introspector", None), "_categories", {})
+        ),
+        tweens=tweens,
+        baseline_tween_names=frozenset(getattr(getattr(tweens, "sorter", None), "names", ())),
+        baseline_action_ids=frozenset(id(action) for action in actions),
     )
 
 
-def _restore_pyramid_state(pyramid_config, snapshot: _PyramidState) -> None:
-    registry = pyramid_config.registry
-    registry.clear()
-    registry.update(snapshot.registry_values)
+def _capture_guardian_actions(pyramid_config, snapshot: _PyramidState) -> None:
+    action_state = getattr(pyramid_config, "action_state", None)
+    actions = getattr(action_state, "actions", ()) if action_state is not None else ()
+    guardian_actions = [
+        action for action in actions if id(action) not in snapshot.baseline_action_ids
+    ]
+    introspectables = tuple(
+        introspectable
+        for action in guardian_actions
+        for introspectable in action.get("introspectables", ())
+    )
+    snapshot.guardian_introspectables = introspectables
+    snapshot.guardian_route_names = frozenset(
+        introspectable["name"]
+        for introspectable in introspectables
+        if introspectable.category_name == "routes" and "name" in introspectable
+    )
+    snapshot.guardian_tween_names = frozenset(
+        introspectable["name"]
+        for introspectable in introspectables
+        if introspectable.category_name == "tweens" and "name" in introspectable
+    )
 
-    for key, _registration in list(registry._utility_registrations.items()):
-        if key not in snapshot.utility_registrations:
-            provided, name = key
-            registry.unregisterUtility(provided=provided, name=name)
-    for key, registration in snapshot.utility_registrations.items():
-        if registry._utility_registrations.get(key) != registration:
-            provided, name = key
-            if key in registry._utility_registrations:
-                registry.unregisterUtility(provided=provided, name=name)
-            component, info, factory = registration
-            registry.registerUtility(
-                component, provided=provided, name=name, info=info, factory=factory
-            )
 
-    for key in list(registry._adapter_registrations):
-        if key not in snapshot.adapter_registrations:
-            required, provided, name = key
-            registry.unregisterAdapter(required=required, provided=provided, name=name)
-    for key, registration in snapshot.adapter_registrations.items():
-        if registry._adapter_registrations.get(key) != registration:
-            required, provided, name = key
-            if key in registry._adapter_registrations:
-                registry.unregisterAdapter(required=required, provided=provided, name=name)
-            factory, info = registration
-            registry.registerAdapter(
-                factory, required=required, provided=provided, name=name, info=info
-            )
+def _remove_guardian_view_adapters(pyramid_config, snapshot: _PyramidState) -> None:
+    """Remove only view adapters created by Guardian's deferred actions.
 
-    for utility, state in snapshot.mutable_utilities:
-        utility.__dict__.clear()
-        utility.__dict__.update(deepcopy(state))
-    registry._clear_view_lookup_cache()
-
-    introspector = pyramid_config.introspector
-    introspector._categories = {
-        category: dict(entries) for category, entries in snapshot.introspector_categories.items()
+    Pyramid 2.1 does not expose an iterator over view registrations.  The
+    adapter registry is therefore inspected narrowly here, using the
+    ``derived_callable`` identity Pyramid records on each Guardian view
+    introspectable.  A MultiView is edited in place so a later plugin view in
+    the same adapter slot remains registered.
+    """
+    targets = {
+        introspectable.get("derived_callable")
+        for introspectable in snapshot.guardian_introspectables
+        if introspectable.category_name == "views"
+        and introspectable.get("derived_callable") is not None
     }
-    introspector._refs = dict(snapshot.introspector_refs)
-    introspector._counter = snapshot.introspector_counter
+    if not targets:
+        return
+
+    registry = pyramid_config.registry
+    for key, registration in list(registry._adapter_registrations.items()):
+        required, provided, name = key
+        factory = registration[0]
+        if factory in targets:
+            registry.unregisterAdapter(required=required, provided=provided, name=name)
+            continue
+        views = getattr(factory, "views", None)
+        media_views = getattr(factory, "media_views", None)
+        if views is None and media_views is None:
+            continue
+        changed = False
+        if views is not None:
+            retained = [entry for entry in views if entry[1] not in targets]
+            changed = len(retained) != len(views)
+            views[:] = retained
+        if media_views is not None:
+            for offer, offer_views in list(media_views.items()):
+                retained = [entry for entry in offer_views if entry[1] not in targets]
+                changed = changed or len(retained) != len(offer_views)
+                if retained:
+                    media_views[offer] = retained
+                else:
+                    media_views.pop(offer)
+            if hasattr(factory, "accepts"):
+                factory.accepts[:] = [offer for offer in factory.accepts if offer in media_views]
+        if (
+            changed
+            and not getattr(factory, "views", ())
+            and not getattr(factory, "media_views", {})
+        ):
+            registry.unregisterAdapter(required=required, provided=provided, name=name)
+
+
+def _remove_route(mapper, route) -> None:
+    mapper.routelist[:] = [candidate for candidate in mapper.routelist if candidate is not route]
+    mapper.static_routes[:] = [
+        candidate for candidate in mapper.static_routes if candidate is not route
+    ]
+
+
+def _restore_guardian_routes(pyramid_config, snapshot: _PyramidState) -> None:
+    registry = pyramid_config.registry
+    mapper = registry.queryUtility(IRoutesMapper)
+    if mapper is not None and (snapshot.routes_mapper is None or mapper is snapshot.routes_mapper):
+        for name in snapshot.guardian_route_names:
+            current = mapper.routes.get(name)
+            baseline = snapshot.baseline_routes.get(name)
+            if baseline is None:
+                if current is not None:
+                    _remove_route(mapper, current)
+                    mapper.routes.pop(name, None)
+                continue
+            if current is not baseline:
+                if current is not None:
+                    _remove_route(mapper, current)
+                mapper.routes[name] = baseline
+                if baseline in snapshot.baseline_routelist and baseline not in mapper.routelist:
+                    index = snapshot.baseline_routelist.index(baseline)
+                    mapper.routelist.insert(min(index, len(mapper.routelist)), baseline)
+                if (
+                    baseline in snapshot.baseline_static_routes
+                    and baseline not in mapper.static_routes
+                ):
+                    index = snapshot.baseline_static_routes.index(baseline)
+                    mapper.static_routes.insert(min(index, len(mapper.static_routes)), baseline)
+
+    for name in snapshot.guardian_route_names:
+        key = (IRouteRequest, name)
+        if key in snapshot.baseline_utility_keys:
+            continue
+        if registry.queryUtility(IRouteRequest, name=name) is not None:
+            registry.unregisterUtility(provided=IRouteRequest, name=name)
+
+    if (
+        snapshot.routes_mapper is None
+        and mapper is not None
+        and not getattr(mapper, "routelist", ())
+        and not getattr(mapper, "static_routes", ())
+    ):
+        registry.unregisterUtility(provided=IRoutesMapper, name="")
+
+
+def _restore_guardian_tweens(pyramid_config, snapshot: _PyramidState) -> None:
+    tweens = pyramid_config.registry.queryUtility(ITweens)
+    if tweens is None or (snapshot.tweens is not None and tweens is not snapshot.tweens):
+        return
+    sorter = getattr(tweens, "sorter", None)
+    if sorter is not None:
+        for name in snapshot.guardian_tween_names:
+            if name not in snapshot.baseline_tween_names and name in sorter.names:
+                sorter.remove(name)
+    explicit = getattr(tweens, "explicit", None)
+    if explicit is not None:
+        explicit[:] = [
+            entry
+            for entry in explicit
+            if entry[0] not in snapshot.guardian_tween_names
+            or entry[0] in snapshot.baseline_tween_names
+        ]
+    if (
+        snapshot.tweens is None
+        and not getattr(sorter, "names", ())
+        and not getattr(tweens, "explicit", ())
+    ):
+        pyramid_config.registry.unregisterUtility(provided=ITweens, name="")
+
+
+def _restore_guardian_introspection(pyramid_config, snapshot: _PyramidState) -> None:
+    introspector = pyramid_config.introspector
+    for introspectable in snapshot.guardian_introspectables:
+        current = introspector.get(introspectable.category_name, introspectable.discriminator)
+        if current is introspectable:
+            introspector.remove(introspectable.category_name, introspectable.discriminator)
+    for category in list(introspector._categories):
+        if (
+            category not in snapshot.baseline_introspection_categories
+            and not introspector._categories[category]
+        ):
+            del introspector._categories[category]
+
+
+def _restore_pyramid_state(pyramid_config, snapshot: _PyramidState) -> None:
+    _remove_guardian_view_adapters(pyramid_config, snapshot)
+    _restore_guardian_routes(pyramid_config, snapshot)
+    _restore_guardian_tweens(pyramid_config, snapshot)
+    _restore_guardian_introspection(pyramid_config, snapshot)
 
 
 def _close_components_resources(components: _Components, primary: BaseException) -> None:
@@ -592,6 +721,7 @@ def devpiserver_pyramid_configure(config, pyramid_config) -> None:
             "devpi_guardian.enforcement.tween.guardian_enforcement_tween_factory",
             under="devpi_server.views.tween_keyfs_transaction",
         )
+        _capture_guardian_actions(pyramid_config, pyramid_state)
 
         def publish() -> None:
             components = None

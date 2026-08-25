@@ -17,6 +17,14 @@ from devpi_guardian.activation import (
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 
 
+def _unrelated_plugin_view(_context, _request):
+    return "unrelated"
+
+
+def _unrelated_plugin_tween_factory(handler, _registry):
+    return handler
+
+
 def _plugin_config(tmp_path, *, quarantine_root=None):
     args = SimpleNamespace(
         guardian_db=str(tmp_path / "guardian.db"),
@@ -335,6 +343,69 @@ def test_final_publication_runs_after_later_finite_actions(monkeypatch, tmp_path
         pyramid.commit()
 
     assert events == ["later"]
+
+
+def test_final_publication_failure_preserves_unrelated_pyramid_actions(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+    from pyramid.interfaces import (
+        IRouteRequest,
+        IRoutesMapper,
+        ITweens,
+        IView,
+        IViewClassifier,
+    )
+    from zope.interface import Interface
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("build probe")),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.add_route("other_plugin_route", "/other-plugin")
+    pyramid.add_view(
+        _unrelated_plugin_view,
+        route_name="other_plugin_route",
+        request_method="GET",
+    )
+    pyramid.add_tween(f"{__name__}._unrelated_plugin_tween_factory")
+    pyramid.action(
+        "other-plugin-registry",
+        callable=lambda: pyramid.registry.__setitem__("other_plugin", object()),
+        order=100,
+    )
+
+    with pytest.raises(Exception, match="build probe"):
+        pyramid.commit()
+
+    mapper = pyramid.registry.queryUtility(IRoutesMapper)
+    assert mapper is not None
+    assert mapper.get_route("other_plugin_route") is not None
+    assert "other_plugin" in pyramid.registry
+    assert (
+        pyramid.registry.queryUtility(ITweens).sorter.name2val[
+            f"{__name__}._unrelated_plugin_tween_factory"
+        ]
+        is _unrelated_plugin_tween_factory
+    )
+    request_iface = pyramid.registry.queryUtility(IRouteRequest, name="other_plugin_route")
+    assert (
+        pyramid.registry.adapters.registered((IViewClassifier, request_iface, Interface), IView, "")
+        is not None
+    )
 
 
 def test_activation_failure_after_quarantine_open_has_no_component_side_effects(tmp_path):
