@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
-from devpi_guardian.analyzers import Finding
+from devpi_guardian.analyzers import Finding, finding_fingerprint
 from devpi_guardian.verdicts.models import (
     BaselineTier,
     Decision,
@@ -19,6 +20,7 @@ from devpi_guardian.verdicts.models import (
 )
 from devpi_guardian.worker.models import (
     AnalysisEvidence,
+    AnalysisFileDiff,
     AnalysisReport,
     AnalysisStep,
     VerifiedArtifact,
@@ -33,6 +35,11 @@ _DEFAULT_F7_TIER_SCORES = {
     "sdist": 70,
 }
 _MAX_TEXT_LENGTH = 4096
+_MAX_RULE_ESCALATIONS = 256
+_MAX_EVIDENCE = 1024
+_MAX_DIFF_PATHS = 4096
+_MAX_REPORT_BYTES = 1024 * 1024
+_MAX_POLICY_BYTES = 64 * 1024
 
 
 class PolicyInputError(ValueError):
@@ -48,17 +55,17 @@ def _validate_score(value: object, name: str) -> int:
 def _validate_text(value: object, name: str) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{name} must not be blank")
-    if len(value) > _MAX_TEXT_LENGTH:
-        raise ValueError(f"{name} is too long")
     if any(
         ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F or 0xD800 <= ord(char) <= 0xDFFF
         for char in value
     ):
         raise ValueError(f"{name} contains a control character")
     try:
-        value.encode("utf-8")
+        encoded = value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError(f"{name} is not valid UTF-8") from exc
+    if len(encoded) > _MAX_TEXT_LENGTH:
+        raise ValueError(f"{name} is too long")
     return value
 
 
@@ -176,6 +183,8 @@ class PolicyConfig:
             raise ValueError("F7 tier scores must be non-decreasing")
         if not isinstance(self.rule_escalations, Mapping):
             raise ValueError("rule_escalations must be a mapping")
+        if len(self.rule_escalations) > _MAX_RULE_ESCALATIONS:
+            raise ValueError("too many rule escalations")
         escalations: dict[str, str] = {}
         for rule, action in self.rule_escalations.items():
             _validate_text(rule, "rule escalation id")
@@ -253,9 +262,11 @@ class PolicyEngine:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        if len(payload) > _MAX_POLICY_BYTES:
+            raise ValueError("canonical policy configuration is too large")
         digest = hashlib.sha256(payload).hexdigest()
         self._policy_version = f"{self._config.name}/{self._config.revision}+sha256:{digest}"
-        if len(self._policy_version) > _MAX_TEXT_LENGTH:
+        if len(self._policy_version.encode("utf-8")) > _MAX_TEXT_LENGTH:
             raise ValueError("policy_version is too long")
 
     @property
@@ -276,6 +287,8 @@ class PolicyEngine:
 
         for item in report.evidence:
             action = self._effective_action(item)
+            if item.finding.rule == "analyzer_error" and action is not Decision.DENY:
+                continue
             if action is Decision.DENY:
                 has_deny = True
                 reason_codes.add(f"finding.deny:{item.analyzer}:{item.finding.rule}")
@@ -376,6 +389,15 @@ class PolicyEngine:
                 raise PolicyInputError("invalid analyzer step name or status")
             if step.analyzer in steps:
                 raise PolicyInputError("duplicate analyzer step")
+            if step.reason is not None:
+                try:
+                    _validate_text(step.reason, "step reason")
+                except ValueError as exc:
+                    raise PolicyInputError(str(exc)) from exc
+            if step.status == "skipped" and step.reason is None:
+                raise PolicyInputError("skipped analyzer requires a reason")
+            if step.status != "skipped" and step.reason is not None:
+                raise PolicyInputError("completed or error analyzer cannot have a reason")
             steps[step.analyzer] = step
         if set(steps) != _ANALYZERS:
             raise PolicyInputError("report must contain one F7, F8, and F9 step")
@@ -400,6 +422,38 @@ class PolicyEngine:
             raise PolicyInputError("absent baseline cannot have a completed F7 step")
         if not isinstance(report.evidence, tuple):
             raise PolicyInputError("evidence must be a tuple")
+        if len(report.evidence) > _MAX_EVIDENCE:
+            raise PolicyInputError("too many analysis evidence items")
+        if report.file_diff is not None:
+            if type(report.file_diff) is not AnalysisFileDiff:
+                raise PolicyInputError("invalid file diff")
+            if not report.has_baseline or steps["F7"].status == "skipped":
+                raise PolicyInputError("file diff requires an F7 baseline")
+            all_paths: list[str] = []
+            for field_name in ("added", "changed", "removed"):
+                paths = getattr(report.file_diff, field_name)
+                if type(paths) is not tuple:
+                    raise PolicyInputError("file diff paths must be tuples")
+                for path in paths:
+                    try:
+                        _validate_text(path, "diff path")
+                    except ValueError as exc:
+                        raise PolicyInputError(str(exc)) from exc
+                    if (
+                        "\\" in path
+                        or path.startswith("/")
+                        or posixpath.normpath(path) != path
+                        or any(part in ("", ".", "..") for part in path.split("/"))
+                    ):
+                        raise PolicyInputError("diff path is not canonical")
+                    all_paths.append(path)
+                if tuple(sorted(paths)) != paths or len(set(paths)) != len(paths):
+                    raise PolicyInputError("file diff paths must be sorted and unique")
+            if len(all_paths) > _MAX_DIFF_PATHS or len(set(all_paths)) != len(all_paths):
+                raise PolicyInputError("file diff paths must be globally unique")
+        seen_evidence: set[tuple[object, ...]] = set()
+        analyzer_error_steps: set[str] = set()
+        analyzer_error_findings: set[str] = set()
         for item in report.evidence:
             if (
                 type(item) is not AnalysisEvidence
@@ -427,3 +481,52 @@ class PolicyEngine:
                     raise PolicyInputError("F7 evidence baseline tier does not match report")
             elif item.baseline_tier is not None:
                 raise PolicyInputError("F8/F9 evidence cannot claim a baseline tier")
+            fingerprint = finding_fingerprint(item.finding)
+            identity = (item.analyzer, fingerprint, item.origin, item.baseline_tier)
+            if identity in seen_evidence:
+                raise PolicyInputError("duplicate analysis evidence")
+            seen_evidence.add(identity)
+            if item.finding.rule == "analyzer_error":
+                analyzer_error_findings.add(item.analyzer)
+        analyzer_error_steps = {step.analyzer for step in report.steps if step.status == "error"}
+        if analyzer_error_steps != analyzer_error_findings:
+            raise PolicyInputError("analyzer_error evidence must match error steps")
+        try:
+            aggregate = json.dumps(
+                {
+                    "analyzer_version": report.analyzer_version,
+                    "baseline_sha256": report.baseline_sha256,
+                    "baseline_tier": report.baseline_tier,
+                    "steps": [(step.analyzer, step.status, step.reason) for step in report.steps],
+                    "evidence": [
+                        (
+                            item.analyzer,
+                            item.origin,
+                            item.baseline_tier,
+                            item.finding.rule,
+                            item.finding.action,
+                            item.finding.file,
+                            item.finding.line,
+                            item.finding.snippet,
+                            item.finding.message,
+                            item.finding.source,
+                            item.finding.sink,
+                        )
+                        for item in report.evidence
+                    ],
+                    "file_diff": None
+                    if report.file_diff is None
+                    else {
+                        field_name: getattr(report.file_diff, field_name)
+                        for field_name in ("added", "changed", "removed")
+                    },
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+            raise PolicyInputError("report is not canonically serializable") from exc
+        if len(aggregate) > _MAX_REPORT_BYTES:
+            raise PolicyInputError("analysis report is too large")

@@ -16,6 +16,7 @@ from devpi_guardian.policy import (
 from devpi_guardian.verdicts.models import Decision
 from devpi_guardian.worker.models import (
     AnalysisEvidence,
+    AnalysisFileDiff,
     AnalysisReport,
     AnalysisStep,
     VerifiedArtifact,
@@ -46,25 +47,49 @@ def report(
     baseline_tier: str = "same_tag",
     steps: tuple[AnalysisStep, ...] | None = None,
     evidence: tuple[AnalysisEvidence, ...] = (),
+    file_diff: AnalysisFileDiff | None = None,
 ) -> AnalysisReport:
+    selected_steps = steps or (
+        AnalysisStep("F7", "completed" if baseline else "skipped"),
+        AnalysisStep("F8", "completed"),
+        AnalysisStep("F9", "completed" if pair else "skipped"),
+    )
+    selected_steps = tuple(
+        AnalysisStep(step.analyzer, step.status, "test coverage gap")
+        if step.status == "skipped" and step.reason is None
+        else step
+        for step in selected_steps
+    )
+    selected_evidence = list(evidence)
+    for step in selected_steps:
+        if step.status == "error" and not any(
+            item.analyzer == step.analyzer and item.finding.rule == "analyzer_error"
+            for item in selected_evidence
+        ):
+            error_item = finding("analyzer_error", analyzer=step.analyzer)
+            if step.analyzer == "F7" and baseline:
+                error_item = AnalysisEvidence(
+                    analyzer="F7",
+                    finding=error_item.finding,
+                    baseline_tier=baseline_tier,
+                )
+            selected_evidence.append(error_item)
     return AnalysisReport(
         analyzer_version=analyzer_version,
         has_baseline=baseline,
         baseline_sha256=BASELINE if baseline else None,
         baseline_tier=baseline_tier if baseline else None,
-        evidence=evidence,
-        steps=steps
-        or (
-            AnalysisStep("F7", "completed" if baseline else "skipped"),
-            AnalysisStep("F8", "completed"),
-            AnalysisStep("F9", "completed" if pair else "skipped"),
-        ),
+        evidence=tuple(selected_evidence),
+        steps=selected_steps,
+        file_diff=file_diff,
     )
 
 
-def finding(rule: str = "unknown_rule", action: str = "REVIEW") -> AnalysisEvidence:
+def finding(
+    rule: str = "unknown_rule", action: str = "REVIEW", analyzer: str = "F8"
+) -> AnalysisEvidence:
     return AnalysisEvidence(
-        analyzer="F8",
+        analyzer=analyzer,
         finding=Finding(rule, action, "x.py", 1, "x", "finding"),
     )
 
@@ -384,7 +409,6 @@ def test_skipped_analyzer_evidence_and_bad_baseline_evidence_are_rejected() -> N
     with pytest.raises(PolicyInputError):
         engine().assess(
             report(
-                baseline=False,
                 steps=(
                     AnalysisStep("F7", "skipped"),
                     AnalysisStep("F8", "completed"),
@@ -437,12 +461,108 @@ def test_scores_use_maximum_and_are_cardinality_invariant() -> None:
         AnalysisStep("F9", "skipped"),
     )
     one = engine().assess(report(baseline=False, steps=steps))
-    duplicate = engine().assess(
-        report(baseline=False, steps=steps, evidence=(finding("same"), finding("same")))
-    )
     assert one.decision is Decision.REVIEW
     assert one.score == 90
-    assert duplicate.score == one.score
+    with pytest.raises(PolicyInputError, match="duplicate"):
+        engine().assess(
+            report(baseline=False, steps=steps, evidence=(finding("same"), finding("same")))
+        )
+
+
+def test_analyzer_error_finding_requires_matching_error_step() -> None:
+    error_finding = finding("analyzer_error")
+    with pytest.raises(PolicyInputError, match="error"):
+        engine().assess(
+            report(
+                steps=(
+                    AnalysisStep("F7", "completed"),
+                    AnalysisStep("F8", "completed"),
+                    AnalysisStep("F9", "completed"),
+                ),
+                evidence=(AnalysisEvidence("F8", error_finding.finding),),
+            )
+        )
+    valid = engine().assess(
+        report(
+            steps=(
+                AnalysisStep("F7", "completed"),
+                AnalysisStep("F8", "error"),
+                AnalysisStep("F9", "completed"),
+            ),
+            evidence=(AnalysisEvidence("F8", error_finding.finding),),
+        )
+    )
+    assert valid.score == 90
+
+
+@pytest.mark.parametrize("analyzer", ["F7", "F8", "F9"])
+def test_each_analyzer_error_step_requires_error_evidence_and_scores_floor(analyzer: str) -> None:
+    steps = tuple(
+        AnalysisStep(name, "error" if name == analyzer else "completed")
+        for name in ("F7", "F8", "F9")
+    )
+    assessed = engine().assess(report(steps=steps))
+    assert assessed.score == 90
+    assert f"coverage.error:{analyzer}" in assessed.reason_codes
+
+
+def test_conflicting_same_fingerprint_evidence_is_rejected() -> None:
+    first = finding("same", "REVIEW")
+    conflicting = AnalysisEvidence(
+        analyzer="F8",
+        finding=Finding("same", "DENY", "x.py", 1, "x", "different message"),
+    )
+    with pytest.raises(PolicyInputError, match="duplicate"):
+        engine().assess(report(evidence=(first, conflicting)))
+
+
+def test_step_reasons_and_file_diff_paths_are_structurally_validated() -> None:
+    with pytest.raises(PolicyInputError, match="reason"):
+        engine().assess(
+            AnalysisReport(
+                analyzer_version="analyzer-1",
+                has_baseline=False,
+                baseline_sha256=None,
+                baseline_tier=None,
+                evidence=(),
+                steps=(
+                    AnalysisStep("F7", "skipped"),
+                    AnalysisStep("F8", "completed"),
+                    AnalysisStep("F9", "completed"),
+                ),
+            )
+        )
+    with pytest.raises(PolicyInputError, match="sorted"):
+        engine().assess(
+            report(
+                evidence=(),
+                steps=(
+                    AnalysisStep("F7", "completed"),
+                    AnalysisStep("F8", "completed"),
+                    AnalysisStep("F9", "completed"),
+                ),
+                file_diff=AnalysisFileDiff(added=("z.py", "a.py"), changed=(), removed=()),
+            )
+        )
+
+
+def test_policy_text_limits_are_utf8_byte_based() -> None:
+    with pytest.raises(ValueError, match="too long"):
+        PolicyConfig(name="é" * 2049)
+
+
+def test_policy_cardinality_limits_are_explicit() -> None:
+    with pytest.raises(ValueError, match="rule escalations"):
+        PolicyConfig(rule_escalations={f"rule-{i}": "REVIEW" for i in range(257)})
+    evidence = tuple(
+        AnalysisEvidence(
+            analyzer="F8",
+            finding=Finding(f"rule-{i}", "REVIEW", f"x-{i}.py", 1, "x", "m"),
+        )
+        for i in range(1025)
+    )
+    with pytest.raises(PolicyInputError, match="evidence"):
+        engine().assess(report(evidence=evidence))
 
 
 def test_unknown_rule_ids_are_forward_compatible_and_escalatable() -> None:

@@ -109,6 +109,82 @@ class _NoFetchallFactory:
         return _NoFetchallConnection(self._factory.connect())
 
 
+class _CountMismatchConnection(_NoFetchallConnection):
+    def __init__(self, connection, count):
+        super().__init__(connection)
+        self._count = count
+
+    def execute(self, sql, *args, **kwargs):
+        if "SELECT COUNT(*) FROM audit_events" in sql:
+            return _CountCursor(self._count)
+        return super().execute(sql, *args, **kwargs)
+
+
+class _CountCursor:
+    def __init__(self, count):
+        self._count = count
+
+    def fetchone(self):
+        return (self._count,)
+
+
+class _CountMismatchFactory:
+    def __init__(self, factory, count):
+        self._factory = factory
+        self.path = factory.path
+        self._count = count
+
+    def connect(self):
+        return _CountMismatchConnection(self._factory.connect(), self._count)
+
+
+class _CleanupFailureConnection(_NoFetchallConnection):
+    def rollback(self):
+        raise sqlite3.OperationalError("rollback failed")
+
+    def close(self):
+        raise sqlite3.OperationalError("close failed")
+
+
+class _ProcessCleanupConnection(_CleanupFailureConnection):
+    def close(self):
+        raise KeyboardInterrupt("close interrupted")
+
+
+class _CleanupFailureFactory:
+    def __init__(self, factory, *, primary=False):
+        self._factory = factory
+        self.path = factory.path
+        self._primary = primary
+
+    def connect(self):
+        connection = _CleanupFailureConnection(self._factory.connect())
+        if self._primary:
+            connection.execute = self._execute_primary
+        return connection
+
+    @staticmethod
+    def _execute_primary(_sql, *_args, **_kwargs):
+        raise sqlite3.OperationalError("primary failed")
+
+
+class _ProcessCleanupFactory(_CleanupFailureFactory):
+    def connect(self):
+        return _ProcessCleanupConnection(self._factory.connect())
+
+
+class _TraceFactory:
+    def __init__(self, factory):
+        self._factory = factory
+        self.path = factory.path
+        self.statements = []
+
+    def connect(self):
+        connection = self._factory.connect()
+        connection.set_trace_callback(self.statements.append)
+        return connection
+
+
 def test_verifier_streams_audit_cursor_without_fetchall(tmp_path):
     factory = _db(tmp_path)
     with closing(factory.connect()) as connection:
@@ -119,6 +195,97 @@ def test_verifier_streams_audit_cursor_without_fetchall(tmp_path):
         connection.commit()
     result = verify_audit_chain(_NoFetchallFactory(factory))
     assert result.valid is True and result.count == 2
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_verifier_rejects_count_mismatch_without_false_valid(tmp_path, count):
+    factory = _db(tmp_path)
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        SQLiteAuditWriter().append_in_transaction(connection, _event())
+        connection.commit()
+    result = verify_audit_chain(_CountMismatchFactory(factory, count))
+    assert result.valid is False
+    assert "count" in (result.reason or "")
+
+
+@pytest.mark.parametrize("primary", [False, True])
+def test_verifier_cleanup_failures_are_not_suppressed(tmp_path, primary):
+    factory = _db(tmp_path)
+    with pytest.raises(StoreUnavailable):
+        verify_audit_chain(_CleanupFailureFactory(factory, primary=primary))
+
+
+def test_verifier_does_not_hide_process_control_cleanup_failure(tmp_path):
+    factory = _db(tmp_path)
+    with pytest.raises(KeyboardInterrupt, match="close interrupted"):
+        verify_audit_chain(_ProcessCleanupFactory(factory))
+
+
+def test_writer_rejects_same_name_noop_trigger_before_using_cache(tmp_path):
+    factory = _db(tmp_path)
+    with closing(factory.connect()) as connection:
+        connection.execute("DROP TRIGGER audit_events_update_guard")
+        connection.execute(
+            """
+            CREATE TRIGGER audit_events_update_guard
+            BEFORE UPDATE ON audit_events
+            BEGIN SELECT 1; END
+            """
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            SQLiteAuditWriter().append_in_transaction(connection, _event())
+
+
+def test_writer_cache_verifies_one_new_row_per_sequential_append(tmp_path):
+    traced = _TraceFactory(_db(tmp_path))
+    writer = SQLiteAuditWriter()
+    for number in range(4):
+        with closing(traced.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            writer.append_in_transaction(connection, _event(number))
+            connection.commit()
+    full_scans = sum(
+        "FROM audit_events ORDER BY id" in statement and "WHERE" not in statement
+        for statement in traced.statements
+    )
+    suffix_scans = sum(
+        "FROM audit_events WHERE id >" in statement for statement in traced.statements
+    )
+    assert full_scans == 1
+    assert suffix_scans == 3
+
+
+def test_writer_cache_regression_after_outer_rollback_is_repaired(tmp_path):
+    factory = _db(tmp_path)
+    writer = SQLiteAuditWriter()
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        writer.append_in_transaction(connection, _event(1))
+        writer.append_in_transaction(connection, _event(2))
+        connection.rollback()
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        writer.append_in_transaction(connection, _event(3))
+        connection.commit()
+    assert verify_audit_chain(factory).valid is True
+
+
+def test_cold_writer_detects_mid_chain_corruption_before_append(tmp_path):
+    factory = _db(tmp_path)
+    writer = SQLiteAuditWriter()
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        writer.append_in_transaction(connection, _event(1))
+        writer.append_in_transaction(connection, _event(2))
+        connection.commit()
+        connection.execute("DROP TRIGGER audit_events_update_guard")
+        connection.execute("UPDATE audit_events SET actor = 'tampered' WHERE id = 1")
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(StoreUnavailable):
+            SQLiteAuditWriter().append_in_transaction(connection, _event(3))
 
 
 def test_persisted_fields_are_exact_and_expected_head_succeeds(tmp_path):
@@ -199,6 +366,17 @@ def test_writer_rejects_parameterized_invalid_dtos(tmp_path, field, value, match
         connection.execute("BEGIN IMMEDIATE")
         with pytest.raises(ValueError, match=match):
             SQLiteAuditWriter().append_in_transaction(connection, invalid)
+
+
+def test_writer_uses_utf8_byte_bounds_for_text_fields(tmp_path):
+    factory = _db(tmp_path)
+    with closing(factory.connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        SQLiteAuditWriter().append_in_transaction(connection, replace(_event(), actor="é" * 2048))
+        with pytest.raises(ValueError, match="too long"):
+            SQLiteAuditWriter().append_in_transaction(
+                connection, replace(_event(1), actor="é" * 2049)
+            )
 
 
 def test_writer_rejects_wrong_event_type_and_decision_type(tmp_path):
@@ -384,9 +562,9 @@ def test_verifier_detects_scalar_tamper_and_expected_tail(tmp_path):
 def test_verifier_reports_first_invalid_id_for_tamper(tmp_path, column, value, reason):
     factory = _db(tmp_path)
     with closing(factory.connect()) as connection:
-        connection.execute("DROP TRIGGER audit_events_update_guard")
         connection.execute("BEGIN IMMEDIATE")
         SQLiteAuditWriter().append_in_transaction(connection, _event())
+        connection.execute("DROP TRIGGER audit_events_update_guard")
         connection.execute(f"UPDATE audit_events SET {column} = ? WHERE id = 1", (value,))
         connection.commit()
     result = verify_audit_chain(factory)
@@ -398,9 +576,9 @@ def test_verifier_reports_first_invalid_id_for_tamper(tmp_path, column, value, r
 def test_recomputed_hash_cannot_hide_invalid_persisted_text(tmp_path):
     factory = _db(tmp_path)
     with closing(factory.connect()) as connection:
-        connection.execute("DROP TRIGGER audit_events_update_guard")
         connection.execute("BEGIN IMMEDIATE")
         SQLiteAuditWriter().append_in_transaction(connection, _event())
+        connection.execute("DROP TRIGGER audit_events_update_guard")
         row = connection.execute(
             """
             SELECT id, occurred_at, actor, action, sha256, previous_decision,
@@ -450,13 +628,13 @@ def test_schema_has_audit_indexes_and_middle_gap_is_detected(tmp_path):
             "audit_events_action_occurred_at_idx",
             "audit_events_event_hash_unique_idx",
         } <= indexes
-        connection.execute("DROP TRIGGER audit_events_delete_guard")
         connection.execute("BEGIN IMMEDIATE")
         writer = SQLiteAuditWriter()
         writer.append_in_transaction(connection, _event(1))
         writer.append_in_transaction(connection, _event(2, when=NOW + timedelta(seconds=1)))
         writer.append_in_transaction(connection, _event(3, when=NOW + timedelta(seconds=2)))
         connection.commit()
+        connection.execute("DROP TRIGGER audit_events_delete_guard")
         connection.execute("DELETE FROM audit_events WHERE id = 2")
     result = verify_audit_chain(factory)
     assert result.valid is False

@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import RLock
 from typing import Any
 
 from devpi_guardian.verdicts.errors import StoreUnavailable
@@ -18,13 +20,60 @@ _MAX_ACTOR = 4096
 _MAX_ACTION = 256
 _MAX_REASON = 4096
 _MAX_VERSION = 4096
+_MAX_CANONICAL_PAYLOAD_BYTES = 64 * 1024
+_AUDIT_COLUMNS = """
+    id, event_version, canonicalization_version, occurred_at,
+    actor, action, sha256, previous_decision, new_decision,
+    reason, policy_version, analyzer_version, previous_hash,
+    event_hash
+"""
+_REQUIRED_SCHEMA_OBJECTS = frozenset(
+    {
+        ("index", "audit_events_sha256_occurred_at_idx"),
+        ("index", "audit_events_action_occurred_at_idx"),
+        ("index", "audit_events_event_hash_unique_idx"),
+        ("trigger", "audit_events_history_insert_guard"),
+        ("trigger", "audit_events_chain_insert_guard"),
+        ("trigger", "audit_events_update_guard"),
+        ("trigger", "audit_events_delete_guard"),
+    }
+)
+_REQUIRED_SCHEMA_FRAGMENTS = {
+    "audit_events_history_insert_guard": (
+        "before insert on audit_events",
+        "new.id",
+        "new.event_hash",
+        "immutable audit event history",
+    ),
+    "audit_events_chain_insert_guard": (
+        "before insert on audit_events",
+        "new.id",
+        "new.previous_hash",
+        "max(id) + 1",
+        "invalid audit chain head",
+    ),
+    "audit_events_update_guard": (
+        "before update on audit_events",
+        "raise(abort, 'audit events are append-only')",
+    ),
+    "audit_events_delete_guard": (
+        "before delete on audit_events",
+        "raise(abort, 'audit events are append-only')",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedPrefix:
+    identity: str
+    schema: tuple[tuple[str, str, str], ...]
+    count: int
+    head: str
 
 
 def _text(value: object, field: str, maximum: int) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{field} must be a nonblank string")
-    if len(value) > maximum:
-        raise ValueError(f"{field} is too long")
     if any(
         ord(character) < 0x20
         or 0x7F <= ord(character) <= 0x9F
@@ -33,9 +82,11 @@ def _text(value: object, field: str, maximum: int) -> str:
     ):
         raise ValueError(f"{field} contains a control character")
     try:
-        value.encode("utf-8")
+        encoded = value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError(f"{field} is not valid UTF-8") from exc
+    if len(encoded) > maximum:
+        raise ValueError(f"{field} is too long")
     return value
 
 
@@ -108,8 +159,11 @@ def _canonical_payload(
 
 
 def _event_hash(previous_hash: str, event_id: int, values: dict[str, Any]) -> str:
+    payload = _canonical_payload(event_id, previous_hash, values)
+    if len(payload) > _MAX_CANONICAL_PAYLOAD_BYTES:
+        raise ValueError("canonical audit payload is too large")
     return hashlib.sha256(
-        bytes.fromhex(previous_hash) + b"\0" + _canonical_payload(event_id, previous_hash, values),
+        bytes.fromhex(previous_hash) + b"\0" + payload,
     ).hexdigest()
 
 
@@ -179,8 +233,169 @@ def _store_unavailable(connection_or_path: object, exc: BaseException) -> StoreU
     return StoreUnavailable(str(path))
 
 
+def _schema_contract(connection: sqlite3.Connection) -> tuple[tuple[str, str, str], ...]:
+    raw_columns = connection.execute("PRAGMA table_info(audit_events)").fetchall()
+    if any(type(row[1]) is not str or type(row[2]) is not str for row in raw_columns):
+        raise StoreUnavailable("audit database")
+    columns = tuple((row[1], row[2].upper(), row[3], row[5]) for row in raw_columns)
+    expected_columns = (
+        ("id", "INTEGER", 0, 1),
+        ("event_version", "INTEGER", 1, 0),
+        ("canonicalization_version", "INTEGER", 1, 0),
+        ("occurred_at", "TEXT", 1, 0),
+        ("actor", "TEXT", 1, 0),
+        ("action", "TEXT", 1, 0),
+        ("sha256", "TEXT", 1, 0),
+        ("previous_decision", "TEXT", 1, 0),
+        ("new_decision", "TEXT", 1, 0),
+        ("reason", "TEXT", 1, 0),
+        ("policy_version", "TEXT", 0, 0),
+        ("analyzer_version", "TEXT", 0, 0),
+        ("previous_hash", "TEXT", 1, 0),
+        ("event_hash", "TEXT", 1, 0),
+    )
+    if columns != expected_columns:
+        raise StoreUnavailable("audit database")
+    objects = tuple(
+        (row[0], row[1], row[2])
+        for row in connection.execute(
+            """
+            SELECT type, name, sql FROM sqlite_master
+            WHERE type IN ('index', 'trigger') AND name NOT GLOB 'sqlite_*'
+            ORDER BY type, name
+            """
+        ).fetchall()
+    )
+    present = {(kind, name) for kind, name, _sql in objects}
+    if not present >= _REQUIRED_SCHEMA_OBJECTS:
+        raise StoreUnavailable("audit database")
+    if any(type(sql) is not str or not sql for _kind, _name, sql in objects):
+        raise StoreUnavailable("audit database")
+    definitions = {name: re.sub(r"\s+", " ", sql).strip().lower() for _kind, name, sql in objects}
+    for name, fragments in _REQUIRED_SCHEMA_FRAGMENTS.items():
+        definition = definitions.get(name, "")
+        if not all(fragment in definition for fragment in fragments):
+            raise StoreUnavailable("audit database")
+    for name, fragment in {
+        "audit_events_sha256_occurred_at_idx": "on audit_events(sha256, occurred_at)",
+        "audit_events_action_occurred_at_idx": "on audit_events(action, occurred_at)",
+        "audit_events_event_hash_unique_idx": "create unique index",
+    }.items():
+        if fragment not in definitions.get(name, ""):
+            raise StoreUnavailable("audit database")
+    return objects
+
+
+def _database_identity(connection: sqlite3.Connection) -> str | None:
+    row = connection.execute("PRAGMA database_list").fetchone()
+    if row is None or len(row) < 3 or type(row[2]) is not str or not row[2]:
+        return None
+    return row[2]
+
+
+def _verify_rows(
+    rows: Any,
+    *,
+    start: int,
+    head: str,
+    expected_count: int,
+) -> tuple[int, str]:
+    position = start
+    for row in rows:
+        position += 1
+        if type(row[0]) is not int or row[0] != position:
+            raise StoreUnavailable("audit database")
+        existing = _validate_persisted_row(row)
+        previous_hash = existing["previous_hash"]
+        stored_hash = existing["event_hash"]
+        if previous_hash != head:
+            raise StoreUnavailable("audit database")
+        try:
+            expected_hash = _event_hash(previous_hash, existing["id"], existing)
+        except (TypeError, ValueError, UnicodeError, OverflowError):
+            raise StoreUnavailable("audit database") from None
+        if stored_hash != expected_hash:
+            raise StoreUnavailable("audit database")
+        head = stored_hash
+        if position > expected_count:
+            raise StoreUnavailable("audit database")
+    if position != expected_count:
+        raise StoreUnavailable("audit database")
+    return position, head
+
+
 class SQLiteAuditWriter:
     """Append validated, chained audit events using an existing transaction."""
+
+    def __init__(self) -> None:
+        self._cache: _VerifiedPrefix | None = None
+        self._cache_lock = RLock()
+
+    def _verified_prefix(self, connection: sqlite3.Connection) -> tuple[int, str]:
+        """Verify the visible prefix, caching only rows present before insertion.
+
+        The cache is instance-local and keyed by SQLite's stable database path plus
+        the immutable audit schema catalog. It is never advanced after this method
+        returns, so an outer transaction may roll back safely; a later count
+        regression forces a cold full scan.
+        """
+        with self._cache_lock:
+            schema = _schema_contract(connection)
+            identity = _database_identity(connection)
+            count_row = connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+            if (
+                count_row is None
+                or len(count_row) != 1
+                or type(count_row[0]) is not int
+                or count_row[0] < 0
+            ):
+                raise StoreUnavailable("audit database")
+            count = count_row[0]
+            cache = self._cache
+            usable = (
+                identity is not None
+                and cache is not None
+                and cache.identity == identity
+                and cache.schema == schema
+                and count >= cache.count
+            )
+            if usable and cache.count:
+                tail = connection.execute(
+                    f"SELECT {_AUDIT_COLUMNS} FROM audit_events WHERE id = ?",
+                    (cache.count,),
+                ).fetchone()
+                if tail is None:
+                    usable = False
+                else:
+                    persisted = _validate_persisted_row(tail)
+                    usable = (
+                        persisted["id"] == cache.count and persisted["event_hash"] == cache.head
+                    )
+            if usable:
+                if count > cache.count:
+                    rows = connection.execute(
+                        f"SELECT {_AUDIT_COLUMNS} FROM audit_events WHERE id > ? ORDER BY id",
+                        (cache.count,),
+                    )
+                    verified_count, head = _verify_rows(
+                        rows,
+                        start=cache.count,
+                        head=cache.head,
+                        expected_count=count,
+                    )
+                else:
+                    verified_count, head = cache.count, cache.head
+            else:
+                rows = connection.execute(f"SELECT {_AUDIT_COLUMNS} FROM audit_events ORDER BY id")
+                verified_count, head = _verify_rows(
+                    rows,
+                    start=0,
+                    head=ZERO_HASH,
+                    expected_count=count,
+                )
+            if identity is not None:
+                self._cache = _VerifiedPrefix(identity, schema, verified_count, head)
+            return verified_count, head
 
     def append_in_transaction(
         self,
@@ -195,33 +410,8 @@ class SQLiteAuditWriter:
         if not active_transaction:
             raise ValueError("an active transaction is required")
         try:
-            rows = connection.execute(
-                """
-                SELECT id, event_version, canonicalization_version, occurred_at,
-                       actor, action, sha256, previous_decision, new_decision,
-                       reason, policy_version, analyzer_version, previous_hash,
-                       event_hash
-                FROM audit_events ORDER BY id
-                """
-            )
-            head = ZERO_HASH
-            event_id = 1
-            for position, row in enumerate(rows, 1):
-                if type(row[0]) is not int or row[0] != position:
-                    raise StoreUnavailable("audit database")
-                existing = _validate_persisted_row(row)
-                previous_hash = existing["previous_hash"]
-                stored_hash = existing["event_hash"]
-                if previous_hash != head:
-                    raise StoreUnavailable("audit database")
-                try:
-                    expected_hash = _event_hash(previous_hash, existing["id"], existing)
-                except (TypeError, ValueError, UnicodeError, OverflowError):
-                    raise StoreUnavailable("audit database") from None
-                if stored_hash != expected_hash:
-                    raise StoreUnavailable("audit database")
-                head = stored_hash
-                event_id = position + 1
+            existing_count, head = self._verified_prefix(connection)
+            event_id = existing_count + 1
             previous_hash = head
             event_hash = _event_hash(previous_hash, event_id, values)
             connection.execute(

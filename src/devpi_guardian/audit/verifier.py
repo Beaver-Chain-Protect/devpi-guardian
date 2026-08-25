@@ -47,6 +47,8 @@ def verify_audit_chain(
         except (TypeError, ValueError):
             return _invalid(0, None, None, "invalid expected head")
     connection: sqlite3.Connection | None = None
+    result: AuditVerificationResult | None = None
+    primary: BaseException | None = None
     try:
         connection = factory.connect()
         connection.execute("BEGIN")
@@ -69,37 +71,87 @@ def verify_audit_chain(
             """
         )
         head: str | None = None
+        seen = 0
         for position, row in enumerate(rows, 1):
+            seen = position
+            if seen > count:
+                result = _invalid(count, head, position, "row count mismatch")
+                break
             event_id = row[0] if row and type(row[0]) is int else position
             if type(row[0]) is not int or row[0] != position:
-                return _invalid(count, head, position, "id gap or reorder")
+                result = _invalid(count, head, position, "id gap or reorder")
+                break
             try:
                 values = _validate_persisted_row(row)
             except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
-                return _invalid(count, head, event_id, str(exc))
+                result = _invalid(count, head, event_id, str(exc))
+                break
             previous_hash = values["previous_hash"]
             if previous_hash != (head or ZERO_HASH):
-                return _invalid(count, head, event_id, "previous hash mismatch")
+                result = _invalid(count, head, event_id, "previous hash mismatch")
+                break
             try:
                 computed = _event_hash(previous_hash, position, values)
             except (TypeError, ValueError, UnicodeError, OverflowError):
-                return _invalid(count, head, event_id, "event hash computation failed")
+                result = _invalid(count, head, event_id, "event hash computation failed")
+                break
             if values["event_hash"] != computed:
-                return _invalid(count, head, event_id, "event hash mismatch")
+                result = _invalid(count, head, event_id, "event hash mismatch")
+                break
             head = values["event_hash"]
-        if expected_head is not None and expected_head != head:
-            return _invalid(count, head, count + 1, "expected head mismatch")
-        return AuditVerificationResult(True, count, head, None, None)
-    except StoreUnavailable:
-        raise
-    except (sqlite3.Error, OSError, TypeError, ValueError, UnicodeError, OverflowError) as exc:
-        path = getattr(factory, "path", "audit database")
-        raise StoreUnavailable(str(path)) from exc
+        if result is None and seen != count:
+            result = _invalid(count, head, seen + 1, "row count mismatch")
+        if result is None and expected_head is not None and expected_head != head:
+            result = _invalid(count, head, count + 1, "expected head mismatch")
+        if result is None:
+            result = AuditVerificationResult(True, count, head, None, None)
+    except BaseException as exc:
+        primary = exc
     finally:
+        cleanup_errors: list[BaseException] = []
         if connection is not None:
             try:
                 if connection.in_transaction:
                     connection.rollback()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
                 connection.close()
-            except (sqlite3.Error, OSError):
-                pass
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            process_control = next(
+                (
+                    error
+                    for error in cleanup_errors
+                    if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit))
+                ),
+                None,
+            )
+            note_target = process_control or cleanup_errors[0]
+            for cleanup_error in cleanup_errors:
+                if cleanup_error is not note_target:
+                    note_target.add_note(
+                        "additional audit cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if primary is not None:
+                primary.add_note(
+                    f"audit cleanup failed: {type(note_target).__name__}: {note_target}"
+                )
+            elif process_control is not None:
+                primary = process_control
+            else:
+                primary = StoreUnavailable(str(getattr(factory, "path", "audit database")))
+                primary.__cause__ = cleanup_errors[0]
+    if primary is not None:
+        if isinstance(primary, StoreUnavailable):
+            raise primary
+        if isinstance(
+            primary, (sqlite3.Error, OSError, TypeError, ValueError, UnicodeError, OverflowError)
+        ):
+            path = getattr(factory, "path", "audit database")
+            raise StoreUnavailable(str(path)) from primary
+        raise primary
+    assert result is not None
+    return result
