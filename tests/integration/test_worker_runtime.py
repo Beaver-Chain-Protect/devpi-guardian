@@ -189,6 +189,10 @@ def test_cached_hashless_mirror_plus_e_is_gated_until_effective_allow(
             503,
         }
 
+    initial_simple = running_mirror_devpi.request("/root/guardian/+simple/mirror-guardian/")
+    assert initial_simple.status == 200
+    assert artifact.filename not in initial_simple.body.decode("utf-8", errors="replace")
+
     upstream_url = urllib.parse.urljoin(
         local_upstream.base_url,
         f"packages/{artifact.filename}",
@@ -198,21 +202,8 @@ def test_cached_hashless_mirror_plus_e_is_gated_until_effective_allow(
         upstream_url=upstream_url,
         sha256=artifact.sha256,
     )
-
-    link_href = (
-        urllib.parse.urljoin(running_mirror_devpi.base_url, artifact.direct_path)
-        + f"#sha256={artifact.sha256}"
-    )
-    queue = FileDiscoverySink(running_mirror_devpi.guardian_db.parent / "discovery")
-    queue.discover(
-        DiscoveryCandidate(
-            "root/guardian",
-            artifact.project,
-            artifact.filename,
-            artifact.sha256,
-            link_href,
-        )
-    )
+    simple = running_mirror_devpi.request("/root/guardian/+simple/mirror-guardian/")
+    assert simple.status == 200
     reader = SQLiteVerdictReader(ConnectionFactory(running_mirror_devpi.guardian_db))
     assert _wait_until(
         lambda: _cas_path(running_mirror_devpi, artifact.sha256).is_file(),

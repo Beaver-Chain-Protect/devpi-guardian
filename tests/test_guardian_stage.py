@@ -10,6 +10,7 @@ from devpi_guardian.verdicts.models import EnforcementDecision
 from devpi_server.config import get_pluginmanager
 from devpi_server.model import get_stage_customizer_class
 from devpi_server.model import SimplelinkMeta
+from devpi_server.normalized import NormalizedName
 from pyramid.httpexceptions import HTTPServiceUnavailable
 from types import SimpleNamespace
 import pytest
@@ -68,13 +69,18 @@ class UnusableProject:
         raise AssertionError("project must not participate in F2 policy")
 
 
-def make_stage(reader=None, *, initialized=True, sink=None):
+def make_stage(reader=None, *, initialized=True, sink=None, filestore=None, config_args=None):
     plugin_manager = get_pluginmanager()
-    xom = SimpleNamespace(config=SimpleNamespace(hook=plugin_manager.hook))
+    config = SimpleNamespace(hook=plugin_manager.hook)
+    if config_args is not None:
+        config.args = config_args
+    xom = SimpleNamespace(config=config)
     if initialized:
         setattr(xom, _READER_ATTRIBUTE, reader)
     if sink is not None:
         xom._devpi_guardian_discovery_sink = sink
+    if filestore is not None:
+        xom.filestore = filestore
     customizer_class = get_stage_customizer_class(xom, "guardian")
     return customizer_class(SimpleNamespace(xom=xom))
 
@@ -235,6 +241,152 @@ def test_filter_skips_reader_when_no_link_has_a_valid_sha256() -> None:
 
     assert decisions == [False, False, False, False]
     assert reader.calls == []
+
+
+class CachedPlusEKey:
+    def __init__(self, entry, *, exists=True):
+        self.entry = entry
+        self._exists = exists
+
+    def exists(self):
+        return self._exists
+
+
+class CachedPlusEEntry:
+    user = "root"
+    index = "pypi"
+    project = "demo"
+    version = "1.0"
+
+    def __init__(self, relpath, sha256, *, cached=True, hashes=None, project="demo", version="1.0"):
+        self.relpath = relpath
+        self.project = project
+        self.version = version
+        self._cached = cached
+        self.hashes = {"sha256": sha256} if hashes is None else hashes
+
+    def file_exists(self):
+        return self._cached
+
+    @property
+    def basename(self):
+        return self.relpath.rsplit("/", 1)[-1]
+
+
+class CachedPlusEFileStore:
+    def __init__(self, entry, *, key_exists=True):
+        self.entry = entry
+        self.key = CachedPlusEKey(entry, exists=key_exists)
+        self.calls = []
+
+    def get_key_from_relpath(self, relpath):
+        self.calls.append(("get_key_from_relpath", relpath))
+        return self.key
+
+    def get_file_entry_from_key(self, key):
+        self.calls.append(("get_file_entry_from_key", key))
+        return key.entry
+
+
+def cached_plus_e_stage(*, entry, sink, reader):
+    return make_stage(
+        reader,
+        sink=sink,
+        filestore=CachedPlusEFileStore(entry),
+        config_args=SimpleNamespace(guardian_base_url="https://devpi.invalid"),
+    )
+
+
+def test_filter_hydrates_cached_plus_e_sha256_and_enqueues_canonical_candidate() -> None:
+    sha256 = "a" * 64
+    relpath = "root/pypi/+e/abc/demo-1.0-py3-none-any.whl"
+    entry = CachedPlusEEntry(relpath, sha256)
+    link = SimplelinkMeta(("demo-1.0-py3-none-any.whl", "/" + relpath, "", ""))
+    reader = RecordingReader(
+        {
+            sha256: make_decision(
+                sha256,
+                allowed=False,
+                decision=Decision.DENY,
+                source=DecisionSource.MISSING,
+                state=ArtifactState.MISSING,
+            )
+        }
+    )
+    sink = RecordingSink()
+
+    assert run_filter(
+        cached_plus_e_stage(entry=entry, sink=sink, reader=reader), "demo", [link]
+    ) == [False]
+    assert reader.calls == [(sha256,)]
+    [(candidate,)] = sink.batches
+    assert candidate.sha256 == sha256
+    assert candidate.link_href == f"https://devpi.invalid:443/{relpath}#sha256={sha256}"
+    assert link.hashes.get("sha256") is None
+
+
+def test_filter_accepts_devpi_normalized_project_names_for_discovery() -> None:
+    sha256 = "b" * 64
+    link = make_link("demo-1.0.whl", f"#sha256={sha256}")
+    reader = RecordingReader(
+        {
+            sha256: make_decision(
+                sha256,
+                allowed=False,
+                decision=Decision.DENY,
+                source=DecisionSource.MISSING,
+                state=ArtifactState.MISSING,
+            )
+        }
+    )
+    sink = RecordingSink()
+
+    assert run_filter(make_stage(reader, sink=sink), NormalizedName("demo"), [link]) == [False]
+    [(candidate,)] = sink.batches
+    assert candidate.project == "demo"
+
+
+@pytest.mark.parametrize(
+    ("entry", "href"),
+    [
+        (
+            CachedPlusEEntry("root/pypi/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64, cached=False),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl",
+        ),
+        (
+            CachedPlusEEntry("root/pypi/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64, hashes={}),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl",
+        ),
+        (
+            CachedPlusEEntry("root/other/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl",
+        ),
+        (
+            CachedPlusEEntry(
+                "root/pypi/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64, project="other"
+            ),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl",
+        ),
+        (
+            CachedPlusEEntry("root/pypi/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64, version="2.0"),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl",
+        ),
+        (
+            CachedPlusEEntry("root/pypi/+e/abc/demo-1.0-py3-none-any.whl", "a" * 64),
+            "/root/pypi/+e/abc/demo-1.0-py3-none-any.whl?token=secret",
+        ),
+    ],
+)
+def test_filter_fails_closed_for_unsafe_cached_plus_e_metadata(entry, href) -> None:
+    link = SimplelinkMeta(("demo-1.0-py3-none-any.whl", href, "", ""))
+    reader = RecordingReader(error=AssertionError("reader must not be called"))
+    sink = RecordingSink()
+
+    assert run_filter(
+        cached_plus_e_stage(entry=entry, sink=sink, reader=reader), "demo", [link]
+    ) == [False]
+    assert reader.calls == []
+    assert sink.batches == []
 
 
 def test_filter_enqueues_only_initialized_missing_decisions() -> None:

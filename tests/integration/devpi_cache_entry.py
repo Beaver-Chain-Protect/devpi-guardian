@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from devpi_common.metadata import normalize_name, splitbasename
+from devpi_common.url import URL
 from devpi_server.config import get_pluginmanager, parseoptions
 from devpi_server.filestore import Digests
 from devpi_server.main import xom_from_config
@@ -34,7 +35,7 @@ def _materialize(
     if not relpath.startswith("root/pypi/+e/"):
         raise ValueError("cache entry route must be root/pypi/+e")
     filename = relpath.rsplit("/", 1)[-1]
-    project, version, _extension = splitbasename(filename)
+    project, _version, _extension = splitbasename(filename)
     project = normalize_name(project)
     content = _fetch(upstream_url)
     actual_sha256 = hashlib.sha256(content).hexdigest()
@@ -49,13 +50,16 @@ def _materialize(
     xom = xom_from_config(config)
     try:
         with xom.keyfs.write_transaction(allow_restart=True):
-            key = xom.filestore.get_key_from_relpath(relpath)
-            if key is None:
-                raise RuntimeError("devpi did not recognize the mirror cache route")
-            entry = xom.filestore.get_file_entry_from_key(key)
-            entry.url = upstream_url
-            entry.project = project
-            entry.version = version
+            if xom.model.getstage("root", "pypi") is None:
+                raise RuntimeError("devpi root/pypi stage is unavailable")
+            entry = xom.filestore.maplink(
+                URL(upstream_url),
+                user="root",
+                index="pypi",
+                project=project,
+            )
+            if entry.relpath != relpath:
+                raise RuntimeError("devpi mirror cache route differs from the requested +e route")
             entry.file_set_content(
                 BytesIO(content),
                 hashes=Digests({"sha256": expected_sha256}),

@@ -6,12 +6,15 @@ import math
 import os
 import socket
 import stat
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
+from devpi_common.metadata import normalize_name, splitbasename
 from devpi_server.main import Fatal
 from pluggy import HookimplMarker
 from pyramid.httpexceptions import HTTPServiceUnavailable
@@ -32,7 +35,7 @@ from .verdicts.errors import InvalidSha256, StoreUnavailable
 from .verdicts.models import DecisionSource, validate_sha256
 from .verdicts.reader import SQLiteVerdictReader
 from .verdicts.store import SQLiteArtifactStore
-from .worker.devpi_paths import DevpiBase, DevpiRouteError
+from .worker.devpi_paths import DevpiBase, DevpiRouteError, validate_artifact_relpath
 from .worker.discovery import (
     DiscoveryCandidate,
     DiscoveryUnavailable,
@@ -59,13 +62,21 @@ class GuardianStage:
     def get_simple_links_filter_iter(self, project, links):
         link_snapshot = []
         link_sha256s = []
+        link_hrefs = []
+        project_name = str(project) if isinstance(project, str) else None
         for link in links:
             link_snapshot.append(link)
             try:
                 sha256 = validate_sha256(link.hashes.get("sha256"))
             except InvalidSha256:
                 sha256 = None
+            hydrated_href = None
+            if sha256 is None:
+                hydrated = _hydrate_cached_plus_e_link(self.stage.xom, link, project=project_name)
+                if hydrated is not None:
+                    sha256, hydrated_href = hydrated
             link_sha256s.append(sha256)
+            link_hrefs.append(hydrated_href)
         requested = [sha256 for sha256 in link_sha256s if sha256 is not None]
         if not requested:
             return iter(False for _ in link_sha256s)
@@ -76,8 +87,9 @@ class GuardianStage:
             unavailable = HTTPServiceUnavailable(headers={"Retry-After": "5"})
             raise unavailable from exc
         missing = []
-        project_name = project if type(project) is str else None
-        for link, sha256 in zip(link_snapshot, link_sha256s, strict=True):
+        for link, sha256, hydrated_href in zip(
+            link_snapshot, link_sha256s, link_hrefs, strict=True
+        ):
             decision = decisions.get(sha256) if sha256 is not None else None
             if (
                 project_name is None
@@ -90,7 +102,7 @@ class GuardianStage:
                     project=project_name,
                     filename=str(link.basename),
                     sha256=sha256,
-                    link_href=str(link.href),
+                    link_href=hydrated_href or str(link.href),
                 )
             )
         if missing:
@@ -105,6 +117,74 @@ class GuardianStage:
             else False
             for sha256 in link_sha256s
         )
+
+
+def _hydrate_cached_plus_e_link(xom, link, *, project: str | None) -> tuple[str, str] | None:
+    """Return authoritative identity for a cached devpi ``+e`` link.
+
+    A hashless ``+e`` link is useful only when the corresponding devpi
+    FileEntry is already materialized.  The URL is used to select a key, but
+    every identity field is cross-checked against that entry before a
+    discovery candidate is created.  In particular, this helper never reads
+    an upstream URL or the public Guardian route.
+    """
+    try:
+        href = link.href
+        if not isinstance(href, str):
+            return None
+        filename = link.basename
+        if type(filename) is not str or project is None:
+            return None
+        try:
+            parsed_project, parsed_version, _ = splitbasename(filename)
+            parsed_project = normalize_name(parsed_project)
+            requested_project = normalize_name(project)
+        except (TypeError, ValueError):
+            return None
+        if parsed_project != requested_project:
+            return None
+        raw = urlsplit(href)
+        if raw.query or raw.fragment:
+            return None
+        base = DevpiBase.parse(_worker_base_url(xom.config))
+        relpath, _ = base.resolve_link(href)
+        parts = validate_artifact_relpath(relpath, filename=filename)
+        if parts[2] != "+e":
+            return None
+
+        filestore = xom.filestore
+        key = filestore.get_key_from_relpath(relpath)
+        if key is None or key.exists() is not True:
+            return None
+        entry = filestore.get_file_entry_from_key(key)
+        if entry is None:
+            return None
+        if (
+            type(entry.relpath) is not str
+            or entry.relpath != relpath
+            or type(entry.user) is not str
+            or entry.user != parts[0]
+            or type(entry.index) is not str
+            or entry.index != parts[1]
+            or type(entry.basename) is not str
+            or entry.basename != filename
+            or not isinstance(entry.project, str)
+            or normalize_name(entry.project) != parsed_project
+            or type(entry.version) is not str
+            or entry.version != parsed_version
+            or entry.file_exists() is not True
+        ):
+            return None
+        hashes = entry.hashes
+        if not isinstance(hashes, Mapping):
+            return None
+        advertised = hashes.get("sha256")
+        if type(advertised) is not str:
+            return None
+        sha256 = validate_sha256(advertised)
+        return sha256, f"{base.origin_for(entry.relpath)}#sha256={sha256}"
+    except (AttributeError, InvalidSha256, KeyError, TypeError, ValueError, OSError):
+        return None
 
 
 def get_verdict_reader(xom) -> SQLiteVerdictReader:

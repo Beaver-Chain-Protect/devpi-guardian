@@ -711,6 +711,13 @@ def running_mirror_devpi(
             f"mirror_url={local_upstream.base_url}/simple/",
             "mirror_cache_expiry=0",
         )
+        client.api(
+            "index",
+            "-c",
+            "root/guardian",
+            "type=guardian",
+            "bases=root/pypi",
+        )
         simple_path = f"/root/pypi/+simple/{local_upstream.artifact.project}/"
         simple = client.request(simple_path)
         if simple.status != 200:
