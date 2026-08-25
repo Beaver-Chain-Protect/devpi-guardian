@@ -379,6 +379,38 @@ def test_connection_rejects_path_replacement_during_open(tmp_path, monkeypatch) 
         ConnectionFactory(path).connect()
 
 
+def test_two_live_connections_keep_rotation_rejected_after_one_closes(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    first = factory.connect()
+    second = factory.connect()
+    replacement = tmp_path / "replacement.db"
+    with closing(sqlite3.connect(replacement)) as connection:
+        connection.execute("CREATE TABLE marker(value INTEGER)")
+        connection.commit()
+    first.close()
+    os.replace(replacement, factory.path)
+    try:
+        with pytest.raises(StoreUnavailable):
+            factory.connect()
+    finally:
+        second.close()
+
+
+def test_concurrent_connection_lifecycle_does_not_leave_stale_registry(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+
+    def open_and_close(_number: int) -> None:
+        connection = factory.connect()
+        connection.close()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(open_and_close, range(32)))
+    connection = factory.connect()
+    connection.close()
+
+
 @pytest.mark.parametrize(
     "recursive_result",
     [None, (0,), (True,)],

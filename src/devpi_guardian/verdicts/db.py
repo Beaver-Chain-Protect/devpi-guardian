@@ -33,7 +33,7 @@ _Catalog = tuple[tuple[object, ...], ...]
 # An open trusted connection pins the observed main inode.  A path rotation
 # while it is live is rejected before SQLite can combine a new main file with
 # the old connection's WAL generation.
-_ACTIVE_CONNECTIONS: dict[str, set[tuple[int, int]]] = {}
+_ACTIVE_CONNECTIONS: dict[str, dict[tuple[int, int], int]] = {}
 _ACTIVE_CONNECTIONS_LOCK = RLock()
 
 
@@ -64,6 +64,26 @@ def trusted_connection_identity(
     return identity
 
 
+def trusted_connection_generation_current(connection: sqlite3.Connection) -> bool:
+    """Return whether a trusted file connection still names the live path."""
+
+    identity = trusted_connection_identity(connection)
+    if (
+        identity is None
+        or len(identity) != 4
+        or identity[0] != "file"
+        or type(identity[1]) is not str
+        or type(identity[2]) is not int
+        or type(identity[3]) is not int
+    ):
+        return False
+    try:
+        current = os.stat(identity[1])
+    except (OSError, ValueError):
+        return False
+    return (current.st_dev, current.st_ino) == (identity[2], identity[3])
+
+
 def _open_identity_sentinel(path: str) -> tuple[int, os.stat_result]:
     try:
         descriptor = os.open(path, os.O_RDONLY)
@@ -72,7 +92,7 @@ def _open_identity_sentinel(path: str) -> tuple[int, os.stat_result]:
     before = os.fstat(descriptor)
     identity = (before.st_dev, before.st_ino)
     with _ACTIVE_CONNECTIONS_LOCK:
-        active = _ACTIVE_CONNECTIONS.get(path, set())
+        active = _ACTIVE_CONNECTIONS.get(path, {})
         if active and identity not in active:
             os.close(descriptor)
             raise OSError("database main file changed while a connection was open")
@@ -83,7 +103,8 @@ def _register_connection(connection: _TrustedConnection, identity: tuple[object,
     path = identity[1]
     inode = (identity[2], identity[3])
     with _ACTIVE_CONNECTIONS_LOCK:
-        _ACTIVE_CONNECTIONS.setdefault(path, set()).add(inode)
+        generations = _ACTIVE_CONNECTIONS.setdefault(path, {})
+        generations[inode] = generations.get(inode, 0) + 1
     connection._devpi_guardian_registered = True
 
 
@@ -94,7 +115,13 @@ def _unregister_connection(identity: tuple[object, ...]) -> None:
         active = _ACTIVE_CONNECTIONS.get(path)
         if active is None:
             return
-        active.discard(inode)
+        count = active.get(inode)
+        if count is None:
+            return
+        if count > 1:
+            active[inode] = count - 1
+        else:
+            active.pop(inode)
         if not active:
             _ACTIVE_CONNECTIONS.pop(path, None)
 
@@ -120,7 +147,9 @@ class ConnectionFactory:
         ):
             raise ValueError("invalid busy_timeout_ms")
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        if type(check_same_thread) is not bool:
+            raise ValueError("check_same_thread must be a bool")
         connection: sqlite3.Connection | None = None
         descriptor: int | None = None
         try:
@@ -136,6 +165,7 @@ class ConnectionFactory:
                 database_path,
                 isolation_level=None,
                 timeout=self.busy_timeout_ms / 1000,
+                check_same_thread=check_same_thread,
                 factory=_TrustedConnection,
             )
             connection.row_factory = sqlite3.Row

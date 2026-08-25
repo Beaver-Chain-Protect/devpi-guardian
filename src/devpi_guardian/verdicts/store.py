@@ -7,10 +7,13 @@ import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from threading import RLock
 
 from devpi_common.metadata import normalize_name
 
-from .db import ConnectionFactory
+from devpi_guardian.audit.writer import SQLiteAuditWriter
+
+from .db import ConnectionFactory, trusted_connection_generation_current
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
 from .invariants import (
@@ -297,9 +300,44 @@ class SQLiteArtifactStore:
         self.connection_factory = factory
         self._audit_writer = audit_writer
         self._now = now if now is not None else lambda: datetime.now(UTC)
+        self._stable_write_connection: sqlite3.Connection | None = None
+        self._stable_write_lock = RLock()
+        self._stable_write_closed = False
+        self._stable_write_active = False
+
+    def _uses_stable_connection(self) -> bool:
+        # Only the production pair has an authenticated connection-generation
+        # invariant.  Subclasses and custom factories must retain the old
+        # one-operation-per-connection behavior.
+        return (
+            type(self._audit_writer) is SQLiteAuditWriter
+            and type(self.connection_factory) is ConnectionFactory
+        )
+
+    def close(self) -> None:
+        """Close the store-owned write connection; safe to call repeatedly."""
+
+        if not self._uses_stable_connection():
+            return
+        with self._stable_write_lock:
+            if self._stable_write_closed:
+                return
+            self._stable_write_closed = True
+            connection = self._stable_write_connection
+            self._stable_write_connection = None
+            if connection is None:
+                return
+            try:
+                connection.close()
+            except (OSError, sqlite3.Error) as exc:
+                raise StoreUnavailable(str(self.connection_factory.path)) from exc
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
+        if self._uses_stable_connection():
+            with self._stable_write_lock, self._stable_write() as connection:
+                yield connection
+            return
         connection: sqlite3.Connection | None = None
         primary: BaseException | None = None
         committed = False
@@ -330,6 +368,68 @@ class SQLiteArtifactStore:
             if isinstance(primary, sqlite3.Error):
                 path = str(self.connection_factory.path)
                 raise StoreUnavailable(path) from primary
+            raise primary.with_traceback(primary.__traceback__)
+
+    @contextmanager
+    def _stable_write(self) -> Iterator[sqlite3.Connection]:
+        if self._stable_write_closed:
+            raise StoreUnavailable(str(self.connection_factory.path))
+        if self._stable_write_active:
+            raise StoreUnavailable(str(self.connection_factory.path))
+        self._stable_write_active = True
+        connection = self._stable_write_connection
+        primary: BaseException | None = None
+        cleanup_errors: list[BaseException] = []
+        committed = False
+        try:
+            if connection is None:
+                connection = self.connection_factory.connect(check_same_thread=False)
+                self._stable_write_connection = connection
+            if not trusted_connection_generation_current(connection):
+                raise StoreUnavailable(str(self.connection_factory.path))
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+            committed = True
+        except BaseException as exc:
+            primary = exc
+            if connection is not None:
+                try:
+                    if connection.in_transaction:
+                        connection.rollback()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                if self._stable_write_connection is connection:
+                    self._stable_write_connection = None
+        finally:
+            self._stable_write_active = False
+
+        process_control = next(
+            (
+                error
+                for error in cleanup_errors
+                if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit))
+            ),
+            None,
+        )
+        if process_control is not None:
+            if primary is not None:
+                process_control.add_note(f"primary error: {primary!r}")
+            primary = process_control
+        elif primary is not None:
+            for error in cleanup_errors:
+                primary.add_note(f"cleanup error: {error!r}")
+        elif cleanup_errors:
+            primary = cleanup_errors[0]
+
+        if primary is not None and not committed:
+            if isinstance(primary, sqlite3.Error):
+                raise StoreUnavailable(str(self.connection_factory.path)) from primary
             raise primary.with_traceback(primary.__traceback__)
 
     def _audit(
