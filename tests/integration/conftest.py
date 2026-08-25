@@ -238,6 +238,51 @@ class RunningDevpi:
         self.api("login", "root", "--password=")
         self.api("use", "root/dev")
 
+    def materialize_cached_mirror_entry(
+        self,
+        direct_path: str,
+        *,
+        upstream_url: str,
+        sha256: str,
+    ) -> None:
+        """Commit a real hashless mirror entry through devpi's KeyFS cache API."""
+        server = self._server
+        log_dir = self._log_dir
+        if server is None or log_dir is None:
+            raise RuntimeError("devpi-server lifecycle is unavailable")
+        _terminate(server)
+        self._server = None
+        try:
+            helper_environment = _loopback_environment()
+            helper_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            _run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.integration.devpi_cache_entry",
+                    str(self.server_dir),
+                    direct_path,
+                    upstream_url,
+                    sha256,
+                ],
+                cwd=self.server_dir.parent,
+                env=helper_environment,
+            )
+        finally:
+            restarted = _start_server(
+                self.server_dir,
+                self.guardian_db,
+                log_dir,
+                offline=self._offline,
+                preferred_port=server.port,
+                log_label="cache-entry-restart",
+            )
+            self._server = restarted
+            self.base_url = restarted.base_url
+            self.api("use", restarted.base_url)
+            self.api("login", "root", "--password=")
+            self.api("use", "root/pypi")
+
     def close(self) -> None:
         """Stop the current process and verify that its port is released."""
         if self._server is None:

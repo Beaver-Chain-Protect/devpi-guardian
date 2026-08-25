@@ -26,8 +26,10 @@ boundaries. Approval, block, revoke, rescan, baseline, and policy actions retain
 verdict/evidence/override/audit history. Audit-chain verification is included in health and
 startup fails closed if the chain is invalid.
 
-The API and CLI never return quarantine bytes, local filesystem paths, credentials, origin
-URLs, or worker bypass tokens. Errors are bounded and sanitized; an unavailable provider
-returns the documented service-unavailable response rather than exposing a traceback. Public
+The API and CLI never return quarantine bytes, local filesystem paths, credentials, query
+strings, fragments, or worker bypass tokens. Sanitized canonical origin metadata may be
+returned for release mappings; it contains no credentials, query, fragment, or local path.
+Errors are bounded and sanitized; an unavailable provider returns the documented
+service-unavailable response rather than exposing a traceback. Public
 devpi ``+f``/``+e`` downloads remain governed by the shared ``VerdictReader`` and only an
 effective ``ALLOW`` can reach the release-file handler.

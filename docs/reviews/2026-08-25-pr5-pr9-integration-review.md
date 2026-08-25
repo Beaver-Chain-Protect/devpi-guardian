@@ -23,21 +23,28 @@ inventory/backfill process is delivered. The worker quarantine is a dedicated ab
 
 ## Task 8 evidence recorded before final review
 
-The new real-devpi integration proof was first run RED. The initial mirror assertion timed
-out because a hashless `+e` mirror link cannot enter the SHA-256 discovery queue; this was
-observed before fixture/runtime edits. The final focused run then passed:
+The real-devpi integration proof was first run RED. The initial assertion failed because the
+fixture had no cache-entry materialization operation; this was observed before the fixture
+helper was added. Subsequent RED runs exposed the subprocess module path and then the expected
+devpi project metadata mismatch; both were corrected by wiring the repository path into the
+helper environment and using devpi's normalized project name. The focused run then passed:
 
 ```text
 uv run pytest tests/integration/test_worker_runtime.py -q -m integration
-2 passed, 4 warnings
+3 passed, 4 warnings
 ```
 
-The passing proof observes private upload CAS publication, exact CAS bytes and path,
-terminal Artifact state, protected `+f` and `.metadata` GET/HEAD, and release only after a
-manual effective `ALLOW`. It also calls the real hashless mirror `+e` route before worker
-discovery, then enqueues a validated mirror candidate through the durable discovery sink and
-observes the production internal stage client fetch the upstream artifact bytes. The public
-mirror route is not used as the worker source.
+The passing proofs observe private upload CAS publication, exact CAS bytes and path, terminal
+Artifact state, protected `+f` and `.metadata` GET/HEAD, and release only after a manual
+effective `ALLOW`. The new `+e` proof first blocks GET/HEAD on the real hashless mirror route,
+stops the already-activated server, fetches the fixture's upstream bytes, and commits them
+through devpi's `MutableFileEntry.file_set_content(..., hashes=...)` KeyFS cache transaction.
+After restart, the durable discovery sink consumes a canonical SHA-bearing link for that same
+`+e` relpath; terminal verdict remains blocked until effective ALLOW, after which real GET/HEAD
+reach devpi's handler. This is operationally valid because it reproduces devpi's official
+post-fetch cache commit after activation, without rewriting route strings or weakening identity
+checks. The existing hashed mirror proof remains and observes the production internal stage
+client fetch upstream bytes; the public Guardian route is not used as the worker source.
 
 The complete acceptance matrix, final implementation head, reviewer identities, reviewer
 results, and resolved finding disposition must be filled in by the final controller after

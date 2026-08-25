@@ -173,3 +173,84 @@ def test_mirror_bytes_use_internal_stage_client_not_guardian_public_url(
     assert any(worker.filename in path for path in new_requests)
     assert all("/root/pypi/+e/" not in path for path in new_requests)
     assert running_mirror_devpi.request(artifact.direct_path).status in {404, 503}
+
+
+def test_cached_hashless_mirror_plus_e_is_gated_until_effective_allow(
+    running_mirror_devpi,
+    local_upstream,
+) -> None:
+    artifact = running_mirror_devpi.mirror_artifact
+    assert artifact is not None
+    assert artifact.direct_path.startswith("/root/pypi/+e/")
+
+    for method in ("GET", "HEAD"):
+        assert running_mirror_devpi.request(artifact.direct_path, method=method).status in {
+            404,
+            503,
+        }
+
+    upstream_url = urllib.parse.urljoin(
+        local_upstream.base_url,
+        f"packages/{artifact.filename}",
+    )
+    running_mirror_devpi.materialize_cached_mirror_entry(
+        artifact.direct_path,
+        upstream_url=upstream_url,
+        sha256=artifact.sha256,
+    )
+
+    link_href = (
+        urllib.parse.urljoin(running_mirror_devpi.base_url, artifact.direct_path)
+        + f"#sha256={artifact.sha256}"
+    )
+    queue = FileDiscoverySink(running_mirror_devpi.guardian_db.parent / "discovery")
+    queue.discover(
+        DiscoveryCandidate(
+            "root/guardian",
+            artifact.project,
+            artifact.filename,
+            artifact.sha256,
+            link_href,
+        )
+    )
+    reader = SQLiteVerdictReader(ConnectionFactory(running_mirror_devpi.guardian_db))
+    assert _wait_until(
+        lambda: _cas_path(running_mirror_devpi, artifact.sha256).is_file(),
+        description="cached hashless mirror CAS object",
+    )
+    assert _wait_until(
+        lambda: _terminal(reader, artifact.sha256),
+        description="cached hashless mirror terminal verdict",
+    )
+    assert _cas_path(running_mirror_devpi, artifact.sha256).read_bytes() == artifact.content
+    terminal_state = reader.get_artifact_details(artifact.sha256).summary.state
+    assert terminal_state in {
+        ArtifactState.ALLOW,
+        ArtifactState.REVIEW,
+        ArtifactState.DENY,
+        ArtifactState.ERROR,
+    }
+
+    for method in ("GET", "HEAD"):
+        assert running_mirror_devpi.request(artifact.direct_path, method=method).status == 404
+
+    store = SQLiteArtifactStore(
+        ConnectionFactory(running_mirror_devpi.guardian_db), RecordingAuditWriter()
+    )
+    store.set_manual_override(
+        ManualOverrideInput(
+            artifact.sha256,
+            Decision.ALLOW,
+            "integration-admin",
+            "allow cached hashless mirror artifact",
+            datetime.now(UTC),
+        )
+    )
+    effective = reader.get_effective_decision(artifact.sha256)
+    assert effective.allowed is True
+    assert effective.effective_decision is Decision.ALLOW
+    for method in ("GET", "HEAD"):
+        response = running_mirror_devpi.request(artifact.direct_path, method=method)
+        assert response.status == 200
+        if method == "GET":
+            assert response.body == artifact.content

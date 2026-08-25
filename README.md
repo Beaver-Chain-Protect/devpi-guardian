@@ -38,7 +38,7 @@ readiness; do not serve unverified bytes to make rollback easier.
 
 ## F5 quarantine
 
-F5 reads unapproved Artifact bytes only from `GUARDIAN_QUARANTINE_DIR`, an absolute
+F5 reads unapproved Artifact bytes only from the `--guardian-quarantine-root` directory, an absolute
 dedicated permission-restricted path outside public devpi storage/routes. Deployment
 must not expose it through HTTP. The content-addressed layout is exactly
 `objects/sha256/<first-2>/<next-2>/<sha256>`; SQLite, filenames, projects, versions,
@@ -276,45 +276,20 @@ Thus only current effective `ALLOW` releases appear, including automatic ALLOW
 results and valid manual ALLOW overrides, with manual DENY, expiry, and automated
 fallback using the same precedence as F2/F3.
 
-`origin_url` is an absolute URL, not a local filesystem path. The existing F4
-sanitizer removes userinfo, query, and fragment, but does not constrain the
-stored scheme. For F6 integration, F5 MUST record the canonical devpi HTTP(S)
-`+f`/`+e` artifact URL. F6 MUST issue HTTP(S) through canonical devpi `+f`/`+e`
-and Guardian enforcement; never use `origin_url` as a trust bypass or local open.
-F4 does not fetch the URL or independently rehash its contents.
+`origin_url` is sanitized canonical origin metadata. Admin responses may return that
+metadata, but it never contains credentials, query strings, fragments, or local
+filesystem paths. F5 records canonical devpi HTTP(S) `+f`/`+e` URLs, and F6 issues
+HTTP(S) through those routes and Guardian enforcement; it never treats `origin_url`
+as a trust bypass or local open. F4 does not fetch the URL or independently rehash
+its contents.
 
-F5 does not receive the in-process factory object created by the devpi plugin.
-Deployment configuration owns one absolute database path. After the migration
-owner reports readiness, F5 independently constructs a `ConnectionFactory`
-from that exact path and does not query Guardian tables directly:
-
-```console
-export GUARDIAN_DB=/var/lib/devpi-guardian/guardian.db
-devpi-server --guardian-db "$GUARDIAN_DB"
-```
-
-The plugin does not read `GUARDIAN_DB` automatically; the same deployment
-configuration explicitly supplies `--guardian-db`, and the F5 process reads
-the variable when constructing its own factory:
-
-```python
-import os
-from pathlib import Path
-
-from devpi_guardian.verdicts.store import SQLiteArtifactStore
-from devpi_guardian.verdicts.db import ConnectionFactory
-
-# Run this only after the devpi process using --guardian-db is ready.
-f5_factory = ConnectionFactory(Path(os.environ["GUARDIAN_DB"]).resolve())
-# audit_writer is an injected F12 implementation of AuditWriter.
-store = SQLiteArtifactStore(f5_factory, audit_writer)
-claim = store.claim_next(worker_id, lease_until)
-if claim is not None:
-    store.record_verdict(claim, verdict, evidence)
-    # On analysis failure, use the same claim instead:
-    # store.mark_analysis_error(claim, error)
-store.recover_expired_claims(now)
-```
+F5 runs in the devpi process after activation. The plugin creates one
+`ConnectionFactory`, `SQLiteAuditWriter`, `SQLiteArtifactStore`, and
+`SQLiteVerdictReader`, then builds the primary `GuardianWorkerThread` with the in-
+process devpi XOM, quarantine store, internal stage client, and the shared reader.
+The worker is registered with devpi's thread pool only after activation and startup
+verification succeed; replicas do not start it. F12's persistent SQLite audit writer
+is part of this same composition and transaction boundary.
 
 `claim_next` atomically changes `DISCOVERED` to `SCANNING` and returns a
 `ClaimedArtifact` containing `sha256`, `size_bytes`, `worker_id`,
@@ -376,25 +351,31 @@ fallback. `request_rescan` deactivates the current override in the same
 transaction and returns the Artifact to `DISCOVERED`, so it remains blocked
 through discovery and scanning until a new verdict is recorded.
 
-F12 implements `AuditWriter.append_in_transaction(connection, event)` using
-the exact `sqlite3.Connection` supplied by F4. The writer records its event in
-that transaction; if audit recording fails, the state transition is rolled
-back. Persistent audit-adapter integration is a separate F12 delivery; current
-F4 proof covers the same-transaction rollback behavior with a recording stub.
+F12 implements `SQLiteAuditWriter.append_in_transaction(connection, event)` using
+the exact `sqlite3.Connection` supplied by F4. The plugin injects this persistent
+writer into `SQLiteArtifactStore`, so verdict, evidence, override, and audit writes
+share one transaction; if audit recording fails, the state transition is rolled back.
+The audit chain is verified during startup and exposed through the F11 health/admin
+surfaces.
 
 ## Running devpi-server
 
-Use `--guardian-db` to choose the persistent SQLite path:
+Configure a primary with the persistent database, mandatory dedicated quarantine root,
+and canonical base URL:
 
 ```console
-devpi-server --guardian-db /var/lib/devpi-guardian/guardian.db
+devpi-server \
+  --guardian-db /var/lib/devpi-guardian/guardian.db \
+  --guardian-quarantine-root /var/lib/devpi-guardian/quarantine \
+  --guardian-base-url https://devpi.example.test
 ```
 
-If omitted, the plugin uses
-`<devpi-server-path>/guardian/guardian.db`. Put the database and its WAL files
-on a persistent volume and keep that volume across restarts. The plugin runs
-and validates its packaged migration once, before registering enforcement; a
-migration failure prevents startup readiness.
+`--guardian-quarantine-root` is required for a primary. Supply the canonical
+`--guardian-base-url` explicitly for deployments; if omitted, the plugin derives a
+canonical URL from devpi's outside URL or host/port settings. The database path may be
+explicitly placed on a persistent volume. Keep the database and its WAL files together
+across restarts. The plugin runs and validates its packaged migrations before registering
+enforcement; a migration failure prevents startup readiness.
 
 For direct `GET` and `HEAD` requests under `+f` and `+e` (including
 `.metadata` requests), the tween resolves the devpi release-file identity and
@@ -501,9 +482,9 @@ uv build
 ## F3/F4 completion criteria
 
 - SQLite migration is repeatable on an empty or already initialized database,
-  and artifacts, mappings, verdict history, evidence, and overrides survive
-  process restart. Persistent F12 audit-adapter integration is separate; F4
-  proves same-transaction rollback when audit recording fails.
+  and artifacts, mappings, verdict history, evidence, overrides, and the persistent
+  F12 audit chain survive process restart. F4 proves same-transaction rollback when
+  audit recording fails.
 - All writes and audit events share one transaction; automated verdicts and
   evidence remain immutable, and only one current verdict and override apply to
   an Artifact.
@@ -519,7 +500,9 @@ uv build
 - The real subprocess harness in `tests/integration/conftest.py` and the
   official `pytest-devpi-server` fixture smoke test in
   `tests/integration/test_pytest_devpi_server.py` verify direct-route blocking,
-  allow behavior, restart persistence, and `+e` failure handling. The broader
+  allow behavior, restart persistence, and `+e` failure handling. A controlled
+  stopped-server KeyFS cache-entry proof also verifies the genuine hashless `+e`
+  lifecycle after SHA metadata is committed through devpi's internal cache path. The broader
   integration proof verifies 64 concurrent blocked requests (8 workers over 8
   rounds), exact-version pip behavior when an Artifact is allowed or revoked,
   uv direct URL lock/sync behavior, and `%2Bf`/`%2Be` route-marker compatibility
