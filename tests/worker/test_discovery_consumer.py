@@ -84,3 +84,35 @@ def test_transition_conflict_is_terminal(tmp_path):
     queue, _, _, consumer = build(tmp_path, store=Store(TransitionConflict("conflict")))
     queue.discover(item())
     assert consumer.run_once().status is DiscoveryCycleStatus.FAILED
+
+
+def test_resolver_rejects_noncanonical_links_and_fragments():
+    payload = b"wheel"
+    resolver = SimpleLinkResolver("https://devpi.invalid/")
+    digest = hashlib.sha256(payload).hexdigest()
+    valid = f"/root/pypi/+f/abc/demo-1.2.3-py3-none-any.whl#sha256={digest}"
+    candidate = item(payload)
+    candidate = DiscoveryCandidate(
+        candidate.stage, candidate.project, candidate.filename, digest, valid
+    )
+    for bad in (
+        valid.replace("/root/pypi", "/root//pypi"),
+        valid.replace("/root/pypi", "/root/./pypi"),
+        valid.replace("/root/pypi", "/root/%2e%2e/pypi"),
+        valid.replace("#sha256=", "#sha256=" + "0"),
+        valid.replace("#sha256=", "#other="),
+        valid.replace("#sha256=" + digest, "#sha256="),
+    ):
+        with __import__("pytest").raises(ValueError):
+            resolver.resolve(
+                DiscoveryCandidate(
+                    candidate.stage, candidate.project, candidate.filename, digest, bad
+                )
+            )
+    for base in (
+        "https://devpi.invalid//",
+        "https://devpi.invalid/?q=1",
+        "https://devpi.invalid/#fragment",
+    ):
+        with __import__("pytest").raises(ValueError):
+            SimpleLinkResolver(base)

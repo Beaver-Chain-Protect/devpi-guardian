@@ -45,6 +45,58 @@ def test_relative_root_and_symlink_root_rejected(tmp_path: Path) -> None:
         QuarantineStore(link, max_size_bytes=100)
 
 
+def test_symlinked_root_parent_rejected(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(QuarantineError):
+        QuarantineStore(parent_link / "q", max_size_bytes=100)
+
+
+def test_preexisting_component_with_unsafe_mode_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "q"
+    root.mkdir(mode=0o700)
+    (root / "objects").mkdir(mode=0o755)
+    with pytest.raises(QuarantineError):
+        QuarantineStore(root, max_size_bytes=100)
+
+
+def test_new_directories_are_exactly_private_under_restrictive_umask(tmp_path: Path) -> None:
+    original = os.umask(0o777)
+    try:
+        store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    finally:
+        os.umask(original)
+    assert (store.root_path.stat().st_mode & 0o777) == 0o700
+    assert (store.root_path / "objects").stat().st_mode & 0o777 == 0o700
+    store.close()
+
+
+def test_close_attempts_all_descriptors_and_preserves_first_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    real_close = os.close
+    calls: list[int] = []
+    incoming_fd = store._incoming_fd
+
+    def close(fd: int) -> None:
+        calls.append(fd)
+        if fd == incoming_fd:
+            raise OSError("incoming close failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", close)
+    with pytest.raises(OSError, match="incoming close failed"):
+        store.close()
+    assert len(calls) == 4
+    assert all(
+        getattr(store, name) is None
+        for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd")
+    )
+
+
 def test_root_and_object_modes_are_restricted(tmp_path: Path) -> None:
     store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
     assert (store.root_path.stat().st_mode & 0o777) == 0o700
@@ -118,5 +170,18 @@ def test_hard_linked_object_is_rejected(tmp_path: Path) -> None:
     store.persist(item, [payload]).open_for_analysis().__exit__(None, None, None)
     path = store.root_path / store.object_relative_path(item.sha256)
     os.link(path, tmp_path / "hard-link")
+    with pytest.raises(QuarantineError):
+        store.get_verified(item)
+
+
+def test_nonregular_fifo_object_is_rejected_without_blocking(tmp_path: Path) -> None:
+    payload = b"fifo target"
+    store = QuarantineStore(tmp_path / "q", max_size_bytes=100)
+    item = candidate(payload)
+    digest = item.sha256
+    leaf_fd = store._open_leaf(digest, create=True)
+    os.close(leaf_fd)
+    leaf = store.root_path / "objects" / "sha256" / digest[:2] / digest[2:4]
+    os.mkfifo(leaf / digest, 0o600)
     with pytest.raises(QuarantineError):
         store.get_verified(item)

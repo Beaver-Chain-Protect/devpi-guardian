@@ -5,32 +5,8 @@ from datetime import UTC, datetime, timedelta
 
 from devpi_guardian.verdicts.models import ClaimedArtifact
 from devpi_guardian.worker.models import ArtifactCandidate
-from devpi_guardian.worker.preparer import HttpArtifactPreparer, QuarantineArtifactPreparer
+from devpi_guardian.worker.preparer import QuarantineArtifactPreparer
 from devpi_guardian.worker.quarantine import QuarantineStore
-
-
-class Response:
-    status_code = 200
-
-    def __init__(self, payload: bytes) -> None:
-        self.payload, self.closed = payload, False
-
-    def iter_content(self, chunk_size):
-        yield self.payload[:3]
-        yield self.payload[3:]
-
-    def close(self):
-        self.closed = True
-
-
-class Session:
-    def __init__(self, payloads):
-        self.payloads, self.responses = payloads, []
-
-    def get(self, url, *, stream, timeout):
-        response = Response(self.payloads[url])
-        self.responses.append(response)
-        return response
 
 
 class Source:
@@ -62,23 +38,10 @@ def claim(item, size):
     )
 
 
-def test_http_preparer_closes_responses_and_returns_descriptor_streams(tmp_path):
-    wheel_payload, sdist_payload = b"wheel", b"sdist"
-    wheel, sdist = (
-        candidate("demo-1.0.0-py3-none-any.whl", wheel_payload),
-        candidate("demo-1.0.0.tar.gz", sdist_payload),
-    )
-    session = Session({wheel.origin_url: wheel_payload, sdist.origin_url: sdist_payload})
-    bundle = HttpArtifactPreparer(
-        source=Source(wheel, (wheel, sdist)),
-        session=session,
-        quarantine=QuarantineStore(tmp_path / "q", max_size_bytes=100),
-    ).prepare(claim(wheel, len(wheel_payload)))
-    with bundle.target.open_for_analysis() as stream:
-        assert stream.read() == wheel_payload
-    assert bundle.same_release_sdist is not None
-    assert all(response.closed for response in session.responses)
-    bundle.close()
+def test_only_descriptor_backed_preparer_is_available():
+    import devpi_guardian.worker.preparer as preparer
+
+    assert not hasattr(preparer, "HttpArtifactPreparer")
 
 
 def test_quarantine_preparer_closes_target_when_counterpart_fails(tmp_path):

@@ -30,7 +30,7 @@ from .models import (
     VerifiedArtifact,
 )
 from .pipeline import QuarantineWorker, WorkerCycle, WorkerCycleStatus
-from .preparer import HttpArtifactPreparer, QuarantineArtifactPreparer
+from .preparer import QuarantineArtifactPreparer
 from .quarantine import (
     ArtifactHashMismatch,
     ArtifactSizeMismatch,
@@ -63,7 +63,6 @@ __all__ = [
     "DiscoveryUnavailable",
     "FileDiscoverySink",
     "GuardianAnalysisEngine",
-    "HttpArtifactPreparer",
     "PrivateUploadConnector",
     "QuarantineArtifactPreparer",
     "QuarantineError",

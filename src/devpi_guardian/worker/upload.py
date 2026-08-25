@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import PurePath
 
+from devpi_common.metadata import normalize_name, splitbasename
+
 from devpi_guardian.verdicts.models import ArtifactInput, ReleaseInput, validate_sha256
 
-from .models import ArtifactCandidate
+from .models import ArtifactCandidate, VerifiedArtifact
 from .quarantine import QuarantineError, QuarantineStore
 
 _CHUNK_SIZE = 1024 * 1024
@@ -37,10 +38,14 @@ class PrivateUploadConnector:
         if not isinstance(hashes, Mapping) or not isinstance(hashes.get("sha256"), str):
             raise QuarantineError("private upload has no SHA-256 metadata")
         digest = validate_sha256(hashes["sha256"])
-        expected_size = getattr(entry, "file_size", None)
-        if expected_size is not None and (type(expected_size) is not int or expected_size < 0):
+        size_value = getattr(entry, "file_size", None)
+        if not callable(size_value):
+            raise QuarantineError("private upload has no callable file_size")
+        expected_size = size_value()
+        if type(expected_size) is not int or expected_size < 0:
             raise QuarantineError("private upload has invalid size metadata")
         stage_name = self._stage_name(stage)
+        self._validate_metadata(filename, project, version)
         origin = f"private-upload://{digest}"
         candidate = ArtifactCandidate(
             stage=stage_name,
@@ -52,17 +57,39 @@ class PrivateUploadConnector:
             expected_size_bytes=expected_size,
         )
         stream = opener()
+        verified: VerifiedArtifact | None = None
         try:
             verified = self._quarantine.persist(candidate, self._chunks(stream))
-        finally:
+        except BaseException as primary:
             close = getattr(stream, "close", None)
             if callable(close):
-                with suppress(BaseException):
+                try:
                     close()
+                except BaseException as cleanup:
+                    primary.add_note(
+                        f"input stream cleanup failed: {type(cleanup).__name__}: {cleanup}"
+                    )
+            raise
+        else:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as cleanup:
+                    try:
+                        verified._stream.close()
+                    except BaseException as descriptor_cleanup:
+                        cleanup.add_note(
+                            "verified stream cleanup failed: "
+                            f"{type(descriptor_cleanup).__name__}: {descriptor_cleanup}"
+                        )
+                    raise QuarantineError("private upload input close failed") from cleanup
         # Publish notification and discovery happen only after the verified
         # descriptor is closed, so no consumer can observe an unpersisted blob.
-        with suppress(BaseException):
+        try:
             verified._stream.close()
+        except BaseException as error:
+            raise QuarantineError("verified upload descriptor close failed") from error
         if self._event is not None:
             self._event("quarantine_published")
         now = datetime.now(UTC)
@@ -98,13 +125,33 @@ class PrivateUploadConnector:
         return value
 
     @staticmethod
+    def _validate_metadata(filename: str, project: str, version: str) -> None:
+        try:
+            parsed_project, parsed_version, _ = splitbasename(filename)
+        except (TypeError, ValueError) as error:
+            raise QuarantineError("private upload filename is not a valid artifact") from error
+        if normalize_name(parsed_project) != normalize_name(project) or parsed_version != version:
+            raise QuarantineError("private upload metadata does not match filename")
+
+    @staticmethod
     def _stage_name(stage) -> str:
         if isinstance(stage, str):
             value = stage
         else:
-            user = getattr(stage, "user", None)
-            index = getattr(stage, "index", None)
-            value = f"{user}/{index}" if user and index else ""
-        if not value.strip():
+            named = getattr(stage, "name", None)
+            if named is not None:
+                value = named
+            else:
+                user = getattr(stage, "user", None)
+                index = getattr(stage, "index", None)
+                value = (
+                    f"{user}/{index}" if isinstance(user, str) and isinstance(index, str) else ""
+                )
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or value.count("/") != 1
+            or any(not part or any(ord(char) < 0x20 for char in part) for part in value.split("/"))
+        ):
             raise QuarantineError("private upload stage metadata is invalid")
         return value

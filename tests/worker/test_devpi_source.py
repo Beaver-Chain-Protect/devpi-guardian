@@ -82,7 +82,7 @@ def test_uncached_source_uses_internal_stage_client():
     item = resolved()
     xom, http = xom_for(Entry(None, item.sha256), b"upstream")
     assert b"".join(DevpiArtifactBytesSource(xom).iter_chunks(item)) == b"upstream"
-    assert http.calls == [("GET", "https://upstream.invalid/a", True)]
+    assert http.calls == [("GET", "https://upstream.invalid/a", False)]
 
 
 def test_source_rejects_metadata_mismatch():
@@ -90,3 +90,33 @@ def test_source_rejects_metadata_mismatch():
     xom, _ = xom_for(Entry(b"bytes", "b" * 64))
     with pytest.raises(DevpiArtifactUnavailable):
         tuple(DevpiArtifactBytesSource(xom).iter_chunks(item))
+
+
+def test_cached_descriptor_is_streamed_after_transaction_exit():
+    item = resolved()
+    events = []
+
+    class Stream(BytesIO):
+        def read(self, size=-1):
+            assert events == ["enter", "exit"]
+            return super().read(size)
+
+    class TxnKeyfs:
+        @contextmanager
+        def read_transaction(self):
+            events.append("enter")
+            yield
+            events.append("exit")
+
+    class TxnEntry(Entry):
+        def file_open_read(self):
+            return Stream(self.payload)
+
+    http = Http(b"unused")
+    stage = SimpleNamespace(http=http)
+    xom = SimpleNamespace(
+        keyfs=TxnKeyfs(),
+        filestore=SimpleNamespace(get_file_entry=lambda _: TxnEntry(b"cached", item.sha256)),
+        model=SimpleNamespace(getstage=lambda *_: stage),
+    )
+    assert b"".join(DevpiArtifactBytesSource(xom).iter_chunks(item)) == b"cached"

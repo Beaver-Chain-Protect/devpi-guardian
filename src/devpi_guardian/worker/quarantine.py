@@ -12,7 +12,6 @@ import os
 import stat
 import uuid
 from collections.abc import Iterable
-from contextlib import suppress
 from pathlib import Path
 from typing import BinaryIO
 
@@ -88,11 +87,20 @@ class QuarantineStore:
         return self._root_path
 
     def close(self) -> None:
+        first_error: BaseException | None = None
         for name in ("_incoming_fd", "_sha256_fd", "_objects_fd", "_root_fd"):
             fd = getattr(self, name, None)
             if fd is not None:
                 setattr(self, name, None)
-                _close_fd(fd)
+                try:
+                    os.close(fd)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    else:
+                        _note_cleanup(first_error, "descriptor", error)
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> QuarantineStore:
         return self
@@ -117,6 +125,8 @@ class QuarantineStore:
         leaf_fd = self._open_leaf(digest, create=True)
         staging_name: str | None = f"artifact-{uuid.uuid4().hex}"
         staging_fd: int | None = None
+        primary_error: BaseException | None = None
+        result: VerifiedArtifact | None = None
         try:
             try:
                 staging_fd = os.open(
@@ -125,6 +135,7 @@ class QuarantineStore:
                     _OBJECT_MODE,
                     dir_fd=self._incoming_fd,
                 )
+                os.fchmod(staging_fd, _OBJECT_MODE)
             except OSError as error:
                 raise QuarantineError("unable to create quarantine staging file") from error
 
@@ -184,8 +195,10 @@ class QuarantineStore:
             verified_stream = self._open_verified_fd(leaf_fd, digest, candidate, size)
             if verified_stream is None:
                 raise QuarantineError("published quarantine object disappeared")
-            return self._artifact(candidate, size, verified_stream)
+            result = self._artifact(candidate, size, verified_stream)
+            return result
         except BaseException as primary:
+            primary_error = primary
             if staging_fd is not None:
                 _close_fd(staging_fd, primary)
             if staging_name is not None:
@@ -197,7 +210,15 @@ class QuarantineStore:
                     _note_cleanup(primary, "staging", cleanup)
             raise
         finally:
-            _close_fd(leaf_fd)
+            try:
+                _close_fd(leaf_fd, primary_error)
+            except BaseException as close_error:
+                if result is not None:
+                    try:
+                        result._stream.close()
+                    except BaseException as stream_error:
+                        _note_cleanup(close_error, "verified stream", stream_error)
+                raise
 
     def get_verified(self, candidate: ArtifactCandidate) -> VerifiedArtifact | None:
         """Open and verify a CAS object, returning its owning descriptor."""
@@ -206,21 +227,35 @@ class QuarantineStore:
         leaf_fd = self._open_leaf(digest, create=False)
         if leaf_fd is None:
             return None
+        primary_error: BaseException | None = None
+        result: VerifiedArtifact | None = None
         try:
             stream = self._open_verified_fd(leaf_fd, digest, candidate, None)
             if stream is None:
                 return None
             try:
                 size = os.fstat(stream.fileno()).st_size
-                return self._artifact(candidate, size, stream)
+                result = self._artifact(candidate, size, stream)
+                return result
             except BaseException as primary:
                 try:
                     stream.close()
                 except BaseException as cleanup:
                     _note_cleanup(primary, "verified stream", cleanup)
                 raise
+        except BaseException as primary:
+            primary_error = primary
+            raise
         finally:
-            _close_fd(leaf_fd)
+            try:
+                _close_fd(leaf_fd, primary_error)
+            except BaseException as close_error:
+                if result is not None:
+                    try:
+                        result._stream.close()
+                    except BaseException as stream_error:
+                        _note_cleanup(close_error, "verified stream", stream_error)
+                raise
 
     def _artifact(
         self, candidate: ArtifactCandidate, size: int, stream: BinaryIO
@@ -237,32 +272,71 @@ class QuarantineStore:
 
     @staticmethod
     def _open_root(path: Path) -> int:
-        try:
-            st = path.lstat()
-            if stat.S_ISLNK(st.st_mode):
-                raise QuarantineError("quarantine root must not be a symlink")
-        except FileNotFoundError:
-            with suppress(FileExistsError):
-                path.mkdir(mode=_DIR_MODE)
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except OSError as error:
-            raise QuarantineError("unable to open quarantine root") from error
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISDIR(st.st_mode):
-                raise QuarantineError("quarantine root must be a directory")
-            if st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != _DIR_MODE:
-                raise QuarantineError("quarantine root owner or mode is unsafe")
-            return fd
-        except BaseException as error:
-            _close_fd(fd, error)
-            raise
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parts = path.parts[1:]
+        if not parts:
+            _close_fd(fd)
+            raise QuarantineError("quarantine root must not be filesystem root")
+        for index, name in enumerate(parts):
+            if name in ("", ".", "..") or "\x00" in name:
+                _close_fd(fd)
+                raise QuarantineError("invalid quarantine root component")
+            final = index == len(parts) - 1
+            created = False
+            try:
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd,
+                )
+            except FileNotFoundError:
+                if not final:
+                    _close_fd(fd)
+                    raise QuarantineError("quarantine root parent does not exist") from None
+                try:
+                    os.mkdir(name, _DIR_MODE, dir_fd=fd)
+                    created = True
+                    os.chmod(name, _DIR_MODE, dir_fd=fd, follow_symlinks=False)
+                    child = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=fd,
+                    )
+                except OSError as error:
+                    _close_fd(fd, error)
+                    raise QuarantineError("unable to create quarantine root") from error
+            except OSError as error:
+                _close_fd(fd, error)
+                raise QuarantineError("unsafe quarantine root component") from error
+            old_fd = fd
+            fd = child
+            try:
+                _close_fd(old_fd)
+            except BaseException as error:
+                _close_fd(fd, error)
+                raise
+            try:
+                if created:
+                    os.fchmod(fd, _DIR_MODE)
+                st = os.fstat(fd)
+                if not stat.S_ISDIR(st.st_mode):
+                    raise QuarantineError("quarantine root must be a directory")
+                if final and (st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != _DIR_MODE):
+                    raise QuarantineError("quarantine root owner or mode is unsafe")
+            except BaseException as error:
+                _close_fd(fd, error)
+                raise
+        return fd
 
     @staticmethod
     def _open_or_create_dir(parent_fd: int, name: str) -> int:
-        with suppress(FileExistsError):
+        created = False
+        try:
             os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
+            created = True
+            os.chmod(name, _DIR_MODE, dir_fd=parent_fd, follow_symlinks=False)
+        except FileExistsError:
+            pass
         try:
             fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         except OSError as error:
@@ -271,7 +345,9 @@ class QuarantineStore:
             st = os.fstat(fd)
             if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
                 raise QuarantineError(f"unsafe quarantine component: {name}")
-            if stat.S_IMODE(st.st_mode) != _DIR_MODE:
+            if not created and stat.S_IMODE(st.st_mode) != _DIR_MODE:
+                raise QuarantineError(f"unsafe quarantine component mode: {name}")
+            if created:
                 os.fchmod(fd, _DIR_MODE)
             return fd
         except BaseException as error:
@@ -286,6 +362,7 @@ class QuarantineStore:
         )
         if first is None:
             return None
+        second: int | None = None
         try:
             second = (
                 self._open_or_create_dir(first, digest[2:4])
@@ -294,7 +371,12 @@ class QuarantineStore:
             )
             return second
         finally:
-            _close_fd(first)
+            try:
+                _close_fd(first)
+            except BaseException as error:
+                if second is not None:
+                    _close_fd(second, error)
+                raise
 
     @staticmethod
     def _open_existing_dir(parent_fd: int, name: str) -> int | None:
@@ -323,7 +405,19 @@ class QuarantineStore:
         expected_size: int | None,
     ) -> BinaryIO | None:
         try:
-            fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=leaf_fd)
+            entry = os.stat(digest, dir_fd=leaf_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise QuarantineError("unable to inspect quarantine object") from error
+        if not stat.S_ISREG(entry.st_mode):
+            raise QuarantineError("quarantine object is not a regular file")
+        try:
+            fd = os.open(
+                digest,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=leaf_fd,
+            )
         except FileNotFoundError:
             return None
         except OSError as error:
@@ -346,6 +440,7 @@ class QuarantineStore:
                 raise QuarantineError("quarantine object size does not match")
             stream = os.fdopen(fd, "rb", closefd=True)
             fd = -1
+            initial = os.fstat(stream.fileno())
             hasher = hashlib.sha256()
             while True:
                 chunk = stream.read(_CHUNK_SIZE)
@@ -354,6 +449,19 @@ class QuarantineStore:
                 hasher.update(chunk)
             if hasher.hexdigest() != digest:
                 raise QuarantineError("quarantine object digest does not match")
+            final = os.fstat(stream.fileno())
+            if (
+                final.st_dev != initial.st_dev
+                or final.st_ino != initial.st_ino
+                or final.st_uid != initial.st_uid
+                or final.st_mode != initial.st_mode
+                or final.st_nlink != 1
+                or final.st_size != initial.st_size
+                or not stat.S_ISREG(final.st_mode)
+                or final.st_uid != os.geteuid()
+                or stat.S_IMODE(final.st_mode) != _OBJECT_MODE
+            ):
+                raise QuarantineError("quarantine object changed during verification")
             stream.seek(0)
             return stream
         except BaseException as primary:
