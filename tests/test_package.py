@@ -120,6 +120,19 @@ def test_package_contains_exact_guardian_sql_migrations() -> None:
     ]
 
 
+def test_integration_operator_documents_are_present() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    readme = (repository / "README.md").read_text(encoding="utf-8")
+    worker_doc = (repository / "docs" / "f5-worker.rst").read_text(encoding="utf-8")
+    admin_doc = (repository / "docs" / "f11-admin-api-cli.rst").read_text(encoding="utf-8")
+
+    assert "22bc029e584af43e6c79b72a3d6fcef35f49f05f" in readme
+    assert "52593ae444f416625a0e96f0a4874bc30987ce8d" in readme
+    assert "0700" in worker_doc
+    assert "internal stage/mirror client" in worker_doc
+    assert "/+guardian/api/v1/health" in admin_doc
+
+
 def test_plugin_hooks_are_marked_for_devpiserver() -> None:
     assert "devpiserver_impl" in plugin.devpiserver_add_parser_options.__dict__
     assert "devpiserver_impl" in plugin.devpiserver_pyramid_configure.__dict__

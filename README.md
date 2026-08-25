@@ -78,6 +78,16 @@ canonical +f/+e after ALLOW. There is no worker/public route bypass token, heade
 loopback exception. Orphan objects remain safe under the cleanup/retention contract;
 PR1 does not silently delete them.
 
+The integrated worker requires an explicit `--guardian-quarantine-root` absolute directory.
+Create a dedicated directory with mode `0700`, owned by the devpi service account, outside
+the devpi `--serverdir`; it must not be mounted or routed as public storage. Private uploads
+are copied into this CAS before discovery. Mirror candidates are read through devpi's internal
+stage client and upstream stream, never through Guardian's protected public `+f`/`+e` URL.
+The worker publishes health and queue state through the F11 API while it waits for durable
+discovery and terminal verdict transitions. Existing devpi installations with artifacts are
+not automatically backfilled: offline migration/backfill remains unsupported until a future
+dedicated process is delivered.
+
 ## Implemented features
 
 - A read-only `guardian` index type that requires at least one devpi base index.
@@ -98,6 +108,19 @@ PR1 does not silently delete them.
   `503` even when a matching `ALLOW` exists.
 - A narrower official `pytest-devpi-server` fixture smoke test exercises the installed
   plugin.
+- The integrated F5 runtime proof exercises private upload → CAS → discovery → terminal
+  verdict and verifies that only an effective `ALLOW` enables `GET`/`HEAD`, including
+  protected metadata. Mirror bytes are proven to arrive through the internal stage client,
+  while the hashless mirror `+e` path stays fail-closed.
+
+## Safe PR5/PR9 integration provenance
+
+The F5/F6/F7/F10/F11/F12 functionality was selectively integrated from PR5 commit
+`22bc029e584af43e6c79b72a3d6fcef35f49f05f` and PR9 commit
+`52593ae444f416625a0e96f0a4874bc30987ce8d` onto the PR1 activation and enforcement line.
+The PR branches were not merged wholesale. PR1 activation ordering, fail-closed public
+download enforcement, immutable SQLite history, claim fencing, and Python 3.11–3.14 CI
+documentation remain authoritative.
 
 ## F8/F9 artifact analyzers
 
