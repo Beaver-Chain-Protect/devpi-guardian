@@ -643,6 +643,7 @@ def _assert_exact_ci_workflow(workflow: str) -> None:
                 "      - run: uv run ruff format --check .",
                 "      - run: uv run ruff check .",
                 "      - run: uv run flake8 src tests",
+                "      - run: uv run bandit -q -r src -ll -iii",
                 "      - run: uv run python -m build",
             )
         )

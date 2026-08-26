@@ -1,5 +1,9 @@
 # devpi-guardian
 
+[![CI](https://github.com/Beaver-Chain-Protect/devpi-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/Beaver-Chain-Protect/devpi-guardian/actions/workflows/ci.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14250/badge)](https://www.bestpractices.dev/projects/14250)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 devpi-guardian is a devpi-server plugin that exposes a release file only when its
 verified Artifact SHA-256 has a valid effective `ALLOW` verdict. The enforcement
 path is fail-closed: an unknown Artifact, an in-progress analysis, a denied or
@@ -8,7 +12,45 @@ reach the devpi file handler.
 
 The [approved F3/F4 design][approved-design] is in the repository.
 
-[approved-design]: https://github.com/Beaver-Context-Protocol/devpi-guardian/blob/main/docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md
+[approved-design]: https://github.com/Beaver-Chain-Protect/devpi-guardian/blob/main/docs/superpowers/specs/2026-08-17-devpi-guardian-f3-f4-design.md
+
+## Obtain and get started
+
+devpi-guardian is in pre-release development. Obtain the current source from
+the [public repository], create the locked Python 3.11+ environment, and verify
+the installed commands:
+
+```console
+git clone https://github.com/Beaver-Chain-Protect/devpi-guardian.git
+cd devpi-guardian
+uv sync --locked --extra test
+uv run guardian --help
+uv run devpi-server --help
+```
+
+Continue with [Running devpi-server](#running-devpi-server) for the required
+database, quarantine, and canonical URL configuration. Read
+[Operations and security](#operations-and-security) before deploying: Guardian
+is fail-closed, requires persistent SQLite state, and does not support automatic
+backfill of existing devpi installations.
+
+The administrator API and CLI inputs, outputs, authentication boundary, and
+commands are documented in [the F11 reference]. Analyzer interfaces and JSON
+output are documented in [the F8/F9 handoff].
+
+- Ask questions, report bugs, and propose enhancements in [GitHub Issues].
+- Follow [CONTRIBUTING.md] for the contribution and review process, coding
+  requirements, and test policy.
+- Report suspected vulnerabilities privately using [SECURITY.md].
+- Read [CHANGELOG.md] for human-readable release notes and version policy.
+
+[public repository]: https://github.com/Beaver-Chain-Protect/devpi-guardian
+[the F11 reference]: docs/f11-admin-api-cli.rst
+[the F8/F9 handoff]: docs/analyzers/f8-f9-handoff.md
+[GitHub Issues]: https://github.com/Beaver-Chain-Protect/devpi-guardian/issues
+[CONTRIBUTING.md]: CONTRIBUTING.md
+[SECURITY.md]: SECURITY.md
+[CHANGELOG.md]: CHANGELOG.md
 
 ## New-install activation boundary
 
@@ -495,9 +537,13 @@ uv run pytest -q
 uv run ruff format --check .
 uv run ruff check .
 uv run flake8 src tests
+uv run bandit -q -r src -ll -iii
 uv lock --check
 uv build
 ```
+
+See [CONTRIBUTING.md] for the policy requiring tests for major new
+functionality and the criteria used to accept changes.
 
 ## F3/F4 completion criteria
 
