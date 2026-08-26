@@ -4,23 +4,57 @@ from __future__ import annotations
 # Keep devpi's no-section, from-first style in this integration-facing test.
 # ruff: noqa: I001
 from devpi_guardian.verdicts.db import ConnectionFactory
-from devpi_guardian.verdicts.models import Decision
+from devpi_guardian.verdicts.models import ArtifactState, Decision, ManualOverrideInput
+from devpi_guardian.verdicts.reader import SQLiteVerdictReader
 from devpi_guardian.verdicts.store import SQLiteArtifactStore
+from datetime import UTC, datetime
 from pathlib import Path
 from tests.conftest import RecordingAuditWriter
 from tests.integration.test_direct_download import Links
 from tests.integration.test_direct_download import _build_wheel
 from tests.integration.test_direct_download import _discover
-from tests.integration.test_direct_download import _record_verdict
+from tests.integration.test_direct_download import _manual_allow
 import hashlib
 import json
 import pytest
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
 
 pytestmark = pytest.mark.integration
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _manual_decision(store, sha256: str, decision: Decision) -> None:
+    store.set_manual_override(
+        ManualOverrideInput(
+            sha256,
+            decision,
+            "integration-admin",
+            "integration verdict",
+            datetime.now(UTC),
+        )
+    )
+
+
+def _wait_for_terminal(db_path: Path, sha256: str) -> None:
+    reader = SQLiteVerdictReader(ConnectionFactory(db_path))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            state = reader.get_artifact_details(sha256).summary.state
+        except Exception:  # worker may be between discovery transactions
+            state = None
+        if state in {
+            ArtifactState.ALLOW,
+            ArtifactState.REVIEW,
+            ArtifactState.DENY,
+            ArtifactState.ERROR,
+        }:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"artifact {sha256} did not reach a terminal state")
 
 
 def _request(
@@ -91,7 +125,8 @@ def test_official_devpi_server_fixture_exercises_guardian_routes(
         direct_url=direct_url,
         stage=f"{devpi_server.user}/{devpi_server.index}",
     )
-    _record_verdict(store, sha256, Decision.ALLOW)
+    _wait_for_terminal(guardian_db, sha256)
+    _manual_allow(store, sha256, "integration allow")
 
     assert _request(direct_url) == (200, content)
     allowed_head_status, allowed_head_body = _request(
@@ -203,7 +238,8 @@ def test_guardian_index_filters_real_simple_responses_and_downloads(
             direct_url=direct_urls[digest],
             stage=base_stage,
         )
-        _record_verdict(store, digest, decision)
+        _wait_for_terminal(guardian_db, digest)
+        _manual_decision(store, digest, decision)
 
     guardian_status, guardian_body = _request(guardian_simple_url)
     assert guardian_status == 200

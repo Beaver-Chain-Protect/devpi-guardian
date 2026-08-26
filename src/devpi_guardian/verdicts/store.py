@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 
 from devpi_common.metadata import normalize_name
 
+from devpi_guardian.privacy import sanitize_diagnostic, sanitize_diagnostic_graph
+
 from .db import ConnectionFactory
 from .errors import ArtifactNotFound, StoreUnavailable, TransitionConflict
 from .interfaces import AuditWriter
@@ -36,7 +38,6 @@ from .releases import sanitize_origin_url
 _MAX_SQLITE_INTEGER = 2**63 - 1
 _MAX_STORED_TEXT_LENGTH = 4096
 _MAX_DETAILS_JSON_LENGTH = 1024 * 1024
-_MAX_ANALYSIS_ERROR_LENGTH = 4096
 _TERMINAL_STATES = {"ALLOW", "REVIEW", "DENY", "ERROR"}
 
 
@@ -127,16 +128,7 @@ def _serialize_details(value: object) -> str:
 def _sanitize_analysis_error(value: object) -> str:
     if type(value) is not str:
         raise ValueError("error must be a string")
-    return "".join(
-        " "
-        if (
-            ord(character) < 32
-            or 127 <= ord(character) <= 159
-            or 0xD800 <= ord(character) <= 0xDFFF
-        )
-        else character
-        for character in value[:_MAX_ANALYSIS_ERROR_LENGTH]
-    )
+    return sanitize_diagnostic(value)
 
 
 def _require_lease_token(value: object) -> str:
@@ -201,8 +193,18 @@ def _prepare_evidence(
             action = item.action
             file_path_value = item.file_path
             line = item.line
-            message = _require_stored_string(item.message, "message")
-            details_json = _serialize_details(item.details)
+            raw_message = _require_stored_string(item.message, "message")
+            message = sanitize_diagnostic(raw_message)
+            try:
+                details_json = _serialize_details(sanitize_diagnostic_graph(item.details))
+            except (
+                TypeError,
+                ValueError,
+                OverflowError,
+                RecursionError,
+                RuntimeError,
+            ) as exc:
+                raise ValueError("details must be JSON-serializable") from exc
         except AttributeError:
             message = "EvidenceInput missing required fields"
             raise ValueError(message) from None
@@ -211,7 +213,7 @@ def _prepare_evidence(
         file_path = (
             None
             if file_path_value is None
-            else _require_stored_string(file_path_value, "file_path")
+            else sanitize_diagnostic(_require_stored_string(file_path_value, "file_path"))
         )
         line_is_integer = type(line) is int
         line_in_range = line_is_integer and 0 < line <= _MAX_SQLITE_INTEGER
@@ -360,6 +362,97 @@ class SQLiteArtifactStore:
                 occurred_at=occurred_at,
             ),
         )
+
+    def set_baseline_eligibility(
+        self,
+        sha256: str,
+        *,
+        enabled: bool,
+        actor: str,
+        reason: str,
+    ) -> None:
+        canonical = validate_sha256(sha256)
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a bool")
+        actor = _require_stored_string(actor, "actor")
+        reason = _require_stored_string(reason, "reason")
+
+        with self._write() as connection:
+            operation_at = require_utc(_require_datetime(self._now(), "now"), "now")
+            _artifact, _override, context = self._administrator_context(
+                connection,
+                canonical,
+                operation_at,
+            )
+            if enabled and not (
+                context.effective_decision is Decision.ALLOW and context.cooldown_finished
+            ):
+                raise TransitionConflict("baseline must be an effective, cooldown-finished ALLOW")
+
+            current_rows = connection.execute(
+                """
+                SELECT id, enabled FROM baseline_overrides
+                WHERE sha256 = ? AND is_current = 1
+                ORDER BY id LIMIT 2
+                """,
+                (canonical,),
+            ).fetchall()
+            if len(current_rows) > 1:
+                raise TransitionConflict("multiple current baseline overrides")
+            if current_rows and bool(current_rows[0]["enabled"]) is enabled:
+                return
+            if current_rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE baseline_overrides SET is_current = 0
+                    WHERE id = ? AND is_current = 1
+                    """,
+                    (current_rows[0]["id"],),
+                )
+                if cursor.rowcount != 1:
+                    raise TransitionConflict("baseline override update failed")
+
+            created_at = operation_at.isoformat()
+            inserted = connection.execute(
+                """
+                INSERT INTO baseline_overrides(
+                    sha256, enabled, actor, reason, created_at, is_current
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (canonical, int(enabled), actor, reason, created_at),
+            )
+            if inserted.rowcount != 1:
+                raise TransitionConflict("baseline override insert failed")
+
+            expected_baseline_history = self._baseline_history(connection, canonical)
+            expected_override = None if _override is None else tuple(_override)
+            expected_administrator = {
+                "sha256": canonical,
+                "operation_at": operation_at,
+                "expected_artifact": tuple(_artifact),
+                "expected_counts": self._history_counts(connection, canonical),
+                "expected_verdict_id": context.current_verdict_id,
+                "expected_override": expected_override,
+            }
+
+            self._audit(
+                connection,
+                actor=actor,
+                action="baseline.added" if enabled else "baseline.removed",
+                sha256=canonical,
+                reason=reason,
+                previous=context.effective_decision,
+                new=context.effective_decision,
+                policy_version=context.policy_version,
+                analyzer_version=context.analyzer_version,
+                occurred_at=operation_at,
+            )
+            self._verify_administrator_result(connection, **expected_administrator)
+            self._verify_baseline_history(
+                connection,
+                canonical,
+                expected_baseline_history,
+            )
 
     def discover_artifact(
         self,
@@ -663,7 +756,12 @@ class SQLiteArtifactStore:
             )
             baseline_sha256 = verdict.baseline_sha256
             baseline_tier = verdict.baseline_tier
-            created_at = _iso(verdict.created_at, "created_at")
+            created_at_value = require_utc(
+                _require_datetime(verdict.created_at, "created_at"),
+                "created_at",
+            )
+            created_at = created_at_value.isoformat()
+            cooldown_until_value = verdict.cooldown_until
         except AttributeError:
             message = "VerdictInput missing required fields"
             raise ValueError(message) from None
@@ -676,6 +774,17 @@ class SQLiteArtifactStore:
             raise ValueError(message)
         if baseline_tier is not None:
             baseline_tier = validate_baseline_tier(baseline_tier)
+        cooldown_until = None
+        if cooldown_until_value is not None:
+            cooldown_until_at = require_utc(
+                _require_datetime(cooldown_until_value, "cooldown_until"),
+                "cooldown_until",
+            )
+            if decision is not Decision.ALLOW:
+                raise ValueError("cooldown requires an ALLOW verdict")
+            if cooldown_until_at <= created_at_value:
+                raise ValueError("cooldown_until must be later than created_at")
+            cooldown_until = cooldown_until_at.isoformat()
         if sha256 != claim_sha256:
             raise TransitionConflict(sha256)
 
@@ -692,12 +801,13 @@ class SQLiteArtifactStore:
             artifact_row = connection.execute(
                 """
                 SELECT sha256, size_bytes, state, lease_owner,
-                       lease_expires_at, lease_token
+                       lease_expires_at, lease_token, cooldown_started_at,
+                       cooldown_until
                 FROM artifacts WHERE sha256 = ?
                 """,
                 (claim_sha256,),
             ).fetchone()
-            if artifact_row is None or tuple(artifact_row) != (
+            if artifact_row is None or tuple(artifact_row)[:6] != (
                 claim_sha256,
                 claim_size_bytes,
                 "SCANNING",
@@ -706,6 +816,18 @@ class SQLiteArtifactStore:
                 claim_token,
             ):
                 raise TransitionConflict(claim_sha256)
+            stored_cooldown_started_at = artifact_row["cooldown_started_at"]
+            stored_cooldown_until = artifact_row["cooldown_until"]
+            expected_cooldown_started_at = (
+                stored_cooldown_started_at
+                if stored_cooldown_started_at is not None
+                else created_at
+                if cooldown_until is not None
+                else None
+            )
+            expected_cooldown_until = (
+                stored_cooldown_until if stored_cooldown_until is not None else cooldown_until
+            )
 
             if baseline_sha256 is not None:
                 baseline = connection.execute(
@@ -772,7 +894,9 @@ class SQLiteArtifactStore:
                 """
                 UPDATE artifacts
                 SET state = ?, lease_owner = NULL, lease_expires_at = NULL,
-                    lease_token = NULL, last_error = NULL, updated_at = ?
+                    lease_token = NULL, last_error = NULL, updated_at = ?,
+                    cooldown_started_at = COALESCE(cooldown_started_at, ?),
+                    cooldown_until = COALESCE(cooldown_until, ?)
                 WHERE sha256 = ? AND size_bytes = ?
                   AND state = 'SCANNING' AND lease_owner = ?
                   AND lease_expires_at = ? AND lease_token = ?
@@ -781,6 +905,8 @@ class SQLiteArtifactStore:
                 (
                     decision.value,
                     updated_at,
+                    created_at if cooldown_until is not None else None,
+                    cooldown_until,
                     claim_sha256,
                     claim_size_bytes,
                     claim_worker_id,
@@ -795,7 +921,8 @@ class SQLiteArtifactStore:
             final_artifact = connection.execute(
                 """
                 SELECT state, lease_owner, lease_expires_at, lease_token,
-                       last_error, updated_at
+                       last_error, updated_at, cooldown_started_at,
+                       cooldown_until
                 FROM artifacts WHERE sha256 = ?
                 """,
                 (claim_sha256,),
@@ -807,6 +934,8 @@ class SQLiteArtifactStore:
                 None,
                 None,
                 updated_at,
+                expected_cooldown_started_at,
+                expected_cooldown_until,
             ):
                 raise TransitionConflict("artifact terminal state mismatch")
 
@@ -1033,6 +1162,30 @@ class SQLiteArtifactStore:
         if row is None or any(type(value) is not int for value in row):
             raise TransitionConflict("history count failed")
         return tuple(row)
+
+    @staticmethod
+    def _baseline_history(
+        connection: sqlite3.Connection,
+        sha256: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        rows = connection.execute(
+            """
+            SELECT id, sha256, enabled, actor, reason, created_at, is_current
+            FROM baseline_overrides
+            WHERE sha256 = ? ORDER BY id
+            """,
+            (sha256,),
+        ).fetchall()
+        return tuple(tuple(row) for row in rows)
+
+    def _verify_baseline_history(
+        self,
+        connection: sqlite3.Connection,
+        sha256: str,
+        expected: tuple[tuple[object, ...], ...],
+    ) -> None:
+        if self._baseline_history(connection, sha256) != expected:
+            raise TransitionConflict("baseline override history changed")
 
     def _verify_administrator_result(
         self,
@@ -1330,6 +1483,8 @@ class SQLiteArtifactStore:
                 None,
                 None,
                 None,
+                artifact_row["cooldown_started_at"],
+                artifact_row["cooldown_until"],
             )
             verification = {
                 "sha256": sha256,

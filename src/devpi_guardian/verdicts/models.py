@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -13,6 +14,8 @@ from .errors import InvalidSha256
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
 BaselineTier = Literal["same_tag", "universal_wheel", "sdist"]
 _BASELINE_TIERS = frozenset(("same_tag", "universal_wheel", "sdist"))
+_MAX_STORED_TEXT_LENGTH = 4096
+_MAX_DETAILS_JSON_LENGTH = 1024 * 1024
 
 
 class _FrozenList(tuple[Any, ...]):
@@ -59,7 +62,7 @@ def _freeze_json(value: Any) -> Any:
     return value
 
 
-def _snapshot_details(details: dict[str, Any]) -> dict[str, Any]:
+def _snapshot_details(details: object) -> dict[str, Any]:
     if not isinstance(details, dict):
         raise ValueError("details must be a dictionary")
     try:
@@ -72,6 +75,15 @@ def _snapshot_details(details: dict[str, Any]) -> dict[str, Any]:
         )
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise ValueError("details must be JSON-serializable") from exc
+    if (
+        len(
+            json.dumps(frozen, allow_nan=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        > _MAX_DETAILS_JSON_LENGTH
+    ):
+        raise ValueError("details JSON is too large")
     return frozen
 
 
@@ -179,6 +191,17 @@ class AllowedRelease:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseArtifact:
+    stage: str
+    project: str
+    version: str
+    filename: str
+    sha256: str
+    origin_url: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceInput:
     rule_id: str
     action: Decision
@@ -208,6 +231,7 @@ class VerdictInput:
     baseline_sha256: str | None
     baseline_tier: BaselineTier | None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    cooldown_until: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_sha256(self.sha256)
@@ -225,6 +249,13 @@ class VerdictInput:
             message = "policy_version and analyzer_version"
             raise ValueError(f"{message} must not be blank")
         require_utc(self.created_at, "created_at")
+        if self.cooldown_until is not None:
+            cooldown_until = require_utc(self.cooldown_until, "cooldown_until")
+            created_at = require_utc(self.created_at, "created_at")
+            if self.decision is not Decision.ALLOW:
+                raise ValueError("cooldown requires an ALLOW verdict")
+            if cooldown_until <= created_at:
+                raise ValueError("cooldown_until must be later than created_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +304,108 @@ class EnforcementDecision:
     source: DecisionSource
     artifact_state: ArtifactState
     policy_version: str | None
+    cooldown_until: datetime | None = None
+    cooldown_finished: bool = True
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAdminSummary:
+    sha256: str
+    size_bytes: int
+    state: ArtifactState
+    discovered_at: datetime
+    updated_at: datetime
+    cooldown_until: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRecord:
+    rule_id: str
+    action: Decision
+    file_path: str | None
+    line: int | None
+    message: str
+    details: dict[str, Any]
+
+
+def _persisted_text(value: object, field_name: str, *, nonblank: bool = True) -> str:
+    if type(value) is not str:
+        raise ValueError(f"invalid persisted evidence {field_name}")
+    if nonblank and not value.strip():
+        raise ValueError(f"invalid persisted evidence {field_name}")
+    if len(value) > _MAX_STORED_TEXT_LENGTH or "\x00" in value:
+        raise ValueError(f"invalid persisted evidence {field_name}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"invalid persisted evidence {field_name}") from exc
+    return value
+
+
+def parse_persisted_evidence(row: Mapping[str, object]) -> EvidenceRecord:
+    rule_id = _persisted_text(row["rule_id"], "rule_id")
+    action_raw = row["action"]
+    if type(action_raw) is not str:
+        raise ValueError("invalid persisted evidence action")
+    try:
+        action = Decision(action_raw)
+    except ValueError as exc:
+        raise ValueError("invalid persisted evidence action") from exc
+    file_path_raw = row["file_path"]
+    file_path = None if file_path_raw is None else _persisted_text(file_path_raw, "file_path")
+    line = row["line"]
+    if line is not None and (type(line) is not int or not 0 < line <= 2**63 - 1):
+        raise ValueError("invalid persisted evidence line")
+    message = _persisted_text(row["message"], "message")
+    details_json = row["details_json"]
+    if type(details_json) is not str:
+        raise ValueError("invalid persisted evidence details")
+    try:
+        if len(details_json.encode("utf-8")) > _MAX_DETAILS_JSON_LENGTH:
+            raise ValueError("invalid persisted evidence details")
+        details = _snapshot_details(json.loads(details_json))
+        canonical = json.dumps(
+            details,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (UnicodeError, TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError("invalid persisted evidence details") from exc
+    if canonical != details_json:
+        raise ValueError("noncanonical persisted evidence details")
+    return EvidenceRecord(
+        rule_id=rule_id,
+        action=action,
+        file_path=file_path,
+        line=line,
+        message=message,
+        details=details,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAdminDetails:
+    summary: ArtifactAdminSummary
+    allowed: bool
+    effective_decision: Decision
+    decision_source: DecisionSource
+    policy_version: str | None
+    analyzer_version: str | None
+    baseline_sha256: str | None
+    baseline_tier: BaselineTier | None
+    releases: tuple[ReleaseArtifact, ...]
+    evidence: tuple[EvidenceRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantinePage:
+    items: tuple[ArtifactAdminSummary, ...]
+    total: int
+    limit: int
+    offset: int
 
 
 @dataclass(frozen=True, slots=True)

@@ -173,6 +173,7 @@ def seed_artifact(
     expires: datetime | None = None,
     *,
     expires_text: str | None = None,
+    cooldown_until: datetime | None = None,
 ) -> None:
     timestamp = NOW.isoformat()
     lease_values = (
@@ -186,8 +187,9 @@ def seed_artifact(
             """
             INSERT INTO artifacts(
                 sha256, size_bytes, state, discovered_at, updated_at,
-                lease_owner, lease_expires_at, lease_token, last_error
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                lease_owner, lease_expires_at, lease_token, last_error,
+                cooldown_started_at, cooldown_until
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sha256,
@@ -196,6 +198,8 @@ def seed_artifact(
                 timestamp,
                 *lease_values,
                 last_error,
+                timestamp if cooldown_until is not None else None,
+                None if cooldown_until is None else cooldown_until.isoformat(),
             ),
         )
         if automated is not None:
@@ -298,6 +302,165 @@ def test_list_allowed_releases_normalizes_project_and_returns_immutable_result(
     )
     assert isinstance(result, tuple)
     assert reader.list_allowed_releases("missing-project") == ()
+
+
+def test_reader_exposes_release_and_health_admin_apis(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+    )
+    seed_release(factory, SHA_ALLOW)
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    assert reader.get_artifact_releases(SHA_ALLOW)[0].size_bytes == 1
+    assert reader.list_release_artifacts("DEMO_PACKAGE", "1.0.0")
+    assert reader.get_artifact_details(SHA_ALLOW).summary.sha256 == SHA_ALLOW
+    assert reader.health() == {"database": "ok", "schema_version": 6}
+
+
+@pytest.mark.parametrize("corruption", ["missing-verdict", "negative-size", "cooldown-window"])
+def test_list_quarantine_fails_closed_for_corrupt_state(tmp_path, corruption) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    seed_artifact(
+        factory,
+        SHA_REVIEW,
+        ArtifactState.REVIEW,
+        automated=None if corruption == "missing-verdict" else (Decision.REVIEW, "policy-1"),
+    )
+    with closing(factory.connect()) as connection, connection:
+        if corruption == "negative-size":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute("DROP TRIGGER artifacts_identity_immutable")
+            connection.execute(
+                "UPDATE artifacts SET size_bytes = -1 WHERE sha256 = ?",
+                (SHA_REVIEW,),
+            )
+        elif corruption == "cooldown-window":
+            connection.execute("DROP TRIGGER artifacts_cooldown_update_guard")
+            connection.execute(
+                "UPDATE artifacts SET cooldown_started_at = ? WHERE sha256 = ?",
+                (NOW.isoformat(), SHA_REVIEW),
+            )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(StoreUnavailable):
+        reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=10, offset=0)
+
+
+@pytest.mark.parametrize("offset", [-1, 2**63])
+def test_list_quarantine_rejects_offset_out_of_range(tmp_path, offset) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(ValueError, match="offset"):
+        reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=10, offset=offset)
+
+
+def test_quarantine_pagination_order_and_artifact_details_include_evidence(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    shas = ["d" * 64, "e" * 64, "f" * 64]
+    for sha256 in shas:
+        seed_artifact(
+            factory,
+            sha256,
+            ArtifactState.REVIEW,
+            automated=(Decision.REVIEW, "policy-1"),
+        )
+    with closing(factory.connect()) as connection, connection:
+        verdict_id = connection.execute(
+            "SELECT id FROM verdicts WHERE sha256 = ?",
+            (shas[0],),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO evidence(
+                verdict_id, rule_id, action, file_path, line, message, details_json
+            ) VALUES (?, 'rule-1', 'REVIEW', 'pkg/mod.py', 4, 'review', '{}')
+            """,
+            (verdict_id,),
+        )
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    page = reader.list_quarantine(states=(ArtifactState.REVIEW,), limit=1, offset=1)
+
+    assert page.total == 3
+    assert page.limit == 1
+    assert page.offset == 1
+    assert [item.sha256 for item in page.items] == [shas[1]]
+    details = reader.get_artifact_details(shas[0])
+    assert details.summary.state is ArtifactState.REVIEW
+    assert details.evidence[0].rule_id == "rule-1"
+    assert details.evidence[0].message == "review"
+    with pytest.raises(TypeError):
+        details.evidence[0].details["mutated"] = True
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "blank-rule",
+        "blank-message",
+        "invalid-line",
+        "non-object",
+        "oversized",
+        "noncanonical",
+        "malformed-nested",
+    ],
+)
+def test_artifact_details_rejects_semantically_invalid_evidence(tmp_path, corruption) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    sha256 = "9" * 64
+    seed_artifact(
+        factory,
+        sha256,
+        ArtifactState.REVIEW,
+        automated=(Decision.REVIEW, "policy-1"),
+    )
+    details_json = "{}"
+    rule_id = "rule-1"
+    message = "message"
+    line = 1
+    if corruption == "blank-rule":
+        rule_id = ""
+    elif corruption == "blank-message":
+        message = ""
+    elif corruption == "invalid-line":
+        line = 0
+    elif corruption == "non-object":
+        details_json = "[]"
+    elif corruption == "oversized":
+        details_json = '{"value":"' + ("x" * (1024 * 1024)) + '"}'
+    elif corruption == "noncanonical":
+        details_json = '{ "value": 1 }'
+    elif corruption == "malformed-nested":
+        details_json = '{"nested":{"value":1,"value":2}}'
+    with closing(factory.connect()) as connection, connection:
+        if corruption == "invalid-line":
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+        verdict_id = connection.execute(
+            "SELECT id FROM verdicts WHERE sha256 = ?",
+            (sha256,),
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO evidence(
+                verdict_id, rule_id, action, file_path, line, message, details_json
+            ) VALUES (?, ?, 'REVIEW', 'pkg/mod.py', ?, ?, ?)
+            """,
+            (verdict_id, rule_id, line, message, details_json),
+        )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+    with pytest.raises(StoreUnavailable):
+        reader.get_artifact_details(sha256)
 
 
 def test_list_allowed_releases_returns_all_mappings_in_deterministic_order(
@@ -990,6 +1153,66 @@ def test_manual_allow_over_review_is_effective(tmp_path) -> None:
     assert result.artifact_state is ArtifactState.REVIEW
 
 
+def test_manual_allow_bypasses_automated_cooldown_but_automated_allow_does_not(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    cooldown = NOW + timedelta(hours=1)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        manual=Decision.ALLOW,
+        cooldown_until=cooldown,
+    )
+    automated_sha = "d" * 64
+    seed_artifact(
+        factory,
+        automated_sha,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        cooldown_until=cooldown,
+    )
+
+    reader = SQLiteVerdictReader(factory, now=lambda: NOW)
+
+    manual = reader.get_effective_decision(SHA_ALLOW)
+    automated = reader.get_effective_decision(automated_sha)
+
+    assert manual.allowed is True
+    assert manual.source is DecisionSource.MANUAL_OVERRIDE
+    assert manual.reason is None
+    assert automated.allowed is False
+    assert automated.source is DecisionSource.AUTOMATED
+    assert automated.reason == "automated_allow_cooldown"
+
+
+def test_expired_manual_allow_resumes_automated_allow_cooldown_reason(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    migrate(factory)
+    cooldown = NOW + timedelta(hours=1)
+    seed_artifact(
+        factory,
+        SHA_ALLOW,
+        ArtifactState.ALLOW,
+        automated=(Decision.ALLOW, "policy-1"),
+        manual=Decision.ALLOW,
+        expires=NOW + timedelta(minutes=1),
+        cooldown_until=cooldown,
+    )
+
+    reader = SQLiteVerdictReader(
+        factory,
+        now=lambda: NOW + timedelta(minutes=2),
+    )
+    result = reader.get_effective_decision(SHA_ALLOW)
+
+    assert result.allowed is False
+    assert result.effective_decision is Decision.ALLOW
+    assert result.source is DecisionSource.AUTOMATED
+    assert result.reason == "automated_allow_cooldown"
+
+
 def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
     migrate(factory)
@@ -1012,6 +1235,7 @@ def test_expired_manual_allow_falls_back_to_automated_review(tmp_path) -> None:
     assert result.effective_decision is Decision.DENY
     assert result.source is DecisionSource.AUTOMATED
     assert result.artifact_state is ArtifactState.REVIEW
+    assert result.reason is None
 
 
 def test_missing_and_batch_results_are_fail_closed(tmp_path) -> None:

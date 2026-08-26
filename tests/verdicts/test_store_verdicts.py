@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from collections.abc import Iterator
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from devpi_guardian.admin.views import _response
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
 from devpi_guardian.verdicts.errors import (
     ArtifactNotFound,
@@ -84,11 +86,29 @@ def unchecked_verdict(**changes: Any) -> VerdictInput:
         "baseline_sha256": valid.baseline_sha256,
         "baseline_tier": valid.baseline_tier,
         "created_at": valid.created_at,
+        "cooldown_until": valid.cooldown_until,
     }
     values.update(changes)
     value = object.__new__(VerdictInput)
     for field_name, field_value in values.items():
         object.__setattr__(value, field_name, field_value)
+    return value
+
+
+def unchecked_verdict_without_cooldown_slot() -> VerdictInput:
+    valid = verdict()
+    value = object.__new__(VerdictInput)
+    for field_name in (
+        "sha256",
+        "decision",
+        "score",
+        "policy_version",
+        "analyzer_version",
+        "baseline_sha256",
+        "baseline_tier",
+        "created_at",
+    ):
+        object.__setattr__(value, field_name, getattr(valid, field_name))
     return value
 
 
@@ -202,7 +222,16 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
     store.record_verdict(
         claim,
         verdict(created_at=created_at),
-        [evidence(details={"z": [2, 1], "a": {"enabled": True}})],
+        [
+            evidence(
+                details={
+                    "z": [2, 1],
+                    "a": {"enabled": True},
+                    "sha256": {"value": "https://user:secret@example.invalid/a.whl"},
+                    "baseline_sha256": ["https://user:secret@example.invalid/a.whl"],
+                }
+            )
+        ],
     )
 
     artifact_row = fetchall(
@@ -253,7 +282,31 @@ def test_record_verdict_persists_current_verdict_evidence_and_terminal_state(
         "demo/client.py",
         12,
         "new outbound request",
-        '{"a":{"enabled":true},"z":[2,1]}',
+        '{"a":{"enabled":true},"baseline_sha256":["[URL]"],"sha256":{"value":"[URL]"},"z":[2,1]}',
+    )
+
+
+def test_record_allow_verdict_persists_cooldown_window(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    cooldown_until = NOW + timedelta(hours=24)
+
+    store.record_verdict(
+        claim,
+        verdict(decision=Decision.ALLOW, cooldown_until=cooldown_until),
+        (),
+    )
+
+    row = fetchall(
+        store,
+        "SELECT state, cooldown_started_at, cooldown_until FROM artifacts",
+    )[0]
+    assert tuple(row) == (
+        ArtifactState.ALLOW.value,
+        NOW.isoformat(),
+        cooldown_until.isoformat(),
     )
 
 
@@ -789,6 +842,25 @@ def test_record_verdict_requires_exact_verdict_dto_before_connecting(
         store.record_verdict(claim_input(), object(), ())
 
 
+def test_record_verdict_rejects_forged_dto_missing_cooldown_slot(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+
+    with pytest.raises(ValueError, match="VerdictInput missing required fields"):
+        store.record_verdict(
+            claim_input(),
+            unchecked_verdict_without_cooldown_slot(),
+            (),
+        )
+
+    assert audit_writer.events == []
+
+
 @pytest.mark.parametrize("bad_evidence", [None, "text", b"bytes", 123])
 def test_record_verdict_rejects_non_sequence_evidence_before_connecting(
     tmp_path,
@@ -872,6 +944,105 @@ def test_record_verdict_validates_mutated_evidence_before_connecting(
             verdict(),
             [unchecked_evidence(**changes)],
         )
+
+
+def test_record_verdict_rejects_cyclic_evidence_details_before_connecting(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+    details: dict[str, Any] = {}
+    details["cycle"] = details
+
+    with pytest.raises(ValueError, match="details"):
+        store.record_verdict(
+            claim_input(),
+            verdict(),
+            [unchecked_evidence(details=details)],
+        )
+
+
+def test_record_verdict_rejects_cycle_below_diagnostic_evidence_key_before_connecting(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store = SQLiteArtifactStore(
+        NeverConnectFactory(tmp_path / "never.db"),
+        audit_writer,
+    )
+    details: dict[str, Any] = {}
+    cycle: dict[str, Any] = {}
+    cycle["self"] = cycle
+    details["message"] = cycle
+
+    with pytest.raises(ValueError, match="details"):
+        store.record_verdict(
+            claim_input(),
+            verdict(),
+            [unchecked_evidence(details=details)],
+        )
+
+
+def test_record_verdict_redacts_nested_credential_fields_at_persistence_boundary(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    digest = "a" * 64
+
+    store.record_verdict(
+        claim,
+        verdict(),
+        [
+            evidence(
+                details={
+                    "message": {
+                        "client_secret": "nested-secret",
+                        "sha256": digest,
+                    }
+                }
+            )
+        ],
+    )
+
+    details_json = fetchall(store, "SELECT details_json FROM evidence")[0][0]
+
+    assert details_json == (f'{{"message":{{"client_secret":"[REDACTED]","sha256":"{digest}"}}}}')
+
+
+def test_record_verdict_redacts_entire_evidence_details_at_persistence_boundary(
+    tmp_path,
+    audit_writer,
+) -> None:
+    store, claim = prepare_scanning(tmp_path, audit_writer)
+    digest = "a" * 64
+    store.record_verdict(
+        claim,
+        verdict(),
+        [
+            evidence(
+                details={
+                    "path": "/Users/alice/My Secret/file.whl",
+                    "url": "https://user:secret@example.invalid/a?token=query-secret",
+                    "exception": "failed https://user:secret@example.invalid/a",
+                    "sha256": digest,
+                }
+            )
+        ],
+    )
+
+    details_json = fetchall(store, "SELECT details_json FROM evidence")[0][0]
+    details = json.loads(details_json)
+
+    assert details == {
+        "exception": "failed [URL]",
+        "path": "[PATH]",
+        "sha256": digest,
+        "url": "[URL]",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1055,7 +1226,17 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     audit_writer,
 ) -> None:
     store, claim = prepare_scanning(tmp_path, audit_writer)
-    raw_error = "line one\nline two\x00\t" + "x" * 5000 + "TAIL-SECRET"
+    raw_error = (
+        "RuntimeError: origin=https://user:secret@example.invalid/pkg?token=query-secret "
+        "credential=/Users/alice/private/file.whl "
+        "X-Devpi-Auth: dXNlcjpzZWNyZXQ= Authorization: Bearer bearer-secret "
+        "Authorization: Basic dXNlcjpwYXNz auth_token=secret-token "
+        "client_secret=client-secret C:/Users/alice/private/file.whl sha256="
+        + "a" * 64
+        + "\nline two\x00\t"
+        + "x" * 5000
+        + "TAIL-SECRET"
+    )
 
     store.mark_analysis_error(claim, raw_error)
 
@@ -1078,6 +1259,25 @@ def test_analysis_error_is_terminal_sanitized_and_audited(
     assert "\x00" not in row["last_error"]
     assert "\t" not in row["last_error"]
     assert "TAIL-SECRET" not in row["last_error"]
+    assert "secret@example.invalid" not in row["last_error"]
+    assert "query-secret" not in row["last_error"]
+    assert "/Users/alice/private/file.whl" not in row["last_error"]
+    assert "dXNlcjpzZWNyZXQ=" not in row["last_error"]
+    assert "bearer-secret" not in row["last_error"]
+    assert "dXNlcjpwYXNz" not in row["last_error"]
+    assert "secret-token" not in row["last_error"]
+    assert "client-secret" not in row["last_error"]
+    assert "C:/Users/alice/private/file.whl" not in row["last_error"]
+    assert "a" * 64 not in row["last_error"]
+
+    response = _response({"artifact": {"last_error": row["last_error"]}})
+    serialized = response.json_body["artifact"]["last_error"]
+    assert "dXNlcjpzZWNyZXQ=" not in serialized
+    assert "bearer-secret" not in serialized
+    assert "dXNlcjpwYXNz" not in serialized
+    assert "secret-token" not in serialized
+    assert "client-secret" not in serialized
+    assert "C:/Users/alice/private/file.whl" not in serialized
     assert len(audit_writer.events) == 1
     event = audit_writer.events[0]
     assert (

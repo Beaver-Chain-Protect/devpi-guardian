@@ -7,12 +7,16 @@ from typing import Protocol
 
 from .models import (
     AllowedRelease,
+    ArtifactAdminDetails,
     ArtifactInput,
+    ArtifactState,
     AuditEventInput,
     ClaimedArtifact,
     EnforcementDecision,
     EvidenceInput,
     ManualOverrideInput,
+    QuarantinePage,
+    ReleaseArtifact,
     ReleaseInput,
     VerdictInput,
 )
@@ -29,6 +33,26 @@ class VerdictReader(Protocol):
         self,
         project: str,
     ) -> tuple[AllowedRelease, ...]: ...
+
+    def get_artifact_releases(self, sha256: str) -> tuple[ReleaseArtifact, ...]: ...
+
+    def list_release_artifacts(
+        self,
+        project: str,
+        version: str,
+    ) -> tuple[ReleaseArtifact, ...]: ...
+
+    def list_quarantine(
+        self,
+        *,
+        states: tuple[ArtifactState, ...],
+        limit: int,
+        offset: int,
+    ) -> QuarantinePage: ...
+
+    def get_artifact_details(self, sha256: str) -> ArtifactAdminDetails: ...
+
+    def health(self) -> dict[str, object]: ...
 
 
 class AuditWriter(Protocol):
@@ -72,6 +96,15 @@ class ArtifactStore(Protocol):
     def revoke_manual_override(
         self,
         sha256: str,
+        actor: str,
+        reason: str,
+    ) -> None: ...
+
+    def set_baseline_eligibility(
+        self,
+        sha256: str,
+        *,
+        enabled: bool,
         actor: str,
         reason: str,
     ) -> None: ...

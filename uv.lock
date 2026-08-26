@@ -433,6 +433,7 @@ version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "devpi-server" },
+    { name = "requests" },
 ]
 
 [package.optional-dependencies]
@@ -454,6 +455,7 @@ requires-dist = [
     { name = "flake8", marker = "extra == 'test'", specifier = ">=7,<9" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
     { name = "pytest-devpi-server", marker = "extra == 'test'", specifier = "==1.8.0" },
+    { name = "requests", specifier = ">=2.32,<3" },
     { name = "ruff", marker = "extra == 'test'", specifier = ">=0.12,<1" },
     { name = "webtest", marker = "extra == 'test'", specifier = ">=3,<4" },
 ]

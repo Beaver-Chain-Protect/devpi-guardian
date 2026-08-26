@@ -155,6 +155,7 @@ class RunningDevpi:
     allowed_test_root: Path
     mirror_artifact: MirrorArtifact | None = None
     mirror_upstream_requests: list[str] | None = None
+    mirror_worker_artifact: MirrorArtifact | None = None
     _server: _ServerProcess | None = field(default=None, repr=False)
     _log_dir: Path | None = field(default=None, repr=False)
     _offline: bool = field(default=True, repr=False)
@@ -237,6 +238,51 @@ class RunningDevpi:
         self.api("login", "root", "--password=")
         self.api("use", "root/dev")
 
+    def materialize_cached_mirror_entry(
+        self,
+        direct_path: str,
+        *,
+        upstream_url: str,
+        sha256: str,
+    ) -> None:
+        """Commit a real hashless mirror entry through devpi's KeyFS cache API."""
+        server = self._server
+        log_dir = self._log_dir
+        if server is None or log_dir is None:
+            raise RuntimeError("devpi-server lifecycle is unavailable")
+        _terminate(server)
+        self._server = None
+        try:
+            helper_environment = _loopback_environment()
+            helper_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+            _run(
+                [
+                    sys.executable,
+                    "-m",
+                    "tests.integration.devpi_cache_entry",
+                    str(self.server_dir),
+                    direct_path,
+                    upstream_url,
+                    sha256,
+                ],
+                cwd=self.server_dir.parent,
+                env=helper_environment,
+            )
+        finally:
+            restarted = _start_server(
+                self.server_dir,
+                self.guardian_db,
+                log_dir,
+                offline=self._offline,
+                preferred_port=server.port,
+                log_label="cache-entry-restart",
+            )
+            self._server = restarted
+            self.base_url = restarted.base_url
+            self.api("use", restarted.base_url)
+            self.api("login", "root", "--password=")
+            self.api("use", "root/pypi")
+
     def close(self) -> None:
         """Stop the current process and verify that its port is released."""
         if self._server is None:
@@ -311,6 +357,7 @@ class _QuietFileHandler(SimpleHTTPRequestHandler):
 class _LocalUpstream:
     base_url: str
     artifact: MirrorArtifact
+    worker_artifact: MirrorArtifact
     requests: list[str]
 
 
@@ -402,6 +449,9 @@ def _start_server(
     preferred_port: int | None = None,
     log_label: str = "initial",
 ) -> _ServerProcess:
+    quarantine_root = server_dir.parent / f".{server_dir.name}-guardian-quarantine"
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(quarantine_root, 0o700)
     for attempt in range(1, _START_ATTEMPTS + 1):
         port = preferred_port if preferred_port is not None else _free_port()
         base_url = f"http://{_HOST}:{port}"
@@ -424,7 +474,16 @@ def _start_server(
         ]
         if offline:
             args.append("--offline-mode")
-        args.extend(("--guardian-db", str(guardian_db)))
+        args.extend(
+            (
+                "--guardian-db",
+                str(guardian_db),
+                "--guardian-quarantine-root",
+                str(quarantine_root),
+                "--guardian-base-url",
+                base_url,
+            )
+        )
         environment = _loopback_environment()
         environment["PYTHONUNBUFFERED"] = "1"
         with log_path.open("wb") as log:
@@ -501,11 +560,11 @@ def _write_mirror_wheel(root: Path) -> MirrorArtifact:
         f'<!doctype html><a href="../../packages/{filename}">{filename}</a>\n',
         encoding="utf-8",
     )
+    content = wheel.read_bytes()
     (root / "simple" / "index.html").write_text(
         f'<!doctype html><a href="{project}/">{project}</a>\n',
         encoding="utf-8",
     )
-    content = wheel.read_bytes()
     return MirrorArtifact(
         "",
         filename,
@@ -516,10 +575,44 @@ def _write_mirror_wheel(root: Path) -> MirrorArtifact:
     )
 
 
+def _write_hashed_mirror_wheel(root: Path) -> MirrorArtifact:
+    project = "mirror-worker"
+    version = "1.0.0"
+    filename = "mirror_worker-1.0.0-py3-none-any.whl"
+    wheel = root / "packages" / filename
+    dist_info = "mirror_worker-1.0.0.dist-info"
+    metadata = "Metadata-Version: 2.1\nName: mirror-worker\nVersion: 1.0.0\n"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("mirror_worker/__init__.py", '__version__ = "1.0.0"\n')
+        archive.writestr(f"{dist_info}/METADATA", metadata)
+        archive.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: guardian-integration\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{dist_info}/RECORD", "")
+    content = wheel.read_bytes()
+    sha256 = hashlib.sha256(content).hexdigest()
+    simple = root / "simple" / project / "index.html"
+    simple.parent.mkdir(parents=True, exist_ok=True)
+    simple.write_text(
+        f'<!doctype html><a href="../../packages/{filename}#sha256={sha256}">{filename}</a>\n',
+        encoding="utf-8",
+    )
+    root_index = root / "simple" / "index.html"
+    root_index.write_text(
+        root_index.read_text(encoding="utf-8")
+        + f'<!doctype html><a href="{project}/">{project}</a>\n',
+        encoding="utf-8",
+    )
+    return MirrorArtifact("", filename, project, version, sha256, content)
+
+
 @pytest.fixture
 def local_upstream(tmp_path: Path) -> _LocalUpstream:
     root = tmp_path / "upstream"
     artifact = _write_mirror_wheel(root)
+    worker_artifact = _write_hashed_mirror_wheel(root)
     requests: list[str] = []
 
     class TrackingFileHandler(_QuietFileHandler):
@@ -540,7 +633,7 @@ def local_upstream(tmp_path: Path) -> _LocalUpstream:
     )
     thread.start()
     try:
-        yield _LocalUpstream(f"http://{_HOST}:{port}", artifact, requests)
+        yield _LocalUpstream(f"http://{_HOST}:{port}", artifact, worker_artifact, requests)
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -618,6 +711,13 @@ def running_mirror_devpi(
             f"mirror_url={local_upstream.base_url}/simple/",
             "mirror_cache_expiry=0",
         )
+        client.api(
+            "index",
+            "-c",
+            "root/guardian",
+            "type=guardian",
+            "bases=root/pypi",
+        )
         simple_path = f"/root/pypi/+simple/{local_upstream.artifact.project}/"
         simple = client.request(simple_path)
         if simple.status != 200:
@@ -655,6 +755,28 @@ def running_mirror_devpi(
             local_upstream.artifact.sha256,
             local_upstream.artifact.content,
         )
+        worker_simple_path = f"/root/pypi/+simple/{local_upstream.worker_artifact.project}/"
+        worker_simple = client.request(worker_simple_path)
+        if worker_simple.status != 200:
+            raise RuntimeError(f"local worker metadata returned HTTP {worker_simple.status}")
+        worker_parser = _FirstLink()
+        worker_parser.feed(worker_simple.body.decode("utf-8"))
+        if worker_parser.href is None:
+            raise RuntimeError("local worker metadata lacked a release link")
+        worker_url = urllib.parse.urljoin(
+            urllib.parse.urljoin(protected.base_url, worker_simple_path), worker_parser.href
+        )
+        worker_parsed = urllib.parse.urlsplit(worker_url)
+        worker_artifact = MirrorArtifact(
+            urllib.parse.urlunsplit(
+                ("", "", worker_parsed.path, worker_parsed.query, worker_parsed.fragment)
+            ),
+            local_upstream.worker_artifact.filename,
+            local_upstream.worker_artifact.project,
+            local_upstream.worker_artifact.version,
+            local_upstream.worker_artifact.sha256,
+            local_upstream.worker_artifact.content,
+        )
 
         running = RunningDevpi(
             protected.base_url,
@@ -665,6 +787,7 @@ def running_mirror_devpi(
             tmp_path,
             mirror_artifact,
             local_upstream.requests,
+            worker_artifact,
             _server=protected,
             _log_dir=log_dir,
             _offline=False,

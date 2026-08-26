@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "devpi-server==6.20.3",
+  "requests>=2.32,<3",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,9 @@ test = [
 
 [project.entry-points.devpi_server]
 guardian = "devpi_guardian.plugin"
+
+[project.scripts]
+guardian = "devpi_guardian.admin.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

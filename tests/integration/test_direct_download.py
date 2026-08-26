@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -184,6 +185,37 @@ def _discover(
             direct_url,
             now,
         ),
+    )
+
+
+def _wait_for_terminal_artifact(
+    reader: SQLiteVerdictReader,
+    sha256: str,
+    *,
+    timeout: float = 10.0,
+):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            details = reader.get_artifact_details(sha256)
+        except Exception:
+            time.sleep(0.05)
+            continue
+        if details.summary.state not in (ArtifactState.DISCOVERED, ArtifactState.SCANNING):
+            return details
+        time.sleep(0.05)
+    raise AssertionError(f"worker did not reach a terminal state for {sha256}")
+
+
+def _manual_allow(store: SQLiteArtifactStore, sha256: str, reason: str) -> None:
+    store.set_manual_override(
+        ManualOverrideInput(
+            sha256,
+            Decision.ALLOW,
+            "integration-admin",
+            reason,
+            datetime.now(UTC),
+        )
     )
 
 
@@ -462,14 +494,8 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
         ConnectionFactory(running_devpi.guardian_db),
         RecordingAuditWriter(),
     )
-    _discover(
-        store,
-        sha256=sha256,
-        content=content,
-        version="1.0.0",
-        filename=wheel.name,
-        direct_url=direct_url,
-    )
+    reader = SQLiteVerdictReader(ConnectionFactory(running_devpi.guardian_db))
+    _wait_for_terminal_artifact(reader, sha256)
     _assert_blocked(
         running_devpi,
         direct_url,
@@ -478,32 +504,12 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
         sha256=sha256,
     )
 
-    claim = store.claim_next(
-        "integration-scanning-worker",
-        datetime.now(UTC) + timedelta(minutes=5),
-    )
-    assert claim is not None
-    _assert_blocked(
-        running_devpi,
-        direct_url,
-        artifact_content=content,
-        metadata_content=metadata_content,
-        sha256=sha256,
-    )
-    store.record_verdict(
-        claim,
-        VerdictInput(
-            sha256,
-            Decision.REVIEW,
-            1,
-            "policy-integration-1",
-            "analyzer-integration-1",
-            None,
-            None,
-            datetime.now(UTC),
-        ),
-        [],
-    )
+    _manual_allow(store, sha256, "explicit integration approval")
+    allowed = running_devpi.request(direct_url)
+    assert allowed.status == 200
+    assert allowed.body == content
+
+    store.revoke_manual_override(sha256, "integration-admin", "exercise live revocation")
     _assert_blocked(
         running_devpi,
         direct_url,
@@ -513,7 +519,8 @@ def test_private_direct_url_follows_live_verdicts_without_a_decision_cache(
     )
 
     store.request_rescan(sha256, "integration-admin", "approve after rescan")
-    _record_verdict(store, sha256, Decision.ALLOW)
+    _wait_for_terminal_artifact(reader, sha256)
+    _manual_allow(store, sha256, "approve after rescan")
 
     allowed = running_devpi.request(direct_url)
     assert allowed.status == 200
@@ -673,24 +680,8 @@ dependencies = ["demo-guardian @ {direct_url}"]
         sha256=sha256_v2,
     )
 
-    _discover(
-        store,
-        sha256=sha256_v2,
-        content=content_v2,
-        version="2.0.0",
-        filename=wheel_v2.name,
-        direct_url=direct_url_v2,
-    )
-    _record_verdict(store, sha256_v2, Decision.REVIEW)
-    store.set_manual_override(
-        ManualOverrideInput(
-            sha256_v2,
-            Decision.ALLOW,
-            "integration-admin",
-            "temporary review approval",
-            datetime.now(UTC),
-        )
-    )
+    _wait_for_terminal_artifact(reader, sha256_v2)
+    _manual_allow(store, sha256_v2, "temporary review approval")
     assert running_devpi.request(direct_url_v2).body == content_v2
     store.revoke_manual_override(
         sha256_v2,
@@ -741,6 +732,7 @@ dependencies = ["demo-guardian @ {direct_url}"]
     )
     assert running_devpi.request(direct_url).body == content
     store.request_rescan(sha256, "integration-admin", "new policy version")
+    _wait_for_terminal_artifact(reader, sha256)
     _assert_blocked(
         running_devpi,
         direct_url,

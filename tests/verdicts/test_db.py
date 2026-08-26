@@ -119,10 +119,20 @@ def test_migrate_creates_schema_and_is_idempotent(tmp_path) -> None:
         "manual_overrides_history_delete_guard",
         "guardian_activation_immutable_update_guard",
         "guardian_activation_immutable_delete_guard",
+        "artifacts_cooldown_pair_insert_guard",
+        "artifacts_cooldown_update_guard",
+        "audit_events_chain_insert_guard",
+        "audit_events_update_guard",
+        "audit_events_delete_guard",
+        "baseline_overrides_history_update_guard",
+        "baseline_overrides_history_delete_guard",
+        "baseline_overrides_history_insert_guard",
+        "audit_events_history_insert_guard",
     }
     assert expected_tables <= tables
     assert triggers == expected_triggers
-    assert version == 3
+    assert version == 6
+    assert {"guardian_activation", "audit_events", "baseline_overrides"} <= tables
 
 
 def test_guardian_activation_row_is_immutable(tmp_path) -> None:
@@ -145,6 +155,91 @@ def test_guardian_activation_row_is_immutable(tmp_path) -> None:
             )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("DELETE FROM guardian_activation")
+
+
+def test_replace_cannot_bypass_baseline_or_audit_history_guards(tmp_path) -> None:
+    path = tmp_path / "guardian.db"
+    factory = ConnectionFactory(path)
+    migrate(factory)
+    sha256 = "a" * 64
+    timestamp = "2026-08-24T00:00:00+00:00"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "INSERT INTO artifacts(sha256, size_bytes, state, discovered_at, updated_at) "
+            "VALUES (?, 1, 'ALLOW', ?, ?)",
+            (sha256, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO baseline_overrides "
+            "(id, sha256, enabled, actor, reason, created_at, is_current) "
+            "VALUES (1, ?, 1, 'admin', 'original', ?, 1)",
+            (sha256, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO audit_events "
+            "(id, event_version, canonicalization_version, occurred_at, actor, action, "
+            "sha256, previous_decision, new_decision, reason, policy_version, "
+            "analyzer_version, previous_hash, event_hash) "
+            "VALUES (1, 1, 1, ?, 'admin', 'seed', ?, 'DENY', 'ALLOW', 'original', "
+            "NULL, NULL, ?, ?)",
+            (timestamp, sha256, "0" * 64, "f" * 64),
+        )
+        connection.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT OR REPLACE INTO baseline_overrides "
+                "(id, sha256, enabled, actor, reason, created_at, is_current) "
+                "VALUES (1, ?, 0, 'attacker', 'replaced', ?, 1)",
+                (sha256, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT OR REPLACE INTO audit_events "
+                "(id, event_version, canonicalization_version, occurred_at, actor, action, "
+                "sha256, previous_decision, new_decision, reason, policy_version, "
+                "analyzer_version, previous_hash, event_hash) "
+                "VALUES (1, 1, 1, ?, 'attacker', 'replace', ?, 'DENY', 'ALLOW', "
+                "'replaced', NULL, NULL, ?, ?)",
+                (timestamp, sha256, "0" * 64, "f" * 64),
+            )
+        baseline = connection.execute(
+            "SELECT actor, reason FROM baseline_overrides WHERE id = 1"
+        ).fetchone()
+        audit = connection.execute("SELECT actor, reason FROM audit_events WHERE id = 1").fetchone()
+    assert tuple(baseline) == ("admin", "original")
+    assert tuple(audit) == ("admin", "original")
+
+
+def test_migrate_applied_v3_preserves_guardian_activation_row(tmp_path) -> None:
+    factory = ConnectionFactory(tmp_path / "guardian.db")
+    with closing(sqlite3.connect(factory.path)) as connection, connection:
+        connection.executescript(
+            "\n".join(_packaged_migration_sql(version) for version in (1, 2, 3))
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((version, "2026-08-24T00:00:00+00:00") for version in (1, 2, 3)),
+        )
+        connection.execute(
+            """
+            INSERT INTO guardian_activation(
+                singleton, devpi_uuid, activated_at, activation_version
+            ) VALUES (1, 'v3-uuid', '2026-08-24T00:00:00+00:00', 1)
+            """
+        )
+
+    migrate(factory)
+
+    with closing(factory.connect()) as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        activation = connection.execute(
+            "SELECT singleton, devpi_uuid, activated_at, activation_version "
+            "FROM guardian_activation"
+        ).fetchone()
+    assert [row[0] for row in versions] == [1, 2, 3, 4, 5, 6]
+    assert tuple(activation) == (1, "v3-uuid", "2026-08-24T00:00:00+00:00", 1)
 
 
 def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
@@ -189,7 +284,7 @@ def test_migrate_v3_failure_rolls_back_and_retry_succeeds(
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version",
         ).fetchall()
-    assert [version[0] for version in versions] == [1, 2, 3]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5, 6]
 
 
 def test_migrate_close_failure_does_not_mask_primary_migration_error(
@@ -539,7 +634,7 @@ def test_migrate_rejects_v1_without_schema(tmp_path) -> None:
 
 def test_migrate_rejects_future_schema_version(tmp_path) -> None:
     factory = ConnectionFactory(tmp_path / "guardian.db")
-    _seed_schema_version(factory.path, 4)
+    _seed_schema_version(factory.path, 7)
 
     with pytest.raises(MigrationError):
         migrate(factory)
@@ -585,6 +680,9 @@ def _packaged_migration_sql(version: int = 1) -> str:
         1: "001_initial.sql",
         2: "002_baseline_tier.sql",
         3: "003_guardian_activation.sql",
+        4: "004_artifact_cooldown.sql",
+        5: "005_audit_events.sql",
+        6: "006_baseline_overrides.sql",
     }
     return (
         db.resources.files("devpi_guardian.verdicts.sql")
@@ -758,7 +856,7 @@ def test_migrate_v2_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2, 3]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5, 6]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -809,7 +907,7 @@ def test_migrate_v2_catalog_validation_failure_rolls_back_and_retry_succeeds(
             query,
             (subject_sha256,),
         ).fetchone()
-    assert [version[0] for version in versions] == [1, 2, 3]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5, 6]
     assert tuple(row) == (baseline_sha256, None)
 
 
@@ -874,7 +972,7 @@ def test_migrate_upgrades_v1_and_preserves_unclassified_legacy_baseline(
             "SELECT baseline_sha256, baseline_tier FROM verdicts",
         ).fetchone()
 
-    assert [version[0] for version in versions] == [1, 2, 3]
+    assert [version[0] for version in versions] == [1, 2, 3, 4, 5, 6]
     assert tuple(row) == ("b" * 64, None)
 
 

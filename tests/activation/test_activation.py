@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,425 @@ from devpi_guardian.activation import (
     ensure_guardian_activation,
 )
 from devpi_guardian.verdicts.db import ConnectionFactory, migrate
+
+
+def _unrelated_plugin_view(_context, _request):
+    return "unrelated"
+
+
+def _unrelated_plugin_tween_factory(handler, _registry):
+    return handler
+
+
+def _plugin_config(tmp_path, *, quarantine_root=None):
+    args = SimpleNamespace(
+        guardian_db=str(tmp_path / "guardian.db"),
+        guardian_quarantine_root=None if quarantine_root is None else str(quarantine_root),
+        guardian_base_url="http://127.0.0.1:3141",
+        guardian_cooldown_hours=24.0,
+        guardian_worker_poll_interval=0.25,
+    )
+    return SimpleNamespace(
+        args=args,
+        server_path=str(tmp_path / "server"),
+        nodeinfo={"uuid": "plugin-test"},
+    )
+
+
+def test_primary_rejects_missing_quarantine_before_migration_or_publication(tmp_path, monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal, match="quarantine root"):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    assert xom.thread_pool.registered == []
+    assert plugin.VERDICT_READER_REGISTRY_KEY not in pyramid.registry
+    assert pyramid.tweens == []
+
+
+@pytest.mark.parametrize("kind", ["relative", "contained", "symlink", "mode", "owner"])
+def test_primary_rejects_unsafe_quarantine_roots_before_migration(tmp_path, monkeypatch, kind):
+    import os
+
+    import devpi_guardian.plugin as plugin
+
+    server = tmp_path / "server"
+    server.mkdir()
+    target = tmp_path / "quarantine-target"
+    target.mkdir()
+    target.chmod(0o700)
+    if kind == "relative":
+        root = Path("relative-quarantine")
+    elif kind == "contained":
+        root = server / "quarantine"
+        root.mkdir()
+        root.chmod(0o700)
+    elif kind == "symlink":
+        root = tmp_path / "quarantine-link"
+        root.symlink_to(target, target_is_directory=True)
+    else:
+        root = target
+        if kind == "mode":
+            root.chmod(0o755)
+        elif kind == "owner":
+            owner_uid = os.geteuid()
+            monkeypatch.setattr(plugin.os, "geteuid", lambda: owner_uid + 1)
+
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    config.server_path = str(server)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    assert xom.thread_pool.registered == []
+    assert pyramid.registry == {"xom": xom}
+    assert pyramid.tweens == []
+
+
+def test_primary_rejects_unsafe_quarantine_parent_before_migration(tmp_path, monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    server = tmp_path / "server"
+    server.mkdir()
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o777)
+    root = parent / "quarantine"
+    root.mkdir(mode=0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(registered=[]))
+    pyramid = SimpleNamespace(registry={"xom": xom}, tweens=[])
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    config.server_path = str(server)
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: pytest.fail("migration must not run"))
+
+    with pytest.raises(plugin.Fatal, match=r"parent|unsafe|mode"):
+        plugin.devpiserver_pyramid_configure(config, pyramid)
+
+
+def test_upload_hook_replica_is_noop_but_primary_requires_connector():
+    import devpi_guardian.plugin as plugin
+
+    replica = SimpleNamespace(is_replica=lambda: True)
+    plugin.devpiserver_on_upload(SimpleNamespace(xom=replica), "demo", "1.0", object())
+
+    primary = SimpleNamespace(is_replica=lambda: False)
+    with pytest.raises(RuntimeError, match="connector"):
+        plugin.devpiserver_on_upload(SimpleNamespace(xom=primary), "demo", "1.0", object())
+
+
+def test_upload_hook_forwards_exact_arguments():
+    import devpi_guardian.plugin as plugin
+
+    calls = []
+
+    class Connector:
+        def capture(self, **kwargs):
+            calls.append(kwargs)
+
+    xom = SimpleNamespace(is_replica=lambda: False)
+    xom._devpi_guardian_upload_connector = Connector()
+    stage = SimpleNamespace(xom=xom)
+    link = object()
+    plugin.devpiserver_on_upload(stage, "demo", "1.0", link)
+
+    assert calls == [{"stage": stage, "project": "demo", "version": "1.0", "link": link}]
+
+
+def test_publish_failure_rolls_back_registry_xom_and_thread_registration(monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    class Pool:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, worker):
+            self.registered.append(worker)
+
+    pool = Pool()
+    xom = SimpleNamespace(thread_pool=pool)
+    registry = {}
+    pyramid = SimpleNamespace(registry=registry, routes=[], views=[], tweens=[])
+    worker = object()
+
+    class Queue:
+        def discover(self, _candidate):
+            return None
+
+        def discover_many(self, _candidates):
+            return None
+
+    components = SimpleNamespace(
+        queue=Queue(),
+        reader=object(),
+        block_metrics=object(),
+        admin_service=object(),
+        upload_connector=object(),
+        worker=worker,
+    )
+    monkeypatch.setattr(
+        plugin,
+        "configure_admin_routes",
+        lambda _config: (_ for _ in ()).throw(RuntimeError("route failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="route failure"):
+        plugin._publish_components(components, pyramid, xom)
+
+    assert pool.registered == []
+    assert registry == {}
+    assert not hasattr(xom, "_devpi_guardian_verdict_reader")
+    assert not hasattr(xom, "_devpi_guardian_discovery_sink")
+    assert not hasattr(xom, "_devpi_guardian_upload_connector")
+    assert pyramid.routes == []
+    assert pyramid.views == []
+    assert pyramid.tweens == []
+
+
+def test_publish_add_tween_failure_precedes_real_thread_registration(monkeypatch):
+    import devpi_guardian.plugin as plugin
+
+    class Pool:
+        def __init__(self):
+            self.registered = []
+
+        def register(self, worker):
+            self.registered.append(worker)
+
+    pool = Pool()
+    xom = SimpleNamespace(thread_pool=pool)
+    pyramid = SimpleNamespace(registry={}, routes=[], views=[], tweens=[])
+    components = SimpleNamespace(
+        queue=SimpleNamespace(discover=lambda _candidate: None, discover_many=lambda _items: None),
+        reader=object(),
+        block_metrics=object(),
+        admin_service=object(),
+        upload_connector=object(),
+        worker=object(),
+    )
+    monkeypatch.setattr(plugin, "configure_admin_routes", lambda _config: None)
+    monkeypatch.setattr(
+        pyramid,
+        "add_tween",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("tween conflict")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="tween conflict"):
+        plugin._publish_components(components, pyramid, xom)
+
+    assert pool.registered == []
+
+
+def test_real_configurator_conflict_does_not_publish_or_build(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+    from pyramid.exceptions import ConfigurationConflictError
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args: pytest.fail("components must not build before commit conflict resolution"),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.add_route("guardian_health", "/different-conflicting-route")
+
+    with pytest.raises(ConfigurationConflictError):
+        pyramid.commit()
+
+    assert xom.thread_pool._objects == []
+    assert not hasattr(xom, "_devpi_guardian_verdict_reader")
+    assert plugin.ADMIN_SERVICE_REGISTRY_KEY not in pyramid.registry
+
+
+def test_real_configurator_activation_failure_rolls_back_routes_tween_and_introspection(
+    monkeypatch, tmp_path
+):
+    from pyramid.config import Configurator
+    from pyramid.interfaces import IRoutesMapper, ITweens
+
+    import devpi_guardian.plugin as plugin
+    from devpi_guardian.activation import ActivationFailureCategory
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    before_mapper = pyramid.registry.queryUtility(IRoutesMapper)
+    before_tweens = pyramid.registry.queryUtility(ITweens)
+    before_introspection = {
+        category: dict(entries) for category, entries in pyramid.introspector._categories.items()
+    }
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(
+        plugin,
+        "ensure_guardian_activation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            plugin.GuardianActivationError(ActivationFailureCategory.STORE_UNAVAILABLE)
+        ),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+
+    with pytest.raises(Exception, match="guardian activation failed"):
+        pyramid.commit()
+
+    assert xom.thread_pool._objects == []
+    assert pyramid.registry == {"xom": xom}
+    assert pyramid.registry.queryUtility(IRoutesMapper) is before_mapper
+    assert pyramid.registry.queryUtility(ITweens) is before_tweens
+    assert pyramid.registry.queryUtility(ITweens).sorter.names == before_tweens.sorter.names
+    assert {
+        category: dict(entries) for category, entries in pyramid.introspector._categories.items()
+    } == before_introspection
+    events = []
+    pyramid.action("post-rollback", callable=lambda: events.append("ran"))
+    pyramid.commit()
+    assert events == ["ran"]
+
+
+def test_final_publication_runs_after_later_finite_actions(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    events = []
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("build probe")),
+    )
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.action("later-finite", callable=lambda: events.append("later"), order=9999)
+
+    with pytest.raises(Exception, match="build probe"):
+        pyramid.commit()
+
+    assert events == ["later"]
+
+
+def test_final_publication_failure_preserves_unrelated_pyramid_actions(monkeypatch, tmp_path):
+    from pyramid.config import Configurator
+    from pyramid.interfaces import (
+        IRouteRequest,
+        IRoutesMapper,
+        ITweens,
+        IView,
+        IViewClassifier,
+    )
+    from zope.interface import Interface
+
+    import devpi_guardian.plugin as plugin
+
+    root = (tmp_path / "quarantine").resolve()
+    root.mkdir()
+    root.chmod(0o700)
+    xom = SimpleNamespace(is_replica=lambda: False, thread_pool=SimpleNamespace(_objects=[]))
+    config = _plugin_config(tmp_path, quarantine_root=root)
+    pyramid = Configurator(autocommit=False)
+    pyramid.registry["xom"] = xom
+    monkeypatch.setattr(plugin, "migrate", lambda _factory: None)
+    monkeypatch.setattr(plugin, "verify_audit_chain", lambda _factory: SimpleNamespace(valid=True))
+    monkeypatch.setattr(plugin, "ensure_guardian_activation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plugin,
+        "_build_components",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("build probe")),
+    )
+
+    plugin.devpiserver_pyramid_configure(config, pyramid)
+    pyramid.add_route("other_plugin_route", "/other-plugin")
+    pyramid.add_view(
+        _unrelated_plugin_view,
+        route_name="other_plugin_route",
+        request_method="GET",
+    )
+    pyramid.add_tween(f"{__name__}._unrelated_plugin_tween_factory")
+    pyramid.action(
+        "other-plugin-registry",
+        callable=lambda: pyramid.registry.__setitem__("other_plugin", object()),
+        order=100,
+    )
+
+    with pytest.raises(Exception, match="build probe"):
+        pyramid.commit()
+
+    mapper = pyramid.registry.queryUtility(IRoutesMapper)
+    assert mapper is not None
+    assert mapper.get_route("other_plugin_route") is not None
+    assert "other_plugin" in pyramid.registry
+    assert (
+        pyramid.registry.queryUtility(ITweens).sorter.name2val[
+            f"{__name__}._unrelated_plugin_tween_factory"
+        ]
+        is _unrelated_plugin_tween_factory
+    )
+    request_iface = pyramid.registry.queryUtility(IRouteRequest, name="other_plugin_route")
+    assert (
+        pyramid.registry.adapters.registered((IViewClassifier, request_iface, Interface), IView, "")
+        is not None
+    )
+
+
+def test_activation_failure_after_quarantine_open_has_no_component_side_effects(tmp_path):
+    import devpi_guardian.plugin as plugin
+
+    root = tmp_path / "quarantine"
+    root.mkdir()
+    root.chmod(0o700)
+    settings = plugin._GuardianSettings(
+        db_path=tmp_path / "guardian.db",
+        quarantine_root=root,
+        base_url="http://127.0.0.1:3141",
+        cooldown_duration=timedelta(hours=24),
+        poll_interval=0.1,
+    )
+    xom = SimpleNamespace(is_replica=lambda: False)
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        plugin._build_components(
+            settings,
+            ConnectionFactory(tmp_path / "unused.db"),
+            xom,
+            activation=lambda: (_ for _ in ()).throw(RuntimeError("activation failed")),
+        )
+
+    assert not (tmp_path / "discovery").exists()
+    assert list(root.iterdir()) == []
+
 
 NOW = datetime(2026, 8, 24, tzinfo=UTC)
 DEVPI_UUID = "devpi-test-uuid"
